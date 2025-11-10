@@ -1,6 +1,10 @@
+//@aux-build: proc_macros.rs
+//@require-annotations-for-level: WARN
+
 #![warn(clippy::single_match_else)]
-#![allow(clippy::needless_return)]
-#![allow(clippy::no_effect)]
+#![allow(unused, clippy::needless_return, clippy::no_effect, clippy::uninlined_format_args)]
+extern crate proc_macros;
+use proc_macros::with_span;
 
 enum ExprNode {
     ExprAddrOf,
@@ -11,13 +15,23 @@ enum ExprNode {
 static NODE: ExprNode = ExprNode::Unicorns;
 
 fn unwrap_addr() -> Option<&'static ExprNode> {
-    match ExprNode::Butterflies {
+    let _ = match ExprNode::Butterflies {
         ExprNode::ExprAddrOf => Some(&NODE),
         _ => {
             let x = 5;
             None
         },
-    }
+    };
+    //~^^^^^^^ single_match_else
+
+    // Don't lint
+    with_span!(span match ExprNode::Butterflies {
+        ExprNode::ExprAddrOf => Some(&NODE),
+        _ => {
+            let x = 5;
+            None
+        },
+    })
 }
 
 macro_rules! unwrap_addr {
@@ -74,6 +88,7 @@ fn main() {
             return
         },
     }
+    //~^^^^^^^ single_match_else
 
     // lint here
     match Some(1) {
@@ -83,4 +98,136 @@ fn main() {
             return;
         },
     }
+    //~^^^^^^^ single_match_else
+
+    match Some(1) {
+        Some(a) => println!("${:?}", a),
+        // This is an inner comment
+        None => {
+            println!("else block");
+            return;
+        },
+    }
+    //~^^^^^^^^ single_match_else
+    //~| NOTE: you might want to preserve the comments from inside the `match`
+
+    // lint here
+    use std::convert::Infallible;
+    match Result::<i32, &Infallible>::Ok(1) {
+        Ok(a) => println!("${:?}", a),
+        Err(_) => {
+            println!("else block");
+            return;
+        }
+    }
+    //~^^^^^^^ single_match_else
+
+    use std::borrow::Cow;
+    match Cow::from("moo") {
+        Cow::Owned(a) => println!("${:?}", a),
+        Cow::Borrowed(_) => {
+            println!("else block");
+            return;
+        }
+    }
+    //~^^^^^^^ single_match_else
+}
+
+fn issue_10808(bar: Option<i32>) {
+    match bar {
+        Some(v) => unsafe {
+            let r = &v as *const i32;
+            println!("{}", *r);
+        },
+        None => {
+            println!("None1");
+            println!("None2");
+        },
+    }
+    //~^^^^^^^^^^ single_match_else
+
+    match bar {
+        Some(v) => {
+            println!("Some");
+            println!("{v}");
+        },
+        None => unsafe {
+            let v = 0;
+            let r = &v as *const i32;
+            println!("{}", *r);
+        },
+    }
+    //~^^^^^^^^^^^ single_match_else
+
+    match bar {
+        Some(v) => unsafe {
+            let r = &v as *const i32;
+            println!("{}", *r);
+        },
+        None => unsafe {
+            let v = 0;
+            let r = &v as *const i32;
+            println!("{}", *r);
+        },
+    }
+    //~^^^^^^^^^^^ single_match_else
+
+    match bar {
+        #[rustfmt::skip]
+        Some(v) => {
+            unsafe {
+                let r = &v as *const i32;
+                println!("{}", *r);
+            }
+        },
+        None => {
+            println!("None");
+            println!("None");
+        },
+    }
+    //~^^^^^^^^^^^^^ single_match_else
+
+    match bar {
+        Some(v) => {
+            println!("Some");
+            println!("{v}");
+        },
+        #[rustfmt::skip]
+        None => {
+            unsafe {
+                let v = 0;
+                let r = &v as *const i32;
+                println!("{}", *r);
+            }
+        },
+    }
+
+    match bar {
+        #[rustfmt::skip]
+        Some(v) => {
+            unsafe {
+                let r = &v as *const i32;
+                println!("{}", *r);
+            }
+        },
+        #[rustfmt::skip]
+        None => {
+            unsafe {
+                let v = 0;
+                let r = &v as *const i32;
+                println!("{}", *r);
+            }
+        },
+    }
+}
+
+fn irrefutable_match() -> Option<&'static ExprNode> {
+    match ExprNode::Butterflies {
+        ExprNode::Butterflies => Some(&NODE),
+        _ => {
+            let x = 5;
+            None
+        },
+    }
+    //~^^^^^^^ single_match_else
 }

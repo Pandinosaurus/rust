@@ -1,6 +1,8 @@
 use crate::fmt;
-use crate::iter::adapters::{zip::try_get_unchecked, SourceIter, TrustedRandomAccess};
-use crate::iter::{FusedIterator, InPlaceIterable, TrustedLen};
+use crate::iter::adapters::zip::try_get_unchecked;
+use crate::iter::adapters::{SourceIter, TrustedRandomAccess, TrustedRandomAccessNoCoerce};
+use crate::iter::{FusedIterator, InPlaceIterable, TrustedFused, TrustedLen, UncheckedIterator};
+use crate::num::NonZero;
 use crate::ops::Try;
 
 /// An iterator that maps the values of `iter` with `f`.
@@ -17,7 +19,7 @@ use crate::ops::Try;
 /// you can also [`map`] backwards:
 ///
 /// ```rust
-/// let v: Vec<i32> = vec![1, 2, 3].into_iter().map(|x| x + 1).rev().collect();
+/// let v: Vec<i32> = [1, 2, 3].into_iter().map(|x| x + 1).rev().collect();
 ///
 /// assert_eq!(v, [4, 3, 2]);
 /// ```
@@ -30,13 +32,13 @@ use crate::ops::Try;
 /// ```rust
 /// let mut c = 0;
 ///
-/// for pair in vec!['a', 'b', 'c'].into_iter()
+/// for pair in ['a', 'b', 'c'].into_iter()
 ///                                .map(|letter| { c += 1; (letter, c) }) {
-///     println!("{:?}", pair);
+///     println!("{pair:?}");
 /// }
 /// ```
 ///
-/// This will print "('a', 1), ('b', 2), ('c', 3)".
+/// This will print `('a', 1), ('b', 2), ('c', 3)`.
 ///
 /// Now consider this twist where we add a call to `rev`. This version will
 /// print `('c', 1), ('b', 2), ('a', 3)`. Note that the letters are reversed,
@@ -47,10 +49,10 @@ use crate::ops::Try;
 /// ```rust
 /// let mut c = 0;
 ///
-/// for pair in vec!['a', 'b', 'c'].into_iter()
+/// for pair in ['a', 'b', 'c'].into_iter()
 ///                                .map(|letter| { c += 1; (letter, c) })
 ///                                .rev() {
-///     println!("{:?}", pair);
+///     println!("{pair:?}");
 /// }
 /// ```
 #[must_use = "iterators are lazy and do nothing unless consumed"]
@@ -65,6 +67,10 @@ pub struct Map<I, F> {
 impl<I, F> Map<I, F> {
     pub(in crate::iter) fn new(iter: I, f: F) -> Map<I, F> {
         Map { iter, f }
+    }
+
+    pub(crate) fn into_inner(self) -> I {
+        self.iter
     }
 }
 
@@ -110,7 +116,7 @@ where
     where
         Self: Sized,
         G: FnMut(Acc, Self::Item) -> R,
-        R: Try<Ok = Acc>,
+        R: Try<Output = Acc>,
     {
         self.iter.try_fold(init, map_try_fold(&mut self.f, g))
     }
@@ -122,9 +128,10 @@ where
         self.iter.fold(init, map_fold(self.f, g))
     }
 
+    #[inline]
     unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> B
     where
-        Self: TrustedRandomAccess,
+        Self: TrustedRandomAccessNoCoerce,
     {
         // SAFETY: the caller must uphold the contract for
         // `Iterator::__iterator_get_unchecked`.
@@ -146,7 +153,7 @@ where
     where
         Self: Sized,
         G: FnMut(Acc, Self::Item) -> R,
-        R: Try<Ok = Acc>,
+        R: Try<Output = Acc>,
     {
         self.iter.try_rfold(init, map_try_fold(&mut self.f, g))
     }
@@ -176,6 +183,9 @@ where
 #[stable(feature = "fused", since = "1.26.0")]
 impl<B, I: FusedIterator, F> FusedIterator for Map<I, F> where F: FnMut(I::Item) -> B {}
 
+#[unstable(issue = "none", feature = "trusted_fused")]
+unsafe impl<I: TrustedFused, F> TrustedFused for Map<I, F> {}
+
 #[unstable(feature = "trusted_len", issue = "37572")]
 unsafe impl<B, I, F> TrustedLen for Map<I, F>
 where
@@ -184,29 +194,48 @@ where
 {
 }
 
+impl<B, I, F> UncheckedIterator for Map<I, F>
+where
+    I: UncheckedIterator,
+    F: FnMut(I::Item) -> B,
+{
+    unsafe fn next_unchecked(&mut self) -> B {
+        // SAFETY: `Map` is 1:1 with the inner iterator, so if the caller promised
+        // that there's an element left, the inner iterator has one too.
+        let item = unsafe { self.iter.next_unchecked() };
+        (self.f)(item)
+    }
+}
+
 #[doc(hidden)]
 #[unstable(feature = "trusted_random_access", issue = "none")]
-unsafe impl<I, F> TrustedRandomAccess for Map<I, F>
+unsafe impl<I, F> TrustedRandomAccess for Map<I, F> where I: TrustedRandomAccess {}
+
+#[doc(hidden)]
+#[unstable(feature = "trusted_random_access", issue = "none")]
+unsafe impl<I, F> TrustedRandomAccessNoCoerce for Map<I, F>
 where
-    I: TrustedRandomAccess,
+    I: TrustedRandomAccessNoCoerce,
 {
     const MAY_HAVE_SIDE_EFFECT: bool = true;
 }
 
 #[unstable(issue = "none", feature = "inplace_iteration")]
-unsafe impl<S: Iterator, B, I: Iterator, F> SourceIter for Map<I, F>
+unsafe impl<I, F> SourceIter for Map<I, F>
 where
-    F: FnMut(I::Item) -> B,
-    I: SourceIter<Source = S>,
+    I: SourceIter,
 {
-    type Source = S;
+    type Source = I::Source;
 
     #[inline]
-    unsafe fn as_inner(&mut self) -> &mut S {
+    unsafe fn as_inner(&mut self) -> &mut I::Source {
         // SAFETY: unsafe function forwarding to unsafe function with the same requirements
         unsafe { SourceIter::as_inner(&mut self.iter) }
     }
 }
 
 #[unstable(issue = "none", feature = "inplace_iteration")]
-unsafe impl<B, I: InPlaceIterable, F> InPlaceIterable for Map<I, F> where F: FnMut(I::Item) -> B {}
+unsafe impl<I: InPlaceIterable, F> InPlaceIterable for Map<I, F> {
+    const EXPAND_BY: Option<NonZero<usize>> = I::EXPAND_BY;
+    const MERGE_BY: Option<NonZero<usize>> = I::MERGE_BY;
+}

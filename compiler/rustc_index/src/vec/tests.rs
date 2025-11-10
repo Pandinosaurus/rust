@@ -1,10 +1,14 @@
-#![allow(dead_code)]
-newtype_index!(struct MyIdx { MAX = 0xFFFF_FFFA });
+// Allows the macro invocation below to work
+use crate as rustc_index;
+
+crate::newtype_index! {
+    #[orderable]
+    #[max = 0xFFFF_FFFA]
+    struct MyIdx {}
+}
 
 #[test]
 fn index_size_is_optimized() {
-    use std::mem::size_of;
-
     assert_eq!(size_of::<MyIdx>(), 4);
     // Uses 0xFFFF_FFFB
     assert_eq!(size_of::<Option<MyIdx>>(), 4);

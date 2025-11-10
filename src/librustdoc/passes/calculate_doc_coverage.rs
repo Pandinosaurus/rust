@@ -1,28 +1,32 @@
-use crate::clean;
-use crate::core::DocContext;
-use crate::fold::{self, DocFolder};
-use crate::html::markdown::{find_testable_code, ErrorCodes};
-use crate::passes::doc_test_lints::{should_have_doc_example, Tests};
-use crate::passes::Pass;
-use rustc_lint::builtin::MISSING_DOCS;
-use rustc_middle::lint::LintLevelSource;
-use rustc_session::lint;
-use rustc_span::symbol::sym;
-use rustc_span::FileName;
-use serde::Serialize;
+//! Calculates information used for the --show-coverage flag.
 
 use std::collections::BTreeMap;
 use std::ops;
 
-crate const CALCULATE_DOC_COVERAGE: Pass = Pass {
+use rustc_hir as hir;
+use rustc_lint::builtin::MISSING_DOCS;
+use rustc_middle::lint::{LevelAndSource, LintLevelSource};
+use rustc_session::lint;
+use rustc_span::FileName;
+use serde::Serialize;
+use tracing::debug;
+
+use crate::clean;
+use crate::core::DocContext;
+use crate::html::markdown::{ErrorCodes, find_testable_code};
+use crate::passes::Pass;
+use crate::passes::check_doc_test_visibility::{Tests, should_have_doc_example};
+use crate::visit::DocVisitor;
+
+pub(crate) const CALCULATE_DOC_COVERAGE: Pass = Pass {
     name: "calculate-doc-coverage",
-    run: calculate_doc_coverage,
+    run: Some(calculate_doc_coverage),
     description: "counts the number of items with and without documentation",
 };
 
 fn calculate_doc_coverage(krate: clean::Crate, ctx: &mut DocContext<'_>) -> clean::Crate {
     let mut calc = CoverageCalculator { items: Default::default(), ctx };
-    let krate = calc.fold_crate(krate);
+    calc.visit_crate(&krate);
 
     calc.print_results();
 
@@ -114,13 +118,13 @@ fn limit_filename_len(filename: String) -> String {
     }
 }
 
-impl<'a, 'b> CoverageCalculator<'a, 'b> {
+impl CoverageCalculator<'_, '_> {
     fn to_json(&self) -> String {
         serde_json::to_string(
             &self
                 .items
                 .iter()
-                .map(|(k, v)| (k.to_string(), v))
+                .map(|(k, v)| (k.prefer_local().to_string(), v))
                 .collect::<BTreeMap<String, &ItemCount>>(),
         )
         .expect("failed to convert JSON data to string")
@@ -128,6 +132,7 @@ impl<'a, 'b> CoverageCalculator<'a, 'b> {
 
     fn print_results(&self) {
         let output_format = self.ctx.output_format;
+        // In this case we want to ensure that the `OutputFormat` is JSON and NOT the `DocContext`.
         if output_format.is_json() {
             println!("{}", self.to_json());
             return;
@@ -145,8 +150,10 @@ impl<'a, 'b> CoverageCalculator<'a, 'b> {
             examples_percentage: f64,
         ) {
             println!(
-                "| {:<35} | {:>10} | {:>9.1}% | {:>10} | {:>9.1}% |",
-                name, count.with_docs, percentage, count.with_examples, examples_percentage,
+                "| {name:<35} | {with_docs:>10} | {percentage:>9.1}% | {with_examples:>10} | \
+                {examples_percentage:>9.1}% |",
+                with_docs = count.with_docs,
+                with_examples = count.with_examples,
             );
         }
 
@@ -160,7 +167,7 @@ impl<'a, 'b> CoverageCalculator<'a, 'b> {
         for (file, &count) in &self.items {
             if let Some(percentage) = count.percentage() {
                 print_table_record(
-                    &limit_filename_len(file.to_string()),
+                    &limit_filename_len(file.prefer_local().to_string_lossy().into()),
                     count,
                     percentage,
                     count.examples_percentage().unwrap_or(0.),
@@ -181,90 +188,85 @@ impl<'a, 'b> CoverageCalculator<'a, 'b> {
     }
 }
 
-impl<'a, 'b> fold::DocFolder for CoverageCalculator<'a, 'b> {
-    fn fold_item(&mut self, i: clean::Item) -> Option<clean::Item> {
-        match *i.kind {
-            _ if !i.def_id.is_local() => {
-                // non-local items are skipped because they can be out of the users control,
-                // especially in the case of trait impls, which rustdoc eagerly inlines
-                return Some(i);
-            }
+impl DocVisitor<'_> for CoverageCalculator<'_, '_> {
+    fn visit_item(&mut self, i: &clean::Item) {
+        if !i.item_id.is_local() {
+            // non-local items are skipped because they can be out of the users control,
+            // especially in the case of trait impls, which rustdoc eagerly inlines
+            return;
+        }
+
+        match i.kind {
             clean::StrippedItem(..) => {
                 // don't count items in stripped modules
-                return Some(i);
+                return;
             }
-            clean::ImportItem(..) | clean::ExternCrateItem { .. } => {
-                // docs on `use` and `extern crate` statements are not displayed, so they're not
-                // worth counting
-                return Some(i);
-            }
-            clean::ImplItem(ref impl_)
-                if i.attrs
-                    .other_attrs
-                    .iter()
-                    .any(|item| item.has_name(sym::automatically_derived))
-                    || impl_.synthetic
-                    || impl_.blanket_impl.is_some() =>
-            {
-                // built-in derives get the `#[automatically_derived]` attribute, and
-                // synthetic/blanket impls are made up by rustdoc and can't be documented
-                // FIXME(misdreavus): need to also find items that came out of a derive macro
-                return Some(i);
-            }
-            clean::ImplItem(ref impl_) => {
-                let filename = i.span.filename(self.ctx.sess());
-                if let Some(ref tr) = impl_.trait_ {
-                    debug!(
-                        "impl {:#} for {:#} in {}",
-                        tr.print(&self.ctx.cache, self.ctx.tcx),
-                        impl_.for_.print(&self.ctx.cache, self.ctx.tcx),
-                        filename,
-                    );
-
-                    // don't count trait impls, the missing-docs lint doesn't so we shouldn't
-                    // either
-                    return Some(i);
-                } else {
-                    // inherent impls *can* be documented, and those docs show up, but in most
-                    // cases it doesn't make sense, as all methods on a type are in one single
-                    // impl block
-                    debug!(
-                        "impl {:#} in {}",
-                        impl_.for_.print(&self.ctx.cache, self.ctx.tcx),
-                        filename
-                    );
-                }
-            }
+            // docs on `use` and `extern crate` statements are not displayed, so they're not
+            // worth counting
+            clean::ImportItem(..) | clean::ExternCrateItem { .. } => {}
+            // Don't count trait impls, the missing-docs lint doesn't so we shouldn't either.
+            // Inherent impls *can* be documented, and those docs show up, but in most cases it
+            // doesn't make sense, as all methods on a type are in one single impl block
+            clean::ImplItem(_) => {}
             _ => {
                 let has_docs = !i.attrs.doc_strings.is_empty();
                 let mut tests = Tests { found_tests: 0 };
 
-                find_testable_code(
-                    &i.attrs.collapsed_doc_value().unwrap_or_default(),
-                    &mut tests,
-                    ErrorCodes::No,
-                    false,
-                    None,
-                );
+                find_testable_code(&i.doc_value(), &mut tests, ErrorCodes::No, None);
 
-                let filename = i.span.filename(self.ctx.sess());
                 let has_doc_example = tests.found_tests != 0;
-                let hir_id = self.ctx.tcx.hir().local_def_id_to_hir_id(i.def_id.expect_local());
-                let (level, source) = self.ctx.tcx.lint_level_at_node(MISSING_DOCS, hir_id);
+                let hir_id = DocContext::as_local_hir_id(self.ctx.tcx, i.item_id).unwrap();
+                let LevelAndSource { level, src, .. } =
+                    self.ctx.tcx.lint_level_at_node(MISSING_DOCS, hir_id);
+
+                // In case we have:
+                //
+                // ```
+                // enum Foo { Bar(u32) }
+                // // or:
+                // struct Bar(u32);
+                // ```
+                //
+                // there is no need to require documentation on the fields of tuple variants and
+                // tuple structs.
+                let should_be_ignored = i
+                    .item_id
+                    .as_def_id()
+                    .and_then(|def_id| self.ctx.tcx.opt_parent(def_id))
+                    .and_then(|def_id| self.ctx.tcx.hir_get_if_local(def_id))
+                    .map(|node| {
+                        matches!(
+                            node,
+                            hir::Node::Variant(hir::Variant {
+                                data: hir::VariantData::Tuple(_, _, _),
+                                ..
+                            }) | hir::Node::Item(hir::Item {
+                                kind: hir::ItemKind::Struct(_, _, hir::VariantData::Tuple(_, _, _)),
+                                ..
+                            })
+                        )
+                    })
+                    .unwrap_or(false);
+
                 // `missing_docs` is allow-by-default, so don't treat this as ignoring the item
-                // unless the user had an explicit `allow`
-                let should_have_docs =
-                    level != lint::Level::Allow || matches!(source, LintLevelSource::Default);
-                debug!("counting {:?} {:?} in {}", i.type_(), i.name, filename);
-                self.items.entry(filename).or_default().count_item(
-                    has_docs,
-                    has_doc_example,
-                    should_have_doc_example(self.ctx, &i),
-                    should_have_docs,
-                );
+                // unless the user had an explicit `allow`.
+                //
+                let should_have_docs = !should_be_ignored
+                    && (level != lint::Level::Allow || matches!(src, LintLevelSource::Default));
+
+                if let Some(span) = i.span(self.ctx.tcx) {
+                    let filename = span.filename(self.ctx.sess());
+                    debug!("counting {:?} {:?} in {filename:?}", i.type_(), i.name);
+                    self.items.entry(filename).or_default().count_item(
+                        has_docs,
+                        has_doc_example,
+                        should_have_doc_example(self.ctx, i),
+                        should_have_docs,
+                    );
+                }
             }
         }
 
-        Some(self.fold_item_recur(i))
+        self.visit_item_recur(i)
     }
 }

@@ -1,6 +1,6 @@
-// run-rustfix
 #![warn(clippy::manual_ok_or)]
-#![allow(clippy::blacklisted_name)]
+#![allow(clippy::or_fun_call)]
+#![allow(clippy::disallowed_names)]
 #![allow(clippy::redundant_closure)]
 #![allow(dead_code)]
 #![allow(unused_must_use)]
@@ -9,16 +9,20 @@ fn main() {
     // basic case
     let foo: Option<i32> = None;
     foo.map_or(Err("error"), |v| Ok(v));
+    //~^ manual_ok_or
 
     // eta expansion case
     foo.map_or(Err("error"), Ok);
+    //~^ manual_ok_or
 
     // turbo fish syntax
     None::<i32>.map_or(Err("error"), |v| Ok(v));
+    //~^ manual_ok_or
 
     // multiline case
     #[rustfmt::skip]
     foo.map_or(Err::<i32, &str>(
+    //~^ manual_ok_or
         &format!(
             "{}{}{}{}{}{}{}",
             "Alice", "Bob", "Sarah", "Marc", "Sandra", "Eric", "Jenifer")

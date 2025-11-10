@@ -1,108 +1,87 @@
-use pathdiff::diff_paths;
-use rustc_data_structures::fx::FxHashSet;
-use std::env;
-use std::fs;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use rustc_hir::def_id::CrateNum;
-use rustc_middle::middle::cstore::LibSource;
+use pathdiff::diff_paths;
+use rustc_data_structures::fx::FxHashSet;
+use rustc_fs_util::try_canonicalize;
+use tracing::debug;
 
-pub struct RPathConfig<'a> {
-    pub used_crates: &'a [(CrateNum, LibSource)],
+pub(super) struct RPathConfig<'a> {
+    pub libs: &'a [&'a Path],
     pub out_filename: PathBuf,
-    pub is_like_osx: bool,
-    pub has_rpath: bool,
+    pub is_like_darwin: bool,
     pub linker_is_gnu: bool,
-    pub get_install_prefix_lib_path: &'a mut dyn FnMut() -> PathBuf,
 }
 
-pub fn get_rpath_flags(config: &mut RPathConfig<'_>) -> Vec<String> {
-    // No rpath on windows
-    if !config.has_rpath {
-        return Vec::new();
-    }
-
+pub(super) fn get_rpath_linker_args(config: &RPathConfig<'_>) -> Vec<OsString> {
     debug!("preparing the RPATH!");
 
-    let libs = config.used_crates;
-    let libs = libs.iter().filter_map(|&(_, ref l)| l.option()).collect::<Vec<_>>();
-    let rpaths = get_rpaths(config, &libs);
-    let mut flags = rpaths_to_flags(&rpaths);
-
-    // Use DT_RUNPATH instead of DT_RPATH if available
-    if config.linker_is_gnu {
-        flags.push("-Wl,--enable-new-dtags".to_owned());
-    }
-
-    flags
-}
-
-fn rpaths_to_flags(rpaths: &[String]) -> Vec<String> {
-    let mut ret = Vec::with_capacity(rpaths.len()); // the minimum needed capacity
+    let rpaths = get_rpaths(config);
+    let mut args = Vec::with_capacity(rpaths.len() * 2); // the minimum needed capacity
 
     for rpath in rpaths {
-        if rpath.contains(',') {
-            ret.push("-Wl,-rpath".into());
-            ret.push("-Xlinker".into());
-            ret.push(rpath.clone());
-        } else {
-            ret.push(format!("-Wl,-rpath,{}", &(*rpath)));
-        }
+        args.push("-rpath".into());
+        args.push(rpath);
     }
 
-    ret
+    if config.linker_is_gnu {
+        // Use DT_RUNPATH instead of DT_RPATH if available
+        args.push("--enable-new-dtags".into());
+
+        // Set DF_ORIGIN for substitute $ORIGIN
+        args.push("-z".into());
+        args.push("origin".into());
+    }
+
+    args
 }
 
-fn get_rpaths(config: &mut RPathConfig<'_>, libs: &[PathBuf]) -> Vec<String> {
+fn get_rpaths(config: &RPathConfig<'_>) -> Vec<OsString> {
     debug!("output: {:?}", config.out_filename.display());
     debug!("libs:");
-    for libpath in libs {
+    for libpath in config.libs {
         debug!("    {:?}", libpath.display());
     }
 
     // Use relative paths to the libraries. Binaries can be moved
     // as long as they maintain the relative relationship to the
     // crates they depend on.
-    let rel_rpaths = get_rpaths_relative_to_output(config, libs);
+    let rpaths = get_rpaths_relative_to_output(config);
 
-    // And a final backup rpath to the global library location.
-    let fallback_rpaths = vec![get_install_prefix_rpath(config)];
-
-    fn log_rpaths(desc: &str, rpaths: &[String]) {
-        debug!("{} rpaths:", desc);
-        for rpath in rpaths {
-            debug!("    {}", *rpath);
-        }
+    debug!("rpaths:");
+    for rpath in &rpaths {
+        debug!("    {:?}", rpath);
     }
-
-    log_rpaths("relative", &rel_rpaths);
-    log_rpaths("fallback", &fallback_rpaths);
-
-    let mut rpaths = rel_rpaths;
-    rpaths.extend_from_slice(&fallback_rpaths);
 
     // Remove duplicates
     minimize_rpaths(&rpaths)
 }
 
-fn get_rpaths_relative_to_output(config: &mut RPathConfig<'_>, libs: &[PathBuf]) -> Vec<String> {
-    libs.iter().map(|a| get_rpath_relative_to_output(config, a)).collect()
+fn get_rpaths_relative_to_output(config: &RPathConfig<'_>) -> Vec<OsString> {
+    config.libs.iter().map(|a| get_rpath_relative_to_output(config, a)).collect()
 }
 
-fn get_rpath_relative_to_output(config: &mut RPathConfig<'_>, lib: &Path) -> String {
+fn get_rpath_relative_to_output(config: &RPathConfig<'_>, lib: &Path) -> OsString {
     // Mac doesn't appear to support $ORIGIN
-    let prefix = if config.is_like_osx { "@loader_path" } else { "$ORIGIN" };
+    let prefix = if config.is_like_darwin { "@loader_path" } else { "$ORIGIN" };
 
-    let cwd = env::current_dir().unwrap();
-    let mut lib = fs::canonicalize(&cwd.join(lib)).unwrap_or_else(|_| cwd.join(lib));
-    lib.pop(); // strip filename
-    let mut output = cwd.join(&config.out_filename);
-    output.pop(); // strip filename
-    let output = fs::canonicalize(&output).unwrap_or(output);
+    // Strip filenames
+    let lib = lib.parent().unwrap();
+    let output = config.out_filename.parent().unwrap();
+
+    // If output or lib is empty, just assume it locates in current path
+    let lib = if lib == Path::new("") { Path::new(".") } else { lib };
+    let output = if output == Path::new("") { Path::new(".") } else { output };
+
+    let lib = try_canonicalize(lib).unwrap();
+    let output = try_canonicalize(output).unwrap();
     let relative = path_relative_from(&lib, &output)
-        .unwrap_or_else(|| panic!("couldn't create relative path from {:?} to {:?}", output, lib));
-    // FIXME (#9639): This needs to handle non-utf8 paths
-    format!("{}/{}", prefix, relative.to_str().expect("non-utf8 component in path"))
+        .unwrap_or_else(|| panic!("couldn't create relative path from {output:?} to {lib:?}"));
+
+    let mut rpath = OsString::from(prefix);
+    rpath.push("/");
+    rpath.push(relative);
+    rpath
 }
 
 // This routine is adapted from the *old* Path's `path_relative_from`
@@ -113,14 +92,7 @@ fn path_relative_from(path: &Path, base: &Path) -> Option<PathBuf> {
     diff_paths(path, base)
 }
 
-fn get_install_prefix_rpath(config: &mut RPathConfig<'_>) -> String {
-    let path = (config.get_install_prefix_lib_path)();
-    let path = env::current_dir().unwrap().join(&path);
-    // FIXME (#9639): This needs to handle non-utf8 paths
-    path.to_str().expect("non-utf8 component in rpath").to_owned()
-}
-
-fn minimize_rpaths(rpaths: &[String]) -> Vec<String> {
+fn minimize_rpaths(rpaths: &[OsString]) -> Vec<OsString> {
     let mut set = FxHashSet::default();
     let mut minimized = Vec::new();
     for rpath in rpaths {

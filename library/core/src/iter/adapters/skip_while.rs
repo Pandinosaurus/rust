@@ -1,5 +1,7 @@
 use crate::fmt;
-use crate::iter::{adapters::SourceIter, FusedIterator, InPlaceIterable};
+use crate::iter::adapters::SourceIter;
+use crate::iter::{FusedIterator, InPlaceIterable, TrustedFused};
+use crate::num::NonZero;
 use crate::ops::Try;
 
 /// An iterator that rejects elements while `predicate` returns `true`.
@@ -70,7 +72,7 @@ where
     where
         Self: Sized,
         Fold: FnMut(Acc, Self::Item) -> R,
-        R: Try<Ok = Acc>,
+        R: Try<Output = Acc>,
     {
         if !self.flag {
             match self.next() {
@@ -104,23 +106,25 @@ where
 {
 }
 
+#[unstable(issue = "none", feature = "trusted_fused")]
+unsafe impl<I: TrustedFused, P> TrustedFused for SkipWhile<I, P> {}
+
 #[unstable(issue = "none", feature = "inplace_iteration")]
-unsafe impl<S: Iterator, P, I: Iterator> SourceIter for SkipWhile<I, P>
+unsafe impl<P, I> SourceIter for SkipWhile<I, P>
 where
-    P: FnMut(&I::Item) -> bool,
-    I: SourceIter<Source = S>,
+    I: SourceIter,
 {
-    type Source = S;
+    type Source = I::Source;
 
     #[inline]
-    unsafe fn as_inner(&mut self) -> &mut S {
+    unsafe fn as_inner(&mut self) -> &mut I::Source {
         // SAFETY: unsafe function forwarding to unsafe function with the same requirements
         unsafe { SourceIter::as_inner(&mut self.iter) }
     }
 }
 
 #[unstable(issue = "none", feature = "inplace_iteration")]
-unsafe impl<I: InPlaceIterable, F> InPlaceIterable for SkipWhile<I, F> where
-    F: FnMut(&I::Item) -> bool
-{
+unsafe impl<I: InPlaceIterable, F> InPlaceIterable for SkipWhile<I, F> {
+    const EXPAND_BY: Option<NonZero<usize>> = I::EXPAND_BY;
+    const MERGE_BY: Option<NonZero<usize>> = I::MERGE_BY;
 }

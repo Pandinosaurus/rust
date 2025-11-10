@@ -1,5 +1,5 @@
 #![warn(clippy::temporary_assignment)]
-#![allow(const_item_mutation)]
+#![allow(clippy::needless_lifetimes)]
 
 use std::ops::{Deref, DerefMut};
 
@@ -46,13 +46,19 @@ fn main() {
     let mut t = (0, 0);
 
     Struct { field: 0 }.field = 1;
+    //~^ temporary_assignment
+
     MultiStruct {
+        //~^ temporary_assignment
         structure: Struct { field: 0 },
     }
     .structure
     .field = 1;
     ArrayStruct { array: [0] }.array[0] = 1;
+    //~^ temporary_assignment
+
     (0, 0).0 = 1;
+    //~^ temporary_assignment
 
     // no error
     s.field = 1;

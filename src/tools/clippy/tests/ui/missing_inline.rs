@@ -7,8 +7,8 @@
 type Typedef = String;
 pub type PubTypedef = String;
 
-struct Foo {} // ok
-pub struct PubFoo {} // ok
+struct Foo; // ok
+pub struct PubFoo; // ok
 enum FooE {} // ok
 pub enum PubFooE {} // ok
 
@@ -16,7 +16,10 @@ mod module {} // ok
 pub mod pub_module {} // ok
 
 fn foo() {}
-pub fn pub_foo() {} // missing #[inline]
+// missing #[inline]
+pub fn pub_foo() {}
+//~^ missing_inline_in_public_items
+
 #[inline]
 pub fn pub_foo_inline() {} // ok
 #[inline(always)]
@@ -32,7 +35,10 @@ trait Bar {
 
 pub trait PubBar {
     fn PubBar_a(); // ok
-    fn PubBar_b() {} // missing #[inline]
+    // missing #[inline]
+    fn PubBar_b() {}
+    //~^ missing_inline_in_public_items
+
     #[inline]
     fn PubBar_c() {} // ok
 }
@@ -46,9 +52,17 @@ impl PubBar for Foo {
 
 // all of these need inline because PubFoo is exported
 impl PubBar for PubFoo {
-    fn PubBar_a() {} // missing #[inline]
-    fn PubBar_b() {} // missing #[inline]
-    fn PubBar_c() {} // missing #[inline]
+    // missing #[inline]
+    fn PubBar_a() {}
+    //~^ missing_inline_in_public_items
+
+    // missing #[inline]
+    fn PubBar_b() {}
+    //~^ missing_inline_in_public_items
+
+    // missing #[inline]
+    fn PubBar_c() {}
+    //~^ missing_inline_in_public_items
 }
 
 // do not need inline because Foo is not exported
@@ -58,9 +72,35 @@ impl Foo {
 
 // need inline because PubFoo is exported
 impl PubFoo {
-    pub fn PubFooImpl() {} // missing #[inline]
+    // missing #[inline]
+    pub fn PubFooImpl() {}
+    //~^ missing_inline_in_public_items
 }
 
 // do not lint this since users cannot control the external code
 #[derive(Debug)]
-pub struct S {}
+pub struct S;
+
+pub mod issue15301 {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn call_from_c() {
+        println!("Just called a Rust function from C!");
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "Rust" fn call_from_rust() {
+        println!("Just called a Rust function from Rust!");
+    }
+
+    #[unsafe(no_mangle)]
+    pub fn call_from_rust_no_extern() {
+        println!("Just called a Rust function from Rust!");
+    }
+}
+
+pub mod issue15491 {
+    pub trait Foo {
+        #[allow(clippy::missing_inline_in_public_items)]
+        fn foo(&self) {}
+    }
+}

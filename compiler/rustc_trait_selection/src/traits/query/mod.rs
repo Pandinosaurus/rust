@@ -3,13 +3,12 @@
 //! which makes a canonical query by replacing unbound inference
 //! variables and regions, so that results can be reused more broadly.
 //! The providers for the queries defined here can be found in
-//! `librustc_traits`.
+//! `rustc_traits`.
 
 pub mod dropck_outlives;
 pub mod evaluate_obligation;
 pub mod method_autoderef;
 pub mod normalize;
-pub mod outlives_bounds;
 pub mod type_op;
 
 pub use rustc_middle::traits::query::*;

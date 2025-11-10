@@ -1,53 +1,45 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::{is_trait_method, match_qpath, path_to_local_id, paths};
-use if_chain::if_chain;
+use clippy_utils::res::{MaybeDef, MaybeTypeckRes};
+use clippy_utils::{is_expr_identity_function, is_expr_untyped_identity_function};
 use rustc_errors::Applicability;
 use rustc_hir as hir;
+use rustc_hir::ExprKind;
 use rustc_lint::LateContext;
-use rustc_span::{source_map::Span, sym};
+use rustc_span::{Span, sym};
 
 use super::FILTER_MAP_IDENTITY;
 
-pub(super) fn check(
-    cx: &LateContext<'_>,
-    expr: &hir::Expr<'_>,
-    filter_map_args: &[hir::Expr<'_>],
-    filter_map_span: Span,
-) {
-    if is_trait_method(cx, expr, sym::Iterator) {
-        let arg_node = &filter_map_args[1].kind;
+fn is_identity(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<Applicability> {
+    if is_expr_untyped_identity_function(cx, expr) {
+        return Some(Applicability::MachineApplicable);
+    }
+    if is_expr_identity_function(cx, expr) {
+        return Some(Applicability::Unspecified);
+    }
+    None
+}
 
-        let apply_lint = |message: &str| {
-            span_lint_and_sugg(
-                cx,
-                FILTER_MAP_IDENTITY,
-                filter_map_span.with_hi(expr.span.hi()),
-                message,
-                "try",
-                "flatten()".to_string(),
-                Applicability::MachineApplicable,
-            );
-        };
-
-        if_chain! {
-            if let hir::ExprKind::Closure(_, _, body_id, _, _) = arg_node;
-            let body = cx.tcx.hir().body(*body_id);
-
-            if let hir::PatKind::Binding(_, binding_id, ..) = body.params[0].pat.kind;
-            if path_to_local_id(&body.value, binding_id);
-            then {
-                apply_lint("called `filter_map(|x| x)` on an `Iterator`");
-            }
+pub(super) fn check(cx: &LateContext<'_>, expr: &hir::Expr<'_>, filter_map_arg: &hir::Expr<'_>, filter_map_span: Span) {
+    if cx.ty_based_def(expr).opt_parent(cx).is_diag_item(cx, sym::Iterator)
+        && let Some(applicability) = is_identity(cx, filter_map_arg)
+    {
+        // check if the iterator is from an empty array, see issue #12653
+        if let ExprKind::MethodCall(_, recv, ..) = expr.kind
+            && let ExprKind::MethodCall(_, recv2, ..) = recv.kind
+            && let ExprKind::Array(arr) = recv2.kind
+            && arr.is_empty()
+        {
+            return;
         }
 
-        if_chain! {
-            if let hir::ExprKind::Path(ref qpath) = arg_node;
-
-            if match_qpath(qpath, &paths::STD_CONVERT_IDENTITY);
-
-            then {
-                apply_lint("called `filter_map(std::convert::identity)` on an `Iterator`");
-            }
-        }
+        span_lint_and_sugg(
+            cx,
+            FILTER_MAP_IDENTITY,
+            filter_map_span.with_hi(expr.span.hi()),
+            "use of `filter_map` with an identity function",
+            "try",
+            "flatten()".to_string(),
+            applicability,
+        );
     }
 }

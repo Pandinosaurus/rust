@@ -1,5 +1,4 @@
 #![allow(missing_docs)]
-#![allow(deprecated)] // Float
 
 use std::mem;
 
@@ -15,11 +14,11 @@ pub trait Stats {
     /// Sum of the samples.
     ///
     /// Note: this method sacrifices performance at the altar of accuracy
-    /// Depends on IEEE-754 arithmetic guarantees. See proof of correctness at:
+    /// Depends on IEEE 754 arithmetic guarantees. See proof of correctness at:
     /// ["Adaptive Precision Floating-Point Arithmetic and Fast Robust Geometric
     /// Predicates"][paper]
     ///
-    /// [paper]: http://www.cs.cmu.edu/~quake-papers/robust-arithmetic.ps
+    /// [paper]: https://www.cs.cmu.edu/~quake-papers/robust-arithmetic.ps
     fn sum(&self) -> f64;
 
     /// Minimum value of the samples.
@@ -117,7 +116,7 @@ pub struct Summary {
 }
 
 impl Summary {
-    /// Construct a new summary of a sample set.
+    /// Constructs a new summary of a sample set.
     pub fn new(samples: &[f64]) -> Summary {
         Summary {
             sum: samples.sum(),

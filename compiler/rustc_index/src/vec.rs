@@ -1,550 +1,91 @@
+use std::borrow::{Borrow, BorrowMut};
+use std::hash::Hash;
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut, RangeBounds};
+use std::{fmt, slice, vec};
+
+#[cfg(feature = "nightly")]
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 
-use std::fmt;
-use std::fmt::Debug;
-use std::hash::Hash;
-use std::iter::{self, FromIterator};
-use std::marker::PhantomData;
-use std::ops::{Index, IndexMut, Range, RangeBounds};
-use std::slice;
-use std::vec;
+use crate::{Idx, IndexSlice};
 
-/// Represents some newtyped `usize` wrapper.
+/// An owned contiguous collection of `T`s, indexed by `I` rather than by `usize`.
 ///
-/// Purpose: avoid mixing indexes for different bitvector domains.
-pub trait Idx: Copy + 'static + Ord + Debug + Hash {
-    fn new(idx: usize) -> Self;
-
-    fn index(self) -> usize;
-
-    fn increment_by(&mut self, amount: usize) {
-        *self = self.plus(amount);
-    }
-
-    fn plus(self, amount: usize) -> Self {
-        Self::new(self.index() + amount)
-    }
-}
-
-impl Idx for usize {
-    #[inline]
-    fn new(idx: usize) -> Self {
-        idx
-    }
-    #[inline]
-    fn index(self) -> usize {
-        self
-    }
-}
-
-impl Idx for u32 {
-    #[inline]
-    fn new(idx: usize) -> Self {
-        assert!(idx <= u32::MAX as usize);
-        idx as u32
-    }
-    #[inline]
-    fn index(self) -> usize {
-        self as usize
-    }
-}
-
-/// Creates a struct type `S` that can be used as an index with
-/// `IndexVec` and so on.
+/// ## Why use this instead of a `Vec`?
 ///
-/// There are two ways of interacting with these indices:
+/// An `IndexVec` allows element access only via a specific associated index type, meaning that
+/// trying to use the wrong index type (possibly accessing an invalid element) will fail at
+/// compile time.
 ///
-/// - The `From` impls are the preferred way. So you can do
-///   `S::from(v)` with a `usize` or `u32`. And you can convert back
-///   to an integer with `u32::from(s)`.
+/// It also documents what the index is indexing: in a `HashMap<usize, Something>` it's not
+/// immediately clear what the `usize` means, while a `HashMap<FieldIdx, Something>` makes it obvious.
 ///
-/// - Alternatively, you can use the methods `S::new(v)` and `s.index()`
-///   to create/return a value.
+/// ```compile_fail
+/// use rustc_index::{Idx, IndexVec};
 ///
-/// Internally, the index uses a u32, so the index must not exceed
-/// `u32::MAX`. You can also customize things like the `Debug` impl,
-/// what traits are derived, and so forth via the macro.
-#[macro_export]
-#[allow_internal_unstable(step_trait, step_trait_ext, rustc_attrs)]
-macro_rules! newtype_index {
-    // ---- public rules ----
-
-    // Use default constants
-    ($(#[$attrs:meta])* $v:vis struct $name:ident { .. }) => (
-        $crate::newtype_index!(
-            // Leave out derives marker so we can use its absence to ensure it comes first
-            @attrs        [$(#[$attrs])*]
-            @type         [$name]
-            // shave off 256 indices at the end to allow space for packing these indices into enums
-            @max          [0xFFFF_FF00]
-            @vis          [$v]
-            @debug_format ["{}"]);
-    );
-
-    // Define any constants
-    ($(#[$attrs:meta])* $v:vis struct $name:ident { $($tokens:tt)+ }) => (
-        $crate::newtype_index!(
-            // Leave out derives marker so we can use its absence to ensure it comes first
-            @attrs        [$(#[$attrs])*]
-            @type         [$name]
-            // shave off 256 indices at the end to allow space for packing these indices into enums
-            @max          [0xFFFF_FF00]
-            @vis          [$v]
-            @debug_format ["{}"]
-                          $($tokens)+);
-    );
-
-    // ---- private rules ----
-
-    // Base case, user-defined constants (if any) have already been defined
-    (@derives      [$($derives:ident,)*]
-     @attrs        [$(#[$attrs:meta])*]
-     @type         [$type:ident]
-     @max          [$max:expr]
-     @vis          [$v:vis]
-     @debug_format [$debug_format:tt]) => (
-        $(#[$attrs])*
-        #[derive(Copy, PartialEq, Eq, Hash, PartialOrd, Ord, $($derives),*)]
-        #[rustc_layout_scalar_valid_range_end($max)]
-        $v struct $type {
-            private: u32
-        }
-
-        impl Clone for $type {
-            #[inline]
-            fn clone(&self) -> Self {
-                *self
-            }
-        }
-
-        impl $type {
-            $v const MAX_AS_U32: u32 = $max;
-
-            $v const MAX: Self = Self::from_u32($max);
-
-            #[inline]
-            $v const fn from_usize(value: usize) -> Self {
-                assert!(value <= ($max as usize));
-                unsafe {
-                    Self::from_u32_unchecked(value as u32)
-                }
-            }
-
-            #[inline]
-            $v const fn from_u32(value: u32) -> Self {
-                assert!(value <= $max);
-                unsafe {
-                    Self::from_u32_unchecked(value)
-                }
-            }
-
-            #[inline]
-            $v const unsafe fn from_u32_unchecked(value: u32) -> Self {
-                Self { private: value }
-            }
-
-            /// Extracts the value of this index as an integer.
-            #[inline]
-            $v const fn index(self) -> usize {
-                self.as_usize()
-            }
-
-            /// Extracts the value of this index as a `u32`.
-            #[inline]
-            $v const fn as_u32(self) -> u32 {
-                self.private
-            }
-
-            /// Extracts the value of this index as a `usize`.
-            #[inline]
-            $v const fn as_usize(self) -> usize {
-                self.as_u32() as usize
-            }
-        }
-
-        impl std::ops::Add<usize> for $type {
-            type Output = Self;
-
-            fn add(self, other: usize) -> Self {
-                Self::from_usize(self.index() + other)
-            }
-        }
-
-        impl $crate::vec::Idx for $type {
-            #[inline]
-            fn new(value: usize) -> Self {
-                Self::from_usize(value)
-            }
-
-            #[inline]
-            fn index(self) -> usize {
-                self.as_usize()
-            }
-        }
-
-        unsafe impl ::std::iter::Step for $type {
-            #[inline]
-            fn steps_between(start: &Self, end: &Self) -> Option<usize> {
-                <usize as ::std::iter::Step>::steps_between(
-                    &Self::index(*start),
-                    &Self::index(*end),
-                )
-            }
-
-            #[inline]
-            fn forward_checked(start: Self, u: usize) -> Option<Self> {
-                Self::index(start).checked_add(u).map(Self::from_usize)
-            }
-
-            #[inline]
-            fn backward_checked(start: Self, u: usize) -> Option<Self> {
-                Self::index(start).checked_sub(u).map(Self::from_usize)
-            }
-        }
-
-        impl From<$type> for u32 {
-            #[inline]
-            fn from(v: $type) -> u32 {
-                v.as_u32()
-            }
-        }
-
-        impl From<$type> for usize {
-            #[inline]
-            fn from(v: $type) -> usize {
-                v.as_usize()
-            }
-        }
-
-        impl From<usize> for $type {
-            #[inline]
-            fn from(value: usize) -> Self {
-                Self::from_usize(value)
-            }
-        }
-
-        impl From<u32> for $type {
-            #[inline]
-            fn from(value: u32) -> Self {
-                Self::from_u32(value)
-            }
-        }
-
-        $crate::newtype_index!(
-            @handle_debug
-            @derives      [$($derives,)*]
-            @type         [$type]
-            @debug_format [$debug_format]);
-    );
-
-    // base case for handle_debug where format is custom. No Debug implementation is emitted.
-    (@handle_debug
-     @derives      [$($_derives:ident,)*]
-     @type         [$type:ident]
-     @debug_format [custom]) => ();
-
-    // base case for handle_debug, no debug overrides found, so use default
-    (@handle_debug
-     @derives      []
-     @type         [$type:ident]
-     @debug_format [$debug_format:tt]) => (
-        impl ::std::fmt::Debug for $type {
-            fn fmt(&self, fmt: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-                write!(fmt, $debug_format, self.as_u32())
-            }
-        }
-    );
-
-    // Debug is requested for derive, don't generate any Debug implementation.
-    (@handle_debug
-     @derives      [Debug, $($derives:ident,)*]
-     @type         [$type:ident]
-     @debug_format [$debug_format:tt]) => ();
-
-    // It's not Debug, so just pop it off the front of the derives stack and check the rest.
-    (@handle_debug
-     @derives      [$_derive:ident, $($derives:ident,)*]
-     @type         [$type:ident]
-     @debug_format [$debug_format:tt]) => (
-        $crate::newtype_index!(
-            @handle_debug
-            @derives      [$($derives,)*]
-            @type         [$type]
-            @debug_format [$debug_format]);
-    );
-
-    // Append comma to end of derives list if it's missing
-    (@attrs        [$(#[$attrs:meta])*]
-     @type         [$type:ident]
-     @max          [$max:expr]
-     @vis          [$v:vis]
-     @debug_format [$debug_format:tt]
-                   derive [$($derives:ident),*]
-                   $($tokens:tt)*) => (
-        $crate::newtype_index!(
-            @attrs        [$(#[$attrs])*]
-            @type         [$type]
-            @max          [$max]
-            @vis          [$v]
-            @debug_format [$debug_format]
-                          derive [$($derives,)*]
-                          $($tokens)*);
-    );
-
-    // By not including the @derives marker in this list nor in the default args, we can force it
-    // to come first if it exists. When encodable is custom, just use the derives list as-is.
-    (@attrs        [$(#[$attrs:meta])*]
-     @type         [$type:ident]
-     @max          [$max:expr]
-     @vis          [$v:vis]
-     @debug_format [$debug_format:tt]
-                   derive [$($derives:ident,)+]
-                   ENCODABLE = custom
-                   $($tokens:tt)*) => (
-        $crate::newtype_index!(
-            @attrs        [$(#[$attrs])*]
-            @derives      [$($derives,)+]
-            @type         [$type]
-            @max          [$max]
-            @vis          [$v]
-            @debug_format [$debug_format]
-                          $($tokens)*);
-    );
-
-    // By not including the @derives marker in this list nor in the default args, we can force it
-    // to come first if it exists. When encodable isn't custom, add serialization traits by default.
-    (@attrs        [$(#[$attrs:meta])*]
-     @type         [$type:ident]
-     @max          [$max:expr]
-     @vis          [$v:vis]
-     @debug_format [$debug_format:tt]
-                   derive [$($derives:ident,)+]
-                   $($tokens:tt)*) => (
-        $crate::newtype_index!(
-            @derives      [$($derives,)+]
-            @attrs        [$(#[$attrs])*]
-            @type         [$type]
-            @max          [$max]
-            @vis          [$v]
-            @debug_format [$debug_format]
-                          $($tokens)*);
-        $crate::newtype_index!(@serializable $type);
-    );
-
-    // The case where no derives are added, but encodable is overridden. Don't
-    // derive serialization traits
-    (@attrs        [$(#[$attrs:meta])*]
-     @type         [$type:ident]
-     @max          [$max:expr]
-     @vis          [$v:vis]
-     @debug_format [$debug_format:tt]
-                   ENCODABLE = custom
-                   $($tokens:tt)*) => (
-        $crate::newtype_index!(
-            @derives      []
-            @attrs        [$(#[$attrs])*]
-            @type         [$type]
-            @max          [$max]
-            @vis          [$v]
-            @debug_format [$debug_format]
-                          $($tokens)*);
-    );
-
-    // The case where no derives are added, add serialization derives by default
-    (@attrs        [$(#[$attrs:meta])*]
-     @type         [$type:ident]
-     @max          [$max:expr]
-     @vis          [$v:vis]
-     @debug_format [$debug_format:tt]
-                   $($tokens:tt)*) => (
-        $crate::newtype_index!(
-            @derives      []
-            @attrs        [$(#[$attrs])*]
-            @type         [$type]
-            @max          [$max]
-            @vis          [$v]
-            @debug_format [$debug_format]
-                          $($tokens)*);
-        $crate::newtype_index!(@serializable $type);
-    );
-
-    (@serializable $type:ident) => (
-        impl<D: ::rustc_serialize::Decoder> ::rustc_serialize::Decodable<D> for $type {
-            fn decode(d: &mut D) -> Result<Self, D::Error> {
-                d.read_u32().map(Self::from_u32)
-            }
-        }
-        impl<E: ::rustc_serialize::Encoder> ::rustc_serialize::Encodable<E> for $type {
-            fn encode(&self, e: &mut E) -> Result<(), E::Error> {
-                e.emit_u32(self.private)
-            }
-        }
-    );
-
-    // Rewrite final without comma to one that includes comma
-    (@derives      [$($derives:ident,)*]
-     @attrs        [$(#[$attrs:meta])*]
-     @type         [$type:ident]
-     @max          [$max:expr]
-     @vis          [$v:vis]
-     @debug_format [$debug_format:tt]
-                   $name:ident = $constant:expr) => (
-        $crate::newtype_index!(
-            @derives      [$($derives,)*]
-            @attrs        [$(#[$attrs])*]
-            @type         [$type]
-            @max          [$max]
-            @vis          [$v]
-            @debug_format [$debug_format]
-                          $name = $constant,);
-    );
-
-    // Rewrite final const without comma to one that includes comma
-    (@derives      [$($derives:ident,)*]
-     @attrs        [$(#[$attrs:meta])*]
-     @type         [$type:ident]
-     @max          [$max:expr]
-     @vis          [$v:vis]
-     @debug_format [$debug_format:tt]
-                   $(#[doc = $doc:expr])*
-                   const $name:ident = $constant:expr) => (
-        $crate::newtype_index!(
-            @derives      [$($derives,)*]
-            @attrs        [$(#[$attrs])*]
-            @type         [$type]
-            @max          [$max]
-            @vis          [$v]
-            @debug_format [$debug_format]
-                          $(#[doc = $doc])* const $name = $constant,);
-    );
-
-    // Replace existing default for max
-    (@derives      [$($derives:ident,)*]
-     @attrs        [$(#[$attrs:meta])*]
-     @type         [$type:ident]
-     @max          [$_max:expr]
-     @vis          [$v:vis]
-     @debug_format [$debug_format:tt]
-                   MAX = $max:expr,
-                   $($tokens:tt)*) => (
-        $crate::newtype_index!(
-            @derives      [$($derives,)*]
-            @attrs        [$(#[$attrs])*]
-            @type         [$type]
-            @max          [$max]
-            @vis          [$v]
-            @debug_format [$debug_format]
-                          $($tokens)*);
-    );
-
-    // Replace existing default for debug_format
-    (@derives      [$($derives:ident,)*]
-     @attrs        [$(#[$attrs:meta])*]
-     @type         [$type:ident]
-     @max          [$max:expr]
-     @vis          [$v:vis]
-     @debug_format [$_debug_format:tt]
-                   DEBUG_FORMAT = $debug_format:tt,
-                   $($tokens:tt)*) => (
-        $crate::newtype_index!(
-            @derives      [$($derives,)*]
-            @attrs        [$(#[$attrs])*]
-            @type         [$type]
-            @max          [$max]
-            @vis          [$v]
-            @debug_format [$debug_format]
-                          $($tokens)*);
-    );
-
-    // Assign a user-defined constant
-    (@derives      [$($derives:ident,)*]
-     @attrs        [$(#[$attrs:meta])*]
-     @type         [$type:ident]
-     @max          [$max:expr]
-     @vis          [$v:vis]
-     @debug_format [$debug_format:tt]
-                   $(#[doc = $doc:expr])*
-                   const $name:ident = $constant:expr,
-                   $($tokens:tt)*) => (
-        $(#[doc = $doc])*
-        $v const $name: $type = $type::from_u32($constant);
-        $crate::newtype_index!(
-            @derives      [$($derives,)*]
-            @attrs        [$(#[$attrs])*]
-            @type         [$type]
-            @max          [$max]
-            @vis          [$v]
-            @debug_format [$debug_format]
-                          $($tokens)*);
-    );
-}
-
+/// fn f<I1: Idx, I2: Idx>(vec1: IndexVec<I1, u8>, idx1: I1, idx2: I2) {
+///   &vec1[idx1]; // Ok
+///   &vec1[idx2]; // Compile error!
+/// }
+/// ```
+///
+/// While it's possible to use `u32` or `usize` directly for `I`,
+/// you almost certainly want to use a [`newtype_index!`]-generated type instead.
+///
+/// This allows to index the IndexVec with the new index type.
+///
+/// [`newtype_index!`]: ../macro.newtype_index.html
 #[derive(Clone, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct IndexVec<I: Idx, T> {
     pub raw: Vec<T>,
     _marker: PhantomData<fn(&I)>,
 }
 
-// Whether `IndexVec` is `Send` depends only on the data,
-// not the phantom data.
-unsafe impl<I: Idx, T> Send for IndexVec<I, T> where T: Send {}
-
-impl<S: Encoder, I: Idx, T: Encodable<S>> Encodable<S> for IndexVec<I, T> {
-    fn encode(&self, s: &mut S) -> Result<(), S::Error> {
-        Encodable::encode(&self.raw, s)
-    }
-}
-
-impl<S: Encoder, I: Idx, T: Encodable<S>> Encodable<S> for &IndexVec<I, T> {
-    fn encode(&self, s: &mut S) -> Result<(), S::Error> {
-        Encodable::encode(&self.raw, s)
-    }
-}
-
-impl<D: Decoder, I: Idx, T: Decodable<D>> Decodable<D> for IndexVec<I, T> {
-    fn decode(d: &mut D) -> Result<Self, D::Error> {
-        Decodable::decode(d).map(|v| IndexVec { raw: v, _marker: PhantomData })
-    }
-}
-
-impl<I: Idx, T: fmt::Debug> fmt::Debug for IndexVec<I, T> {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.raw, fmt)
-    }
-}
-
-pub type Enumerated<I, J> = iter::Map<iter::Enumerate<J>, IntoIdx<I>>;
-
 impl<I: Idx, T> IndexVec<I, T> {
+    /// Constructs a new, empty `IndexVec<I, T>`.
     #[inline]
-    pub fn new() -> Self {
-        IndexVec { raw: Vec::new(), _marker: PhantomData }
+    pub const fn new() -> Self {
+        IndexVec::from_raw(Vec::new())
     }
 
+    /// Constructs a new `IndexVec<I, T>` from a `Vec<T>`.
     #[inline]
-    pub fn from_raw(raw: Vec<T>) -> Self {
+    pub const fn from_raw(raw: Vec<T>) -> Self {
         IndexVec { raw, _marker: PhantomData }
     }
 
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        IndexVec { raw: Vec::with_capacity(capacity), _marker: PhantomData }
+        IndexVec::from_raw(Vec::with_capacity(capacity))
     }
 
+    /// Creates a new vector with a copy of `elem` for each index in `universe`.
+    ///
+    /// Thus `IndexVec::from_elem(elem, &universe)` is equivalent to
+    /// `IndexVec::<I, _>::from_elem_n(elem, universe.len())`. That can help
+    /// type inference as it ensures that the resulting vector uses the same
+    /// index type as `universe`, rather than something potentially surprising.
+    ///
+    /// For example, if you want to store data for each local in a MIR body,
+    /// using `let mut uses = IndexVec::from_elem(vec![], &body.local_decls);`
+    /// ensures that `uses` is an `IndexVec<Local, _>`, and thus can give
+    /// better error messages later if one accidentally mismatches indices.
     #[inline]
-    pub fn from_elem<S>(elem: T, universe: &IndexVec<I, S>) -> Self
+    pub fn from_elem<S>(elem: T, universe: &IndexSlice<I, S>) -> Self
     where
         T: Clone,
     {
-        IndexVec { raw: vec![elem; universe.len()], _marker: PhantomData }
+        IndexVec::from_raw(vec![elem; universe.len()])
     }
 
+    /// Creates a new IndexVec with n copies of the `elem`.
     #[inline]
     pub fn from_elem_n(elem: T, n: usize) -> Self
     where
         T: Clone,
     {
-        IndexVec { raw: vec![elem; n], _marker: PhantomData }
+        IndexVec::from_raw(vec![elem; n])
     }
 
     /// Create an `IndexVec` with `n` elements, where the value of each
@@ -552,13 +93,25 @@ impl<I: Idx, T> IndexVec<I, T> {
     /// be allocated only once, with a capacity of at least `n`.)
     #[inline]
     pub fn from_fn_n(func: impl FnMut(I) -> T, n: usize) -> Self {
-        let indices = (0..n).map(I::new);
-        Self::from_raw(indices.map(func).collect())
+        // Allow the optimizer to elide the bounds checking when creating each index.
+        let _ = I::new(n);
+        IndexVec::from_raw((0..n).map(I::new).map(func).collect())
     }
 
     #[inline]
+    pub fn as_slice(&self) -> &IndexSlice<I, T> {
+        IndexSlice::from_raw(&self.raw)
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut IndexSlice<I, T> {
+        IndexSlice::from_raw_mut(&mut self.raw)
+    }
+
+    /// Pushes an element to the array returning the index where it was pushed to.
+    #[inline]
     pub fn push(&mut self, d: T) -> I {
-        let idx = I::new(self.len());
+        let idx = self.next_index();
         self.raw.push(d);
         idx
     }
@@ -569,76 +122,35 @@ impl<I: Idx, T> IndexVec<I, T> {
     }
 
     #[inline]
-    pub fn len(&self) -> usize {
-        self.raw.len()
-    }
-
-    /// Gives the next index that will be assigned when `push` is
-    /// called.
-    #[inline]
-    pub fn next_index(&self) -> I {
-        I::new(self.len())
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.raw.is_empty()
-    }
-
-    #[inline]
     pub fn into_iter(self) -> vec::IntoIter<T> {
         self.raw.into_iter()
     }
 
     #[inline]
-    pub fn into_iter_enumerated(self) -> Enumerated<I, vec::IntoIter<T>> {
-        self.raw.into_iter().enumerate().map(IntoIdx { _marker: PhantomData })
+    pub fn into_iter_enumerated(
+        self,
+    ) -> impl DoubleEndedIterator<Item = (I, T)> + ExactSizeIterator {
+        // Allow the optimizer to elide the bounds checking when creating each index.
+        let _ = I::new(self.len());
+        self.raw.into_iter().enumerate().map(|(n, t)| (I::new(n), t))
     }
 
     #[inline]
-    pub fn iter(&self) -> slice::Iter<'_, T> {
-        self.raw.iter()
-    }
-
-    #[inline]
-    pub fn iter_enumerated(&self) -> Enumerated<I, slice::Iter<'_, T>> {
-        self.raw.iter().enumerate().map(IntoIdx { _marker: PhantomData })
-    }
-
-    #[inline]
-    pub fn indices(&self) -> iter::Map<Range<usize>, IntoIdx<I>> {
-        (0..self.len()).map(IntoIdx { _marker: PhantomData })
-    }
-
-    #[inline]
-    pub fn iter_mut(&mut self) -> slice::IterMut<'_, T> {
-        self.raw.iter_mut()
-    }
-
-    #[inline]
-    pub fn iter_enumerated_mut(&mut self) -> Enumerated<I, slice::IterMut<'_, T>> {
-        self.raw.iter_mut().enumerate().map(IntoIdx { _marker: PhantomData })
-    }
-
-    #[inline]
-    pub fn drain<'a, R: RangeBounds<usize>>(
-        &'a mut self,
-        range: R,
-    ) -> impl Iterator<Item = T> + 'a {
+    pub fn drain<R: RangeBounds<usize>>(&mut self, range: R) -> impl Iterator<Item = T> {
         self.raw.drain(range)
     }
 
     #[inline]
-    pub fn drain_enumerated<'a, R: RangeBounds<usize>>(
-        &'a mut self,
+    pub fn drain_enumerated<R: RangeBounds<usize>>(
+        &mut self,
         range: R,
-    ) -> impl Iterator<Item = (I, T)> + 'a {
-        self.raw.drain(range).enumerate().map(IntoIdx { _marker: PhantomData })
-    }
-
-    #[inline]
-    pub fn last(&self) -> Option<I> {
-        self.len().checked_sub(1).map(I::new)
+    ) -> impl Iterator<Item = (I, T)> {
+        let begin = match range.start_bound() {
+            std::ops::Bound::Included(i) => *i,
+            std::ops::Bound::Excluded(i) => i.checked_add(1).unwrap(),
+            std::ops::Bound::Unbounded => 0,
+        };
+        self.raw.drain(range).enumerate().map(move |(n, t)| (I::new(begin + n), t))
     }
 
     #[inline]
@@ -647,65 +159,32 @@ impl<I: Idx, T> IndexVec<I, T> {
     }
 
     #[inline]
-    pub fn swap(&mut self, a: I, b: I) {
-        self.raw.swap(a.index(), b.index())
-    }
-
-    #[inline]
     pub fn truncate(&mut self, a: usize) {
         self.raw.truncate(a)
-    }
-
-    #[inline]
-    pub fn get(&self, index: I) -> Option<&T> {
-        self.raw.get(index.index())
-    }
-
-    #[inline]
-    pub fn get_mut(&mut self, index: I) -> Option<&mut T> {
-        self.raw.get_mut(index.index())
-    }
-
-    /// Returns mutable references to two distinct elements, a and b. Panics if a == b.
-    #[inline]
-    pub fn pick2_mut(&mut self, a: I, b: I) -> (&mut T, &mut T) {
-        let (ai, bi) = (a.index(), b.index());
-        assert!(ai != bi);
-
-        if ai < bi {
-            let (c1, c2) = self.raw.split_at_mut(bi);
-            (&mut c1[ai], &mut c2[0])
-        } else {
-            let (c2, c1) = self.pick2_mut(b, a);
-            (c1, c2)
-        }
-    }
-
-    /// Returns mutable references to three distinct elements or panics otherwise.
-    #[inline]
-    pub fn pick3_mut(&mut self, a: I, b: I, c: I) -> (&mut T, &mut T, &mut T) {
-        let (ai, bi, ci) = (a.index(), b.index(), c.index());
-        assert!(ai != bi && bi != ci && ci != ai);
-        let len = self.raw.len();
-        assert!(ai < len && bi < len && ci < len);
-        let ptr = self.raw.as_mut_ptr();
-        unsafe { (&mut *ptr.add(ai), &mut *ptr.add(bi), &mut *ptr.add(ci)) }
-    }
-
-    pub fn convert_index_type<Ix: Idx>(self) -> IndexVec<Ix, T> {
-        IndexVec { raw: self.raw, _marker: PhantomData }
     }
 
     /// Grows the index vector so that it contains an entry for
     /// `elem`; if that is already true, then has no
     /// effect. Otherwise, inserts new values as needed by invoking
     /// `fill_value`.
+    ///
+    /// Returns a reference to the `elem` entry.
     #[inline]
-    pub fn ensure_contains_elem(&mut self, elem: I, fill_value: impl FnMut() -> T) {
+    pub fn ensure_contains_elem(&mut self, elem: I, fill_value: impl FnMut() -> T) -> &mut T {
         let min_new_len = elem.index() + 1;
         if self.len() < min_new_len {
             self.raw.resize_with(min_new_len, fill_value);
         }
+
+        &mut self[elem]
+    }
+
+    #[inline]
+    pub fn resize(&mut self, new_len: usize, value: T)
+    where
+        T: Clone,
+    {
+        self.raw.resize(new_len, value)
     }
 
     #[inline]
@@ -713,45 +192,67 @@ impl<I: Idx, T> IndexVec<I, T> {
         let min_new_len = elem.index() + 1;
         self.raw.resize_with(min_new_len, fill_value);
     }
-}
 
-impl<I: Idx, T: Clone> IndexVec<I, T> {
     #[inline]
-    pub fn resize(&mut self, new_len: usize, value: T) {
-        self.raw.resize(new_len, value)
+    pub fn append(&mut self, other: &mut Self) {
+        self.raw.append(&mut other.raw);
     }
 }
 
-impl<I: Idx, T: Ord> IndexVec<I, T> {
+/// `IndexVec` is often used as a map, so it provides some map-like APIs.
+impl<I: Idx, T> IndexVec<I, Option<T>> {
     #[inline]
-    pub fn binary_search(&self, value: &T) -> Result<I, I> {
-        match self.raw.binary_search(value) {
-            Ok(i) => Ok(Idx::new(i)),
-            Err(i) => Err(Idx::new(i)),
-        }
+    pub fn insert(&mut self, index: I, value: T) -> Option<T> {
+        self.ensure_contains_elem(index, || None).replace(value)
+    }
+
+    #[inline]
+    pub fn get_or_insert_with(&mut self, index: I, value: impl FnOnce() -> T) -> &mut T {
+        self.ensure_contains_elem(index, || None).get_or_insert_with(value)
+    }
+
+    #[inline]
+    pub fn remove(&mut self, index: I) -> Option<T> {
+        self.get_mut(index)?.take()
+    }
+
+    #[inline]
+    pub fn contains(&self, index: I) -> bool {
+        self.get(index).and_then(Option::as_ref).is_some()
     }
 }
 
-impl<I: Idx, T> Index<I> for IndexVec<I, T> {
-    type Output = T;
-
-    #[inline]
-    fn index(&self, index: I) -> &T {
-        &self.raw[index.index()]
+impl<I: Idx, T: fmt::Debug> fmt::Debug for IndexVec<I, T> {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.raw, fmt)
     }
 }
 
-impl<I: Idx, T> IndexMut<I> for IndexVec<I, T> {
+impl<I: Idx, T> Deref for IndexVec<I, T> {
+    type Target = IndexSlice<I, T>;
+
     #[inline]
-    fn index_mut(&mut self, index: I) -> &mut T {
-        &mut self.raw[index.index()]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
     }
 }
 
-impl<I: Idx, T> Default for IndexVec<I, T> {
+impl<I: Idx, T> DerefMut for IndexVec<I, T> {
     #[inline]
-    fn default() -> Self {
-        Self::new()
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut_slice()
+    }
+}
+
+impl<I: Idx, T> Borrow<IndexSlice<I, T>> for IndexVec<I, T> {
+    fn borrow(&self) -> &IndexSlice<I, T> {
+        self
+    }
+}
+
+impl<I: Idx, T> BorrowMut<IndexSlice<I, T>> for IndexVec<I, T> {
+    fn borrow_mut(&mut self) -> &mut IndexSlice<I, T> {
+        self
     }
 }
 
@@ -762,11 +263,13 @@ impl<I: Idx, T> Extend<T> for IndexVec<I, T> {
     }
 
     #[inline]
+    #[cfg(feature = "nightly")]
     fn extend_one(&mut self, item: T) {
         self.raw.push(item);
     }
 
     #[inline]
+    #[cfg(feature = "nightly")]
     fn extend_reserve(&mut self, additional: usize) {
         self.raw.reserve(additional);
     }
@@ -778,7 +281,7 @@ impl<I: Idx, T> FromIterator<T> for IndexVec<I, T> {
     where
         J: IntoIterator<Item = T>,
     {
-        IndexVec { raw: FromIterator::from_iter(iter), _marker: PhantomData }
+        IndexVec::from_raw(Vec::from_iter(iter))
     }
 }
 
@@ -798,7 +301,7 @@ impl<'a, I: Idx, T> IntoIterator for &'a IndexVec<I, T> {
 
     #[inline]
     fn into_iter(self) -> slice::Iter<'a, T> {
-        self.raw.iter()
+        self.iter()
     }
 }
 
@@ -808,40 +311,41 @@ impl<'a, I: Idx, T> IntoIterator for &'a mut IndexVec<I, T> {
 
     #[inline]
     fn into_iter(self) -> slice::IterMut<'a, T> {
-        self.raw.iter_mut()
+        self.iter_mut()
     }
 }
 
-pub struct IntoIdx<I: Idx> {
-    _marker: PhantomData<fn(&I)>,
-}
-impl<I: Idx, T> FnOnce<((usize, T),)> for IntoIdx<I> {
-    type Output = (I, T);
-
-    extern "rust-call" fn call_once(self, ((n, t),): ((usize, T),)) -> Self::Output {
-        (I::new(n), t)
+impl<I: Idx, T> Default for IndexVec<I, T> {
+    #[inline]
+    fn default() -> Self {
+        IndexVec::new()
     }
 }
 
-impl<I: Idx, T> FnMut<((usize, T),)> for IntoIdx<I> {
-    extern "rust-call" fn call_mut(&mut self, ((n, t),): ((usize, T),)) -> Self::Output {
-        (I::new(n), t)
+impl<I: Idx, T, const N: usize> From<[T; N]> for IndexVec<I, T> {
+    #[inline]
+    fn from(array: [T; N]) -> Self {
+        IndexVec::from_raw(array.into())
     }
 }
 
-impl<I: Idx> FnOnce<(usize,)> for IntoIdx<I> {
-    type Output = I;
-
-    extern "rust-call" fn call_once(self, (n,): (usize,)) -> Self::Output {
-        I::new(n)
+#[cfg(feature = "nightly")]
+impl<S: Encoder, I: Idx, T: Encodable<S>> Encodable<S> for IndexVec<I, T> {
+    fn encode(&self, s: &mut S) {
+        Encodable::encode(&self.raw, s);
     }
 }
 
-impl<I: Idx> FnMut<(usize,)> for IntoIdx<I> {
-    extern "rust-call" fn call_mut(&mut self, (n,): (usize,)) -> Self::Output {
-        I::new(n)
+#[cfg(feature = "nightly")]
+impl<D: Decoder, I: Idx, T: Decodable<D>> Decodable<D> for IndexVec<I, T> {
+    fn decode(d: &mut D) -> Self {
+        IndexVec::from_raw(Vec::<T>::decode(d))
     }
 }
+
+// Whether `IndexVec` is `Send` depends only on the data,
+// not the phantom data.
+unsafe impl<I: Idx, T> Send for IndexVec<I, T> where T: Send {}
 
 #[cfg(test)]
 mod tests;

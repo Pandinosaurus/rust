@@ -16,19 +16,18 @@ fn test_symbols() {
     let m: &syn::ItemMacro = file
         .items
         .iter()
-        .filter_map(|i| {
+        .find_map(|i| {
             if let syn::Item::Macro(m) = i {
                 if m.mac.path == symbols_path { Some(m) } else { None }
             } else {
                 None
             }
         })
-        .next()
         .expect("did not find `symbols!` macro invocation.");
 
     let body_tokens = m.mac.tokens.clone();
 
-    test_symbols_macro(body_tokens, &[]);
+    test_symbols_macro(body_tokens, &["proc_macro::tracked_env is not available in unit test"]);
 }
 
 fn test_symbols_macro(input: TokenStream, expected_errors: &[&str]) {
@@ -43,7 +42,7 @@ fn test_symbols_macro(input: TokenStream, expected_errors: &[&str]) {
         "Macro generated a different number of errors than expected"
     );
 
-    for (found_error, &expected_error) in found_errors.iter().zip(expected_errors.iter()) {
+    for (found_error, &expected_error) in found_errors.iter().zip(expected_errors) {
         let found_error_str = format!("{}", found_error);
         assert_eq!(found_error_str, expected_error);
     }
@@ -84,19 +83,4 @@ fn check_dup_symbol_and_keyword() {
         }
     };
     test_symbols_macro(input, &["Symbol `splat` is duplicated", "location of previous definition"]);
-}
-
-#[test]
-fn check_symbol_order() {
-    let input = quote! {
-        Keywords {}
-        Symbols {
-            zebra,
-            aardvark,
-        }
-    };
-    test_symbols_macro(
-        input,
-        &["Symbol `aardvark` must precede `zebra`", "location of previous symbol `zebra`"],
-    );
 }

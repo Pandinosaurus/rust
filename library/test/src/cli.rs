@@ -1,9 +1,9 @@
 //! Module converting command-line arguments into test configuration.
 
 use std::env;
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
-use super::helpers::isatty;
 use super::options::{ColorConfig, Options, OutputFormat, RunIgnored};
 use super::time::TestTimeOptions;
 
@@ -21,16 +21,22 @@ pub struct TestOpts {
     pub nocapture: bool,
     pub color: ColorConfig,
     pub format: OutputFormat,
+    pub shuffle: bool,
+    pub shuffle_seed: Option<u64>,
     pub test_threads: Option<usize>,
     pub skip: Vec<String>,
     pub time_options: Option<TestTimeOptions>,
+    /// Stop at first failing test.
+    /// May run a few more tests due to threading, but will
+    /// abort as soon as possible.
+    pub fail_fast: bool,
     pub options: Options,
 }
 
 impl TestOpts {
     pub fn use_color(&self) -> bool {
         match self.color {
-            ColorConfig::AutoColor => !self.nocapture && isatty::stdout_isatty(),
+            ColorConfig::AutoColor => !self.nocapture && io::stdout().is_terminal(),
             ColorConfig::AlwaysColor => true,
             ColorConfig::NeverColor => false,
         }
@@ -38,7 +44,7 @@ impl TestOpts {
 }
 
 /// Result of parsing the options.
-pub type OptRes = Result<TestOpts, String>;
+pub(crate) type OptRes = Result<TestOpts, String>;
 /// Result of parsing the option part.
 type OptPartRes<T> = Result<T, String>;
 
@@ -51,11 +57,12 @@ fn optgroups() -> getopts::Options {
         .optflag("", "test", "Run tests and not benchmarks")
         .optflag("", "bench", "Run benchmarks instead of tests")
         .optflag("", "list", "List all tests and benchmarks")
+        .optflag("", "fail-fast", "Don't start new tests after the first failure")
         .optflag("h", "help", "Display this message")
-        .optopt("", "logfile", "Write logs to the specified file", "PATH")
+        .optopt("", "logfile", "Write logs to the specified file (deprecated)", "PATH")
         .optflag(
             "",
-            "nocapture",
+            "no-capture",
             "don't capture stdout/stderr of each \
              task, allow printing directly",
         )
@@ -95,8 +102,9 @@ fn optgroups() -> getopts::Options {
             "Configure formatting of output:
             pretty = Print verbose output;
             terse  = Display one character per test;
-            json   = Output a json document",
-            "pretty|terse|json",
+            json   = Output a json document;
+            junit  = Output a JUnit document",
+            "pretty|terse|json|junit",
         )
         .optflag("", "show-output", "Show captured stdout of successful tests")
         .optopt(
@@ -106,12 +114,10 @@ fn optgroups() -> getopts::Options {
             unstable-options = Allow use of experimental features",
             "unstable-options",
         )
-        .optflagopt(
+        .optflag(
             "",
             "report-time",
-            "Show execution time of each test. Available values:
-            plain   = do not colorize the execution time (default);
-            colored = colorize output according to the `color` parameter value;
+            "Show execution time of each test.
 
             Threshold values for colorized output can be configured via
             `RUST_TEST_TIME_UNIT`, `RUST_TEST_TIME_INTEGRATION` and
@@ -122,7 +128,6 @@ fn optgroups() -> getopts::Options {
             is 0.5 seconds, and the critical time is 2 seconds.
 
             Not available for --format=terse",
-            "plain|colored",
         )
         .optflag(
             "",
@@ -137,12 +142,19 @@ fn optgroups() -> getopts::Options {
 
             `CRITICAL_TIME` here means the limit that should not be exceeded by test.
             ",
+        )
+        .optflag("", "shuffle", "Run tests in random order")
+        .optopt(
+            "",
+            "shuffle-seed",
+            "Run tests in random order; seed the random number generator with SEED",
+            "SEED",
         );
     opts
 }
 
 fn usage(binary: &str, options: &getopts::Options) {
-    let message = format!("Usage: {} [OPTIONS] [FILTERS...]", binary);
+    let message = format!("Usage: {binary} [OPTIONS] [FILTERS...]");
     println!(
         r#"{usage}
 
@@ -151,12 +163,17 @@ tests whose names contain the filter are run. Multiple filter strings may
 be passed, which will run all tests matching any of the filters.
 
 By default, all tests are run in parallel. This can be altered with the
---test-threads flag or the RUST_TEST_THREADS environment variable when running
-tests (set it to 1).
+--test-threads flag when running tests (set it to 1).
+
+By default, the tests are run in alphabetical order. Use --shuffle to run
+the tests in random order. Pass the generated "shuffle seed" to
+--shuffle-seed to run the tests in the same order again. Note that
+--shuffle and --shuffle-seed do not affect whether the tests are run in
+parallel.
 
 All tests have their standard output and standard error captured by default.
-This can be overridden with the --nocapture flag or setting RUST_TEST_NOCAPTURE
-environment variable to a value other than "0". Logging is not captured by default.
+This can be overridden with the --no-capture flag to a value other than "0".
+Logging is not captured by default.
 
 Test Attributes:
 
@@ -182,7 +199,11 @@ Test Attributes:
 /// otherwise creates a `TestOpts` object and returns it.
 pub fn parse_opts(args: &[String]) -> Option<OptRes> {
     // Parse matches.
-    let opts = optgroups();
+    let mut opts = optgroups();
+    // Flags hidden from `usage`
+    opts.optflag("", "nocapture", "Deprecated, use `--no-capture`");
+
+    let binary = args.first().map(|c| &**c).unwrap_or("...");
     let args = args.get(1..).unwrap_or(args);
     let matches = match opts.parse(args) {
         Ok(m) => m,
@@ -192,7 +213,7 @@ pub fn parse_opts(args: &[String]) -> Option<OptRes> {
     // Check if help was requested.
     if matches.opt_present("h") {
         // Show help and do nothing more.
-        usage(&args[0], &opts);
+        usage(binary, &optgroups());
         return None;
     }
 
@@ -217,6 +238,21 @@ macro_rules! unstable_optflag {
     }};
 }
 
+// Gets the option value and checks if unstable features are enabled.
+macro_rules! unstable_optopt {
+    ($matches:ident, $allow_unstable:ident, $option_name:literal) => {{
+        let opt = $matches.opt_str($option_name);
+        if !$allow_unstable && opt.is_some() {
+            return Err(format!(
+                "The \"{}\" option is only accepted on the nightly compiler with -Z unstable-options",
+                $option_name
+            ));
+        }
+
+        opt
+    }};
+}
+
 // Implementation of `parse_opts` that doesn't care about help message
 // and returns a `Result`.
 fn parse_opts_impl(matches: getopts::Matches) -> OptRes {
@@ -225,7 +261,10 @@ fn parse_opts_impl(matches: getopts::Matches) -> OptRes {
     // Unstable flags
     let force_run_in_process = unstable_optflag!(matches, allow_unstable, "force-run-in-process");
     let exclude_should_panic = unstable_optflag!(matches, allow_unstable, "exclude-should-panic");
+    let fail_fast = unstable_optflag!(matches, allow_unstable, "fail-fast");
     let time_options = get_time_options(&matches, allow_unstable)?;
+    let shuffle = get_shuffle(&matches, allow_unstable)?;
+    let shuffle_seed = get_shuffle_seed(&matches, allow_unstable)?;
 
     let include_ignored = matches.opt_present("include-ignored");
     let quiet = matches.opt_present("quiet");
@@ -246,6 +285,10 @@ fn parse_opts_impl(matches: getopts::Matches) -> OptRes {
 
     let options = Options::new().display_output(matches.opt_present("show-output"));
 
+    if logfile.is_some() {
+        let _ = write!(io::stderr(), "warning: `--logfile` is deprecated");
+    }
+
     let test_opts = TestOpts {
         list,
         filters,
@@ -259,10 +302,13 @@ fn parse_opts_impl(matches: getopts::Matches) -> OptRes {
         nocapture,
         color,
         format,
+        shuffle,
+        shuffle_seed,
         test_threads,
         skip,
         time_options,
         options,
+        fail_fast,
     };
 
     Ok(test_opts)
@@ -271,7 +317,8 @@ fn parse_opts_impl(matches: getopts::Matches) -> OptRes {
 // FIXME: Copied from librustc_ast until linkage errors are resolved. Issue #47566
 fn is_nightly() -> bool {
     // Whether this is a feature-staged build, i.e., on the beta or stable channel
-    let disable_unstable_features = option_env!("CFG_DISABLE_UNSTABLE_FEATURES").is_some();
+    let disable_unstable_features =
+        option_env!("CFG_DISABLE_UNSTABLE_FEATURES").map(|s| s != "0").unwrap_or(false);
     // Whether we should enable unstable features for bootstrapping
     let bootstrap = env::var("RUSTC_BOOTSTRAP").is_ok();
 
@@ -284,22 +331,56 @@ fn get_time_options(
     allow_unstable: bool,
 ) -> OptPartRes<Option<TestTimeOptions>> {
     let report_time = unstable_optflag!(matches, allow_unstable, "report-time");
-    let colored_opt_str = matches.opt_str("report-time");
-    let mut report_time_colored = report_time && colored_opt_str == Some("colored".into());
     let ensure_test_time = unstable_optflag!(matches, allow_unstable, "ensure-time");
 
     // If `ensure-test-time` option is provided, time output is enforced,
     // so user won't be confused if any of tests will silently fail.
     let options = if report_time || ensure_test_time {
-        if ensure_test_time && !report_time {
-            report_time_colored = true;
-        }
-        Some(TestTimeOptions::new_from_env(ensure_test_time, report_time_colored))
+        Some(TestTimeOptions::new_from_env(ensure_test_time))
     } else {
         None
     };
 
     Ok(options)
+}
+
+fn get_shuffle(matches: &getopts::Matches, allow_unstable: bool) -> OptPartRes<bool> {
+    let mut shuffle = unstable_optflag!(matches, allow_unstable, "shuffle");
+    if !shuffle && allow_unstable {
+        shuffle = match env::var("RUST_TEST_SHUFFLE") {
+            Ok(val) => &val != "0",
+            Err(_) => false,
+        };
+    }
+
+    Ok(shuffle)
+}
+
+fn get_shuffle_seed(matches: &getopts::Matches, allow_unstable: bool) -> OptPartRes<Option<u64>> {
+    let mut shuffle_seed = match unstable_optopt!(matches, allow_unstable, "shuffle-seed") {
+        Some(n_str) => match n_str.parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(e) => {
+                return Err(format!(
+                    "argument for --shuffle-seed must be a number \
+                     (error: {e})"
+                ));
+            }
+        },
+        None => None,
+    };
+
+    if shuffle_seed.is_none() && allow_unstable {
+        shuffle_seed = match env::var("RUST_TEST_SHUFFLE_SEED") {
+            Ok(val) => match val.parse::<u64>() {
+                Ok(n) => Some(n),
+                Err(_) => panic!("RUST_TEST_SHUFFLE_SEED is `{val}`, should be a number."),
+            },
+            Err(_) => None,
+        };
+    }
+
+    Ok(shuffle_seed)
 }
 
 fn get_test_threads(matches: &getopts::Matches) -> OptPartRes<Option<usize>> {
@@ -310,8 +391,7 @@ fn get_test_threads(matches: &getopts::Matches) -> OptPartRes<Option<usize>> {
             Err(e) => {
                 return Err(format!(
                     "argument for --test-threads must be a number > 0 \
-                     (error: {})",
-                    e
+                     (error: {e})"
                 ));
             }
         },
@@ -332,16 +412,20 @@ fn get_format(
         Some("terse") => OutputFormat::Terse,
         Some("json") => {
             if !allow_unstable {
-                return Err("The \"json\" format is only accepted on the nightly compiler".into());
+                return Err("The \"json\" format is only accepted on the nightly compiler with -Z unstable-options".into());
             }
             OutputFormat::Json
         }
-
+        Some("junit") => {
+            if !allow_unstable {
+                return Err("The \"junit\" format is only accepted on the nightly compiler with -Z unstable-options".into());
+            }
+            OutputFormat::Junit
+        }
         Some(v) => {
             return Err(format!(
-                "argument for --format must be pretty, terse, or json (was \
-                 {})",
-                v
+                "argument for --format must be pretty, terse, json or junit (was \
+                 {v})"
             ));
         }
     };
@@ -358,8 +442,7 @@ fn get_color_config(matches: &getopts::Matches) -> OptPartRes<ColorConfig> {
         Some(v) => {
             return Err(format!(
                 "argument for --color must be auto, always, or never (was \
-                 {})",
-                v
+                 {v})"
             ));
         }
     };
@@ -368,7 +451,7 @@ fn get_color_config(matches: &getopts::Matches) -> OptPartRes<ColorConfig> {
 }
 
 fn get_nocapture(matches: &getopts::Matches) -> OptPartRes<bool> {
-    let mut nocapture = matches.opt_present("nocapture");
+    let mut nocapture = matches.opt_present("nocapture") || matches.opt_present("no-capture");
     if !nocapture {
         nocapture = match env::var("RUST_TEST_NOCAPTURE") {
             Ok(val) => &val != "0",

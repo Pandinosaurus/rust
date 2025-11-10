@@ -8,8 +8,6 @@
 /// # Examples
 ///
 /// ```
-/// #![feature(ready_macro)]
-///
 /// use std::task::{ready, Context, Poll};
 /// use std::future::{self, Future};
 /// use std::pin::Pin;
@@ -19,7 +17,7 @@
 ///     let fut = Pin::new(&mut fut);
 ///
 ///     let num = ready!(fut.poll(cx));
-///     # drop(num);
+///     # let _ = num;
 ///     // ... use num
 ///
 ///     Poll::Ready(())
@@ -29,8 +27,6 @@
 /// The `ready!` call expands to:
 ///
 /// ```
-/// # #![feature(ready_macro)]
-/// #
 /// # use std::task::{Context, Poll};
 /// # use std::future::{self, Future};
 /// # use std::pin::Pin;
@@ -43,13 +39,13 @@
 ///     Poll::Ready(t) => t,
 ///     Poll::Pending => return Poll::Pending,
 /// };
-///     # drop(num);
+///     # let _ = num; // to silence unused warning
 ///     # // ... use num
 ///     #
 ///     # Poll::Ready(())
 /// # }
 /// ```
-#[unstable(feature = "ready_macro", issue = "70922")]
+#[stable(feature = "ready_macro", since = "1.64.0")]
 #[rustc_macro_transparency = "semitransparent"]
 pub macro ready($e:expr) {
     match $e {

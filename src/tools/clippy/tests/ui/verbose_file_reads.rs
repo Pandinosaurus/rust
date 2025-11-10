@@ -18,11 +18,15 @@ fn main() -> std::io::Result<()> {
     s.read_to_end();
     s.read_to_string();
     // Should catch this
-    let mut f = File::open(&path)?;
+    let mut f = File::open(path)?;
     let mut buffer = Vec::new();
     f.read_to_end(&mut buffer)?;
+    //~^ verbose_file_reads
+
     // ...and this
     let mut string_buffer = String::new();
     f.read_to_string(&mut string_buffer)?;
+    //~^ verbose_file_reads
+
     Ok(())
 }

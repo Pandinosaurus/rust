@@ -1,11 +1,10 @@
 //! Defines [`Pointer`] which is used to improve the quality of the generated clif ir for pointer
 //! operations.
 
-use crate::prelude::*;
-
-use rustc_target::abi::Align;
-
 use cranelift_codegen::ir::immediates::Offset32;
+use rustc_abi::Align;
+
+use crate::prelude::*;
 
 /// A pointer pointing either to a certain address, a certain stack slot or nothing.
 #[derive(Copy, Clone, Debug)]
@@ -30,17 +29,11 @@ impl Pointer {
         Pointer { base: PointerBase::Stack(stack_slot), offset: Offset32::new(0) }
     }
 
-    pub(crate) fn const_addr(fx: &mut FunctionCx<'_, '_, '_>, addr: i64) -> Self {
-        let addr = fx.bcx.ins().iconst(fx.pointer_type, addr);
-        Pointer { base: PointerBase::Addr(addr), offset: Offset32::new(0) }
-    }
-
     pub(crate) fn dangling(align: Align) -> Self {
         Pointer { base: PointerBase::Dangling(align), offset: Offset32::new(0) }
     }
 
-    #[cfg(debug_assertions)]
-    pub(crate) fn base_and_offset(self) -> (PointerBase, Offset32) {
+    pub(crate) fn debug_base_and_offset(self) -> (PointerBase, Offset32) {
         (self.base, self.offset)
     }
 

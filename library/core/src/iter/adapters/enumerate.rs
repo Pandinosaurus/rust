@@ -1,5 +1,7 @@
-use crate::iter::adapters::{zip::try_get_unchecked, SourceIter, TrustedRandomAccess};
-use crate::iter::{FusedIterator, InPlaceIterable, TrustedLen};
+use crate::iter::adapters::zip::try_get_unchecked;
+use crate::iter::adapters::{SourceIter, TrustedRandomAccess, TrustedRandomAccessNoCoerce};
+use crate::iter::{FusedIterator, InPlaceIterable, TrustedFused, TrustedLen};
+use crate::num::NonZero;
 use crate::ops::Try;
 
 /// An iterator that yields the current count and the element during iteration.
@@ -12,6 +14,7 @@ use crate::ops::Try;
 #[derive(Clone, Debug)]
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_diagnostic_item = "Enumerate"]
 pub struct Enumerate<I> {
     iter: I,
     count: usize,
@@ -19,6 +22,39 @@ pub struct Enumerate<I> {
 impl<I> Enumerate<I> {
     pub(in crate::iter) fn new(iter: I) -> Enumerate<I> {
         Enumerate { iter, count: 0 }
+    }
+
+    /// Retrieve the current position of the iterator.
+    ///
+    /// If the iterator has not advanced, the position returned will be 0.
+    ///
+    /// The position may also exceed the bounds of the iterator to allow for calculating
+    /// the displacement of the iterator from following calls to [`Iterator::next`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(next_index)]
+    ///
+    /// let arr = ['a', 'b'];
+    ///
+    /// let mut iter = arr.iter().enumerate();
+    ///
+    /// assert_eq!(iter.next_index(), 0);
+    /// assert_eq!(iter.next(), Some((0, &'a')));
+    ///
+    /// assert_eq!(iter.next_index(), 1);
+    /// assert_eq!(iter.next_index(), 1);
+    /// assert_eq!(iter.next(), Some((1, &'b')));
+    ///
+    /// assert_eq!(iter.next_index(), 2);
+    /// assert_eq!(iter.next(), None);
+    /// assert_eq!(iter.next_index(), 2);
+    /// ```
+    #[inline]
+    #[unstable(feature = "next_index", issue = "130711")]
+    pub fn next_index(&self) -> usize {
+        self.count
     }
 }
 
@@ -33,7 +69,7 @@ where
     ///
     /// The method does no guarding against overflows, so enumerating more than
     /// `usize::MAX` elements either produces the wrong result or panics. If
-    /// debug assertions are enabled, a panic is guaranteed.
+    /// overflow checks are enabled, a panic is guaranteed.
     ///
     /// # Panics
     ///
@@ -71,7 +107,7 @@ where
     where
         Self: Sized,
         Fold: FnMut(Acc, Self::Item) -> R,
-        R: Try<Ok = Acc>,
+        R: Try<Output = Acc>,
     {
         #[inline]
         fn enumerate<'a, T, Acc, R>(
@@ -110,10 +146,23 @@ where
         self.iter.fold(init, enumerate(self.count, fold))
     }
 
+    #[inline]
     #[rustc_inherit_overflow_checks]
+    fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
+        let remaining = self.iter.advance_by(n);
+        let advanced = match remaining {
+            Ok(()) => n,
+            Err(rem) => n - rem.get(),
+        };
+        self.count += advanced;
+        remaining
+    }
+
+    #[rustc_inherit_overflow_checks]
+    #[inline]
     unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> <Self as Iterator>::Item
     where
-        Self: TrustedRandomAccess,
+        Self: TrustedRandomAccessNoCoerce,
     {
         // SAFETY: the caller must uphold the contract for
         // `Iterator::__iterator_get_unchecked`.
@@ -150,7 +199,7 @@ where
     where
         Self: Sized,
         Fold: FnMut(Acc, Self::Item) -> R,
-        R: Try<Ok = Acc>,
+        R: Try<Output = Acc>,
     {
         // Can safely add and subtract the count, as `ExactSizeIterator` promises
         // that the number of elements fits into a `usize`.
@@ -188,6 +237,13 @@ where
         let count = self.count + self.iter.len();
         self.iter.rfold(init, enumerate(count, fold))
     }
+
+    #[inline]
+    fn advance_back_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
+        // we do not need to update the count since that only tallies the number of items
+        // consumed from the front. consuming items from the back can never reduce that.
+        self.iter.advance_back_by(n)
+    }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -206,9 +262,13 @@ where
 
 #[doc(hidden)]
 #[unstable(feature = "trusted_random_access", issue = "none")]
-unsafe impl<I> TrustedRandomAccess for Enumerate<I>
+unsafe impl<I> TrustedRandomAccess for Enumerate<I> where I: TrustedRandomAccess {}
+
+#[doc(hidden)]
+#[unstable(feature = "trusted_random_access", issue = "none")]
+unsafe impl<I> TrustedRandomAccessNoCoerce for Enumerate<I>
 where
-    I: TrustedRandomAccess,
+    I: TrustedRandomAccessNoCoerce,
 {
     const MAY_HAVE_SIDE_EFFECT: bool = I::MAY_HAVE_SIDE_EFFECT;
 }
@@ -216,22 +276,42 @@ where
 #[stable(feature = "fused", since = "1.26.0")]
 impl<I> FusedIterator for Enumerate<I> where I: FusedIterator {}
 
+#[unstable(issue = "none", feature = "trusted_fused")]
+unsafe impl<I: TrustedFused> TrustedFused for Enumerate<I> {}
+
 #[unstable(feature = "trusted_len", issue = "37572")]
 unsafe impl<I> TrustedLen for Enumerate<I> where I: TrustedLen {}
 
 #[unstable(issue = "none", feature = "inplace_iteration")]
-unsafe impl<S: Iterator, I: Iterator> SourceIter for Enumerate<I>
+unsafe impl<I> SourceIter for Enumerate<I>
 where
-    I: SourceIter<Source = S>,
+    I: SourceIter,
 {
-    type Source = S;
+    type Source = I::Source;
 
     #[inline]
-    unsafe fn as_inner(&mut self) -> &mut S {
+    unsafe fn as_inner(&mut self) -> &mut I::Source {
         // SAFETY: unsafe function forwarding to unsafe function with the same requirements
         unsafe { SourceIter::as_inner(&mut self.iter) }
     }
 }
 
 #[unstable(issue = "none", feature = "inplace_iteration")]
-unsafe impl<I: InPlaceIterable> InPlaceIterable for Enumerate<I> {}
+unsafe impl<I: InPlaceIterable> InPlaceIterable for Enumerate<I> {
+    const EXPAND_BY: Option<NonZero<usize>> = I::EXPAND_BY;
+    const MERGE_BY: Option<NonZero<usize>> = I::MERGE_BY;
+}
+
+#[stable(feature = "default_iters", since = "1.70.0")]
+impl<I: Default> Default for Enumerate<I> {
+    /// Creates an `Enumerate` iterator from the default value of `I`
+    /// ```
+    /// # use core::slice;
+    /// # use std::iter::Enumerate;
+    /// let iter: Enumerate<slice::Iter<'_, u8>> = Default::default();
+    /// assert_eq!(iter.len(), 0);
+    /// ```
+    fn default() -> Self {
+        Enumerate::new(Default::default())
+    }
+}

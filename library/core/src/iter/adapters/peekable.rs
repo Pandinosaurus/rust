@@ -1,5 +1,6 @@
-use crate::iter::{adapters::SourceIter, FusedIterator, InPlaceIterable, TrustedLen};
-use crate::ops::Try;
+use crate::iter::adapters::SourceIter;
+use crate::iter::{FusedIterator, TrustedLen};
+use crate::ops::{ControlFlow, Try};
 
 /// An iterator with a `peek()` that returns an optional reference to the next
 /// element.
@@ -12,6 +13,7 @@ use crate::ops::Try;
 #[derive(Clone, Debug)]
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_diagnostic_item = "IterPeekable"]
 pub struct Peekable<I: Iterator> {
     iter: I,
     /// Remember a peeked value, even if it was None.
@@ -91,7 +93,7 @@ impl<I: Iterator> Iterator for Peekable<I> {
     where
         Self: Sized,
         F: FnMut(B, Self::Item) -> R,
-        R: Try<Ok = B>,
+        R: Try<Output = B>,
     {
         let acc = match self.peeked.take() {
             Some(None) => return try { init },
@@ -134,15 +136,15 @@ where
     where
         Self: Sized,
         F: FnMut(B, Self::Item) -> R,
-        R: Try<Ok = B>,
+        R: Try<Output = B>,
     {
         match self.peeked.take() {
             Some(None) => try { init },
-            Some(Some(v)) => match self.iter.try_rfold(init, &mut f).into_result() {
-                Ok(acc) => f(acc, v),
-                Err(e) => {
+            Some(Some(v)) => match self.iter.try_rfold(init, &mut f).branch() {
+                ControlFlow::Continue(acc) => f(acc, v),
+                ControlFlow::Break(r) => {
                     self.peeked = Some(Some(v));
-                    Try::from_error(e)
+                    R::from_residual(r)
                 }
             },
             None => self.iter.try_rfold(init, f),
@@ -233,7 +235,6 @@ impl<I: Iterator> Peekable<I> {
     /// Basic usage:
     ///
     /// ```
-    /// #![feature(peekable_peek_mut)]
     /// let mut iter = [1, 2, 3].iter().peekable();
     ///
     /// // Like with `peek()`, we can see into the future without advancing the iterator.
@@ -251,7 +252,7 @@ impl<I: Iterator> Peekable<I> {
     /// assert_eq!(iter.collect::<Vec<_>>(), vec![&5, &3]);
     /// ```
     #[inline]
-    #[unstable(feature = "peekable_peek_mut", issue = "78302")]
+    #[stable(feature = "peekable_peek_mut", since = "1.53.0")]
     pub fn peek_mut(&mut self) -> Option<&mut I::Item> {
         let iter = &mut self.iter;
         self.peeked.get_or_insert_with(|| iter.next()).as_mut()
@@ -268,9 +269,9 @@ impl<I: Iterator> Peekable<I> {
     /// let mut iter = (0..5).peekable();
     /// // The first item of the iterator is 0; consume it.
     /// assert_eq!(iter.next_if(|&x| x == 0), Some(0));
-    /// // The next item returned is now 1, so `consume` will return `false`.
+    /// // The next item returned is now 1, so `next_if` will return `None`.
     /// assert_eq!(iter.next_if(|&x| x == 0), None);
-    /// // `next_if` saves the value of the next item if it was not equal to `expected`.
+    /// // `next_if` retains the next item if the predicate evaluates to `false` for it.
     /// assert_eq!(iter.next(), Some(1));
     /// ```
     ///
@@ -303,9 +304,9 @@ impl<I: Iterator> Peekable<I> {
     /// let mut iter = (0..5).peekable();
     /// // The first item of the iterator is 0; consume it.
     /// assert_eq!(iter.next_if_eq(&0), Some(0));
-    /// // The next item returned is now 1, so `consume` will return `false`.
+    /// // The next item returned is now 1, so `next_if_eq` will return `None`.
     /// assert_eq!(iter.next_if_eq(&0), None);
-    /// // `next_if_eq` saves the value of the next item if it was not equal to `expected`.
+    /// // `next_if_eq` retains the next item if it was not equal to `expected`.
     /// assert_eq!(iter.next(), Some(1));
     /// ```
     #[stable(feature = "peekable_next_if", since = "1.51.0")]
@@ -316,24 +317,123 @@ impl<I: Iterator> Peekable<I> {
     {
         self.next_if(|next| next == expected)
     }
+
+    /// Consumes the next value of this iterator and applies a function `f` on it,
+    /// returning the result if the closure returns `Ok`.
+    ///
+    /// Otherwise if the closure returns `Err` the value is put back for the next iteration.
+    ///
+    /// The content of the `Err` variant is typically the original value of the closure,
+    /// but this is not required. If a different value is returned,
+    /// the next `peek()` or `next()` call will result in this new value.
+    /// This is similar to modifying the output of `peek_mut()`.
+    ///
+    /// If the closure panics, the next value will always be consumed and dropped
+    /// even if the panic is caught, because the closure never returned an `Err` value to put back.
+    ///
+    /// # Examples
+    ///
+    /// Parse the leading decimal number from an iterator of characters.
+    /// ```
+    /// #![feature(peekable_next_if_map)]
+    /// let mut iter = "125 GOTO 10".chars().peekable();
+    /// let mut line_num = 0_u32;
+    /// while let Some(digit) = iter.next_if_map(|c| c.to_digit(10).ok_or(c)) {
+    ///     line_num = line_num * 10 + digit;
+    /// }
+    /// assert_eq!(line_num, 125);
+    /// assert_eq!(iter.collect::<String>(), " GOTO 10");
+    /// ```
+    ///
+    /// Matching custom types.
+    /// ```
+    /// #![feature(peekable_next_if_map)]
+    ///
+    /// #[derive(Debug, PartialEq, Eq)]
+    /// enum Node {
+    ///     Comment(String),
+    ///     Red(String),
+    ///     Green(String),
+    ///     Blue(String),
+    /// }
+    ///
+    /// /// Combines all consecutive `Comment` nodes into a single one.
+    /// fn combine_comments(nodes: Vec<Node>) -> Vec<Node> {
+    ///     let mut result = Vec::with_capacity(nodes.len());
+    ///     let mut iter = nodes.into_iter().peekable();
+    ///     let mut comment_text = None::<String>;
+    ///     loop {
+    ///         // Typically the closure in .next_if_map() matches on the input,
+    ///         //  extracts the desired pattern into an `Ok`,
+    ///         //  and puts the rest into an `Err`.
+    ///         while let Some(text) = iter.next_if_map(|node| match node {
+    ///             Node::Comment(text) => Ok(text),
+    ///             other => Err(other),
+    ///         }) {
+    ///             comment_text.get_or_insert_default().push_str(&text);
+    ///         }
+    ///
+    ///         if let Some(text) = comment_text.take() {
+    ///             result.push(Node::Comment(text));
+    ///         }
+    ///         if let Some(node) = iter.next() {
+    ///             result.push(node);
+    ///         } else {
+    ///             break;
+    ///         }
+    ///     }
+    ///     result
+    /// }
+    ///# assert_eq!( // hiding the test to avoid cluttering the documentation.
+    ///#     combine_comments(vec![
+    ///#         Node::Comment("The".to_owned()),
+    ///#         Node::Comment("Quick".to_owned()),
+    ///#         Node::Comment("Brown".to_owned()),
+    ///#         Node::Red("Fox".to_owned()),
+    ///#         Node::Green("Jumped".to_owned()),
+    ///#         Node::Comment("Over".to_owned()),
+    ///#         Node::Blue("The".to_owned()),
+    ///#         Node::Comment("Lazy".to_owned()),
+    ///#         Node::Comment("Dog".to_owned()),
+    ///#     ]),
+    ///#     vec![
+    ///#         Node::Comment("TheQuickBrown".to_owned()),
+    ///#         Node::Red("Fox".to_owned()),
+    ///#         Node::Green("Jumped".to_owned()),
+    ///#         Node::Comment("Over".to_owned()),
+    ///#         Node::Blue("The".to_owned()),
+    ///#         Node::Comment("LazyDog".to_owned()),
+    ///#     ],
+    ///# )
+    /// ```
+    #[unstable(feature = "peekable_next_if_map", issue = "143702")]
+    pub fn next_if_map<R>(&mut self, f: impl FnOnce(I::Item) -> Result<R, I::Item>) -> Option<R> {
+        let unpeek = if let Some(item) = self.next() {
+            match f(item) {
+                Ok(result) => return Some(result),
+                Err(item) => Some(item),
+            }
+        } else {
+            None
+        };
+        self.peeked = Some(unpeek);
+        None
+    }
 }
 
 #[unstable(feature = "trusted_len", issue = "37572")]
 unsafe impl<I> TrustedLen for Peekable<I> where I: TrustedLen {}
 
 #[unstable(issue = "none", feature = "inplace_iteration")]
-unsafe impl<S: Iterator, I: Iterator> SourceIter for Peekable<I>
+unsafe impl<I: Iterator> SourceIter for Peekable<I>
 where
-    I: SourceIter<Source = S>,
+    I: SourceIter,
 {
-    type Source = S;
+    type Source = I::Source;
 
     #[inline]
-    unsafe fn as_inner(&mut self) -> &mut S {
+    unsafe fn as_inner(&mut self) -> &mut I::Source {
         // SAFETY: unsafe function forwarding to unsafe function with the same requirements
         unsafe { SourceIter::as_inner(&mut self.iter) }
     }
 }
-
-#[unstable(issue = "none", feature = "inplace_iteration")]
-unsafe impl<I: InPlaceIterable> InPlaceIterable for Peekable<I> {}

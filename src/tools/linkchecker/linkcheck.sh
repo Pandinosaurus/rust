@@ -16,14 +16,12 @@
 #
 # --all     Check all books. This can help make sure you don't break links
 #           from other books into your book.
+#
+# --path <book-path>
+#           Path to the root directory for the book. Default to the current
+#           working directory if omitted.
 
 set -e
-
-if [ ! -f book.toml ] && [ ! -f src/SUMMARY.md ]
-then
-    echo "Run command in root directory of the book."
-    exit 1
-fi
 
 html_dir="$(rustc +nightly --print sysroot)/share/doc/rust/html"
 
@@ -38,6 +36,8 @@ fi
 export MDBOOK_OUTPUT__HTML__INPUT_404=""
 
 book_name=""
+# Default to the current directory
+book_path="."
 # Iterative will avoid cleaning up, so you can quickly run it repeatedly.
 iterative=0
 # If "1", test all books, else only this book.
@@ -51,6 +51,10 @@ do
             ;;
         --all)
             all_books=1
+            ;;
+        --path)
+            book_path="${2:-.}"
+            shift
             ;;
         *)
             if [ -n "$book_name" ]
@@ -70,6 +74,12 @@ then
     exit 1
 fi
 
+if [ ! -f "$book_path/book.toml" ] && [ ! -f "$book_path/src/SUMMARY.md" ]
+then
+    echo "Run command in root directory of the book or provide a path to the book"
+    exit 1
+fi
+
 if [ ! -d "$html_dir/$book_name" ]
 then
     echo "book name \"$book_name\" not found in sysroot \"$html_dir\""
@@ -85,19 +95,20 @@ fi
 if [ ! -e "linkchecker/main.rs" ] || [ "$iterative" = "0" ]
 then
     echo "Downloading linkchecker source..."
+    nightly_hash=$(rustc +nightly -Vv | grep commit-hash | cut -f2 -d" ")
+    url="https://raw.githubusercontent.com/rust-lang/rust"
     mkdir linkchecker
-    curl -o linkchecker/Cargo.toml \
-        https://raw.githubusercontent.com/rust-lang/rust/master/src/tools/linkchecker/Cargo.toml
-    curl -o linkchecker/main.rs \
-        https://raw.githubusercontent.com/rust-lang/rust/master/src/tools/linkchecker/main.rs
+    curl -o linkchecker/Cargo.lock ${url}/${nightly_hash}/Cargo.lock
+    curl -o linkchecker/Cargo.toml ${url}/${nightly_hash}/src/tools/linkchecker/Cargo.toml
+    curl -o linkchecker/main.rs ${url}/${nightly_hash}/src/tools/linkchecker/main.rs
 fi
 
 echo "Building book \"$book_name\"..."
-mdbook build
+mdbook build "$book_path"
 
 cp -R "$html_dir" linkcheck
 rm -rf "linkcheck/$book_name"
-cp -R book "linkcheck/$book_name"
+cp -R "$book_path/book" "linkcheck/$book_name"
 
 if [ "$all_books" = "1" ]
 then
@@ -106,7 +117,7 @@ else
     check_path="linkcheck/$book_name"
 fi
 echo "Running linkchecker on \"$check_path\"..."
-cargo run --manifest-path=linkchecker/Cargo.toml -- "$check_path"
+cargo run --release --manifest-path=linkchecker/Cargo.toml -- "$check_path"
 
 if [ "$iterative" = "0" ]
 then

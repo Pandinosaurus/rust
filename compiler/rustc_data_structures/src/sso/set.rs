@@ -1,6 +1,5 @@
 use std::fmt;
 use std::hash::Hash;
-use std::iter::FromIterator;
 
 use super::map::SsoHashMap;
 
@@ -13,7 +12,7 @@ use super::map::SsoHashMap;
 //
 // Missing HashSet API:
 //   all hasher-related
-//   try_reserve (unstable)
+//   try_reserve
 //   shrink_to (unstable)
 //   drain_filter (unstable)
 //   replace
@@ -27,7 +26,7 @@ pub struct SsoHashSet<T> {
     map: SsoHashMap<T, ()>,
 }
 
-/// Adapter function used ot return
+/// Adapter function used to return
 /// result if SsoHashMap functions into
 /// result SsoHashSet should return.
 #[inline(always)]
@@ -75,13 +74,13 @@ impl<T> SsoHashSet<T> {
     /// An iterator visiting all elements in arbitrary order.
     /// The iterator element type is `&'a T`.
     #[inline]
-    pub fn iter(&'a self) -> impl Iterator<Item = &'a T> {
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.into_iter()
     }
 
     /// Clears the set, returning all elements in an iterator.
     #[inline]
-    pub fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
+    pub fn drain(&mut self) -> impl Iterator<Item = T> {
         self.map.drain().map(entry_to_key)
     }
 }
@@ -126,9 +125,10 @@ impl<T: Eq + Hash> SsoHashSet<T> {
 
     /// Adds a value to the set.
     ///
-    /// If the set did not have this value present, `true` is returned.
+    /// Returns whether the value was newly inserted. That is:
     ///
-    /// If the set did have this value present, `false` is returned.
+    /// - If the set did not previously contain this value, `true` is returned.
+    /// - If the set already contained this value, `false` is returned.
     #[inline]
     pub fn insert(&mut self, elem: T) -> bool {
         self.map.insert(elem, ()).is_none()

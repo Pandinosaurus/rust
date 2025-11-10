@@ -8,14 +8,14 @@ mod linewritershim;
 #[cfg(test)]
 mod tests;
 
-use crate::error;
-use crate::fmt;
-use crate::io::Error;
-
-pub use bufreader::BufReader;
-pub use bufwriter::BufWriter;
-pub use linewriter::LineWriter;
+#[stable(feature = "bufwriter_into_parts", since = "1.56.0")]
+pub use bufwriter::WriterPanicked;
 use linewritershim::LineWriterShim;
+
+#[stable(feature = "rust1", since = "1.0.0")]
+pub use self::{bufreader::BufReader, bufwriter::BufWriter, linewriter::LineWriter};
+use crate::io::Error;
+use crate::{error, fmt};
 
 /// An error returned by [`BufWriter::into_inner`] which combines an error that
 /// happened while writing out the buffer, and the buffered writer object
@@ -46,7 +46,7 @@ use linewritershim::LineWriterShim;
 pub struct IntoInnerError<W>(W, Error);
 
 impl<W> IntoInnerError<W> {
-    /// Construct a new IntoInnerError
+    /// Constructs a new IntoInnerError
     fn new(writer: W, error: Error) -> Self {
         Self(writer, error)
     }
@@ -133,7 +133,6 @@ impl<W> IntoInnerError<W> {
     ///
     /// # Example
     /// ```
-    /// #![feature(io_into_inner_error_parts)]
     /// use std::io::{BufWriter, ErrorKind, Write};
     ///
     /// let mut not_enough_space = [0u8; 10];
@@ -143,7 +142,7 @@ impl<W> IntoInnerError<W> {
     /// let err = into_inner_err.into_error();
     /// assert_eq!(err.kind(), ErrorKind::WriteZero);
     /// ```
-    #[unstable(feature = "io_into_inner_error_parts", issue = "79704")]
+    #[stable(feature = "io_into_inner_error_parts", since = "1.55.0")]
     pub fn into_error(self) -> Error {
         self.1
     }
@@ -156,7 +155,6 @@ impl<W> IntoInnerError<W> {
     ///
     /// # Example
     /// ```
-    /// #![feature(io_into_inner_error_parts)]
     /// use std::io::{BufWriter, ErrorKind, Write};
     ///
     /// let mut not_enough_space = [0u8; 10];
@@ -167,7 +165,7 @@ impl<W> IntoInnerError<W> {
     /// assert_eq!(err.kind(), ErrorKind::WriteZero);
     /// assert_eq!(recovered_writer.buffer(), b"t be actually written");
     /// ```
-    #[unstable(feature = "io_into_inner_error_parts", issue = "79704")]
+    #[stable(feature = "io_into_inner_error_parts", since = "1.55.0")]
     pub fn into_parts(self) -> (Error, W) {
         (self.1, self.0)
     }
@@ -181,12 +179,7 @@ impl<W> From<IntoInnerError<W>> for Error {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<W: Send + fmt::Debug> error::Error for IntoInnerError<W> {
-    #[allow(deprecated, deprecated_in_future)]
-    fn description(&self) -> &str {
-        error::Error::description(self.error())
-    }
-}
+impl<W: Send + fmt::Debug> error::Error for IntoInnerError<W> {}
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<W> fmt::Display for IntoInnerError<W> {

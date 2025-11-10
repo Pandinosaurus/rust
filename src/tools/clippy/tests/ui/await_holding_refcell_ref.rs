@@ -1,15 +1,18 @@
-// edition:2018
 #![warn(clippy::await_holding_refcell_ref)]
 
 use std::cell::RefCell;
 
 async fn bad(x: &RefCell<u32>) -> u32 {
     let b = x.borrow();
+    //~^ await_holding_refcell_ref
+
     baz().await
 }
 
 async fn bad_mut(x: &RefCell<u32>) -> u32 {
     let b = x.borrow_mut();
+    //~^ await_holding_refcell_ref
+
     baz().await
 }
 
@@ -31,6 +34,7 @@ async fn also_bad(x: &RefCell<u32>) -> u32 {
     let first = baz().await;
 
     let b = x.borrow_mut();
+    //~^ await_holding_refcell_ref
 
     let second = baz().await;
 
@@ -43,6 +47,7 @@ async fn less_bad(x: &RefCell<u32>) -> u32 {
     let first = baz().await;
 
     let b = x.borrow_mut();
+    //~^ await_holding_refcell_ref
 
     let second = baz().await;
 
@@ -58,6 +63,8 @@ async fn not_good(x: &RefCell<u32>) -> u32 {
 
     let second = {
         let b = x.borrow_mut();
+        //~^ await_holding_refcell_ref
+
         baz().await
     };
 
@@ -70,6 +77,8 @@ async fn not_good(x: &RefCell<u32>) -> u32 {
 fn block_bad(x: &RefCell<u32>) -> impl std::future::Future<Output = u32> + '_ {
     async move {
         let b = x.borrow_mut();
+        //~^ await_holding_refcell_ref
+
         baz().await
     }
 }

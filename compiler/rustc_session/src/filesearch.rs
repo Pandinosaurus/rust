@@ -1,142 +1,226 @@
-pub use self::FileMatch::*;
+//! A module for searching for libraries
 
-use std::borrow::Cow;
-use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
+use std::{env, fs};
 
-use crate::search_paths::{PathKind, SearchPath, SearchPathFile};
-use rustc_fs_util::fix_windows_verbatim_for_gcc;
-use tracing::debug;
+use rustc_fs_util::try_canonicalize;
+use rustc_target::spec::Target;
 
-#[derive(Copy, Clone)]
-pub enum FileMatch {
-    FileMatches,
-    FileDoesntMatch,
-}
-
-// A module for searching for libraries
+use crate::search_paths::{PathKind, SearchPath};
 
 #[derive(Clone)]
-pub struct FileSearch<'a> {
-    sysroot: &'a Path,
-    triple: &'a str,
-    search_paths: &'a [SearchPath],
-    tlib_path: &'a SearchPath,
-    kind: PathKind,
+pub struct FileSearch {
+    cli_search_paths: Vec<SearchPath>,
+    tlib_path: SearchPath,
 }
 
-impl<'a> FileSearch<'a> {
-    pub fn search_paths(&self) -> impl Iterator<Item = &'a SearchPath> {
-        let kind = self.kind;
-        self.search_paths
+impl FileSearch {
+    pub fn cli_search_paths<'b>(&'b self, kind: PathKind) -> impl Iterator<Item = &'b SearchPath> {
+        self.cli_search_paths.iter().filter(move |sp| sp.kind.matches(kind))
+    }
+
+    pub fn search_paths<'b>(&'b self, kind: PathKind) -> impl Iterator<Item = &'b SearchPath> {
+        self.cli_search_paths
             .iter()
             .filter(move |sp| sp.kind.matches(kind))
-            .chain(std::iter::once(self.tlib_path))
+            .chain(std::iter::once(&self.tlib_path))
     }
 
-    pub fn get_lib_path(&self) -> PathBuf {
-        make_target_lib_path(self.sysroot, self.triple)
+    pub fn new(cli_search_paths: &[SearchPath], tlib_path: &SearchPath, target: &Target) -> Self {
+        let this = FileSearch {
+            cli_search_paths: cli_search_paths.to_owned(),
+            tlib_path: tlib_path.clone(),
+        };
+        this.refine(&["lib", &target.staticlib_prefix, &target.dll_prefix])
     }
+    // Produce a new file search from this search that has a smaller set of candidates.
+    fn refine(mut self, allowed_prefixes: &[&str]) -> FileSearch {
+        self.cli_search_paths
+            .iter_mut()
+            .for_each(|search_paths| search_paths.files.retain(allowed_prefixes));
+        self.tlib_path.files.retain(allowed_prefixes);
 
-    pub fn get_self_contained_lib_path(&self) -> PathBuf {
-        self.get_lib_path().join("self-contained")
+        self
     }
-
-    pub fn search<F>(&self, mut pick: F)
-    where
-        F: FnMut(&SearchPathFile, PathKind) -> FileMatch,
-    {
-        for search_path in self.search_paths() {
-            debug!("searching {}", search_path.dir.display());
-            fn is_rlib(spf: &SearchPathFile) -> bool {
-                if let Some(f) = &spf.file_name_str { f.ends_with(".rlib") } else { false }
-            }
-            // Reading metadata out of rlibs is faster, and if we find both
-            // an rlib and a dylib we only read one of the files of
-            // metadata, so in the name of speed, bring all rlib files to
-            // the front of the search list.
-            let files1 = search_path.files.iter().filter(|spf| is_rlib(&spf));
-            let files2 = search_path.files.iter().filter(|spf| !is_rlib(&spf));
-            for spf in files1.chain(files2) {
-                debug!("testing {}", spf.path.display());
-                let maybe_picked = pick(spf, search_path.kind);
-                match maybe_picked {
-                    FileMatches => {
-                        debug!("picked {}", spf.path.display());
-                    }
-                    FileDoesntMatch => {
-                        debug!("rejected {}", spf.path.display());
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn new(
-        sysroot: &'a Path,
-        triple: &'a str,
-        search_paths: &'a [SearchPath],
-        tlib_path: &'a SearchPath,
-        kind: PathKind,
-    ) -> FileSearch<'a> {
-        debug!("using sysroot = {}, triple = {}", sysroot.display(), triple);
-        FileSearch { sysroot, triple, search_paths, tlib_path, kind }
-    }
-
-    // Returns just the directories within the search paths.
-    pub fn search_path_dirs(&self) -> Vec<PathBuf> {
-        self.search_paths().map(|sp| sp.dir.to_path_buf()).collect()
-    }
-
-    // Returns a list of directories where target-specific tool binaries are located.
-    pub fn get_tools_search_paths(&self, self_contained: bool) -> Vec<PathBuf> {
-        let mut p = PathBuf::from(self.sysroot);
-        p.push(find_libdir(self.sysroot).as_ref());
-        p.push(RUST_LIB_DIR);
-        p.push(&self.triple);
-        p.push("bin");
-        if self_contained { vec![p.clone(), p.join("self-contained")] } else { vec![p] }
-    }
-}
-
-pub fn relative_target_lib_path(sysroot: &Path, target_triple: &str) -> PathBuf {
-    let mut p = PathBuf::from(find_libdir(sysroot).as_ref());
-    assert!(p.is_relative());
-    p.push(RUST_LIB_DIR);
-    p.push(target_triple);
-    p.push("lib");
-    p
 }
 
 pub fn make_target_lib_path(sysroot: &Path, target_triple: &str) -> PathBuf {
-    sysroot.join(&relative_target_lib_path(sysroot, target_triple))
+    let rustlib_path = rustc_target::relative_target_rustlib_path(sysroot, target_triple);
+    sysroot.join(rustlib_path).join("lib")
 }
 
-// This function checks if sysroot is found using env::args().next(), and if it
-// is not found, uses env::current_exe() to imply sysroot.
-pub fn get_or_default_sysroot() -> PathBuf {
-    // Follow symlinks.  If the resolved path is relative, make it absolute.
-    fn canonicalize(path: PathBuf) -> PathBuf {
-        let path = fs::canonicalize(&path).unwrap_or(path);
-        // See comments on this target function, but the gist is that
-        // gcc chokes on verbatim paths which fs::canonicalize generates
-        // so we try to avoid those kinds of paths.
-        fix_windows_verbatim_for_gcc(&path)
+/// Returns a path to the target's `bin` folder within its `rustlib` path in the sysroot. This is
+/// where binaries are usually installed, e.g. the self-contained linkers, lld-wrappers, LLVM tools,
+/// etc.
+pub fn make_target_bin_path(sysroot: &Path, target_triple: &str) -> PathBuf {
+    let rustlib_path = rustc_target::relative_target_rustlib_path(sysroot, target_triple);
+    sysroot.join(rustlib_path).join("bin")
+}
+
+#[cfg(unix)]
+fn current_dll_path() -> Result<PathBuf, String> {
+    use std::sync::OnceLock;
+
+    // This is somewhat expensive relative to other work when compiling `fn main() {}` as `dladdr`
+    // needs to iterate over the symbol table of librustc_driver.so until it finds a match.
+    // As such cache this to avoid recomputing if we try to get the sysroot in multiple places.
+    static CURRENT_DLL_PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    CURRENT_DLL_PATH
+        .get_or_init(|| {
+            use std::ffi::{CStr, OsStr};
+            use std::os::unix::prelude::*;
+
+            #[cfg(not(target_os = "aix"))]
+            unsafe {
+                let addr = current_dll_path as usize as *mut _;
+                let mut info = std::mem::zeroed();
+                if libc::dladdr(addr, &mut info) == 0 {
+                    return Err("dladdr failed".into());
+                }
+                #[cfg(target_os = "cygwin")]
+                let fname_ptr = info.dli_fname.as_ptr();
+                #[cfg(not(target_os = "cygwin"))]
+                let fname_ptr = {
+                    assert!(!info.dli_fname.is_null(), "dli_fname cannot be null");
+                    info.dli_fname
+                };
+                let bytes = CStr::from_ptr(fname_ptr).to_bytes();
+                let os = OsStr::from_bytes(bytes);
+                try_canonicalize(Path::new(os)).map_err(|e| e.to_string())
+            }
+
+            #[cfg(target_os = "aix")]
+            unsafe {
+                // On AIX, the symbol `current_dll_path` references a function descriptor.
+                // A function descriptor is consisted of (See https://reviews.llvm.org/D62532)
+                // * The address of the entry point of the function.
+                // * The TOC base address for the function.
+                // * The environment pointer.
+                // The function descriptor is in the data section.
+                let addr = current_dll_path as u64;
+                let mut buffer = vec![std::mem::zeroed::<libc::ld_info>(); 64];
+                loop {
+                    if libc::loadquery(
+                        libc::L_GETINFO,
+                        buffer.as_mut_ptr() as *mut u8,
+                        (size_of::<libc::ld_info>() * buffer.len()) as u32,
+                    ) >= 0
+                    {
+                        break;
+                    } else {
+                        if std::io::Error::last_os_error().raw_os_error().unwrap() != libc::ENOMEM {
+                            return Err("loadquery failed".into());
+                        }
+                        buffer.resize(buffer.len() * 2, std::mem::zeroed::<libc::ld_info>());
+                    }
+                }
+                let mut current = buffer.as_mut_ptr() as *mut libc::ld_info;
+                loop {
+                    let data_base = (*current).ldinfo_dataorg as u64;
+                    let data_end = data_base + (*current).ldinfo_datasize;
+                    if (data_base..data_end).contains(&addr) {
+                        let bytes = CStr::from_ptr(&(*current).ldinfo_filename[0]).to_bytes();
+                        let os = OsStr::from_bytes(bytes);
+                        return try_canonicalize(Path::new(os)).map_err(|e| e.to_string());
+                    }
+                    if (*current).ldinfo_next == 0 {
+                        break;
+                    }
+                    current = (current as *mut i8).offset((*current).ldinfo_next as isize)
+                        as *mut libc::ld_info;
+                }
+                return Err(format!("current dll's address {} is not in the load map", addr));
+            }
+        })
+        .clone()
+}
+
+#[cfg(windows)]
+fn current_dll_path() -> Result<PathBuf, String> {
+    use std::ffi::OsString;
+    use std::io;
+    use std::os::windows::prelude::*;
+
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GetModuleFileNameW, GetModuleHandleExW,
+    };
+    use windows::core::PCWSTR;
+
+    let mut module = HMODULE::default();
+    unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            PCWSTR(current_dll_path as *mut u16),
+            &mut module,
+        )
+    }
+    .map_err(|e| e.to_string())?;
+
+    let mut filename = vec![0; 1024];
+    let n = unsafe { GetModuleFileNameW(Some(module), &mut filename) } as usize;
+    if n == 0 {
+        return Err(format!("GetModuleFileNameW failed: {}", io::Error::last_os_error()));
+    }
+    if n >= filename.capacity() {
+        return Err(format!("our buffer was too small? {}", io::Error::last_os_error()));
     }
 
-    // Use env::current_exe() to get the path of the executable following
-    // symlinks/canonicalizing components.
-    fn from_current_exe() -> PathBuf {
-        match env::current_exe() {
-            Ok(exe) => {
-                let mut p = canonicalize(exe);
-                p.pop();
-                p.pop();
-                p
-            }
-            Err(e) => panic!("failed to get current_exe: {}", e),
+    filename.truncate(n);
+
+    let path = try_canonicalize(OsString::from_wide(&filename)).map_err(|e| e.to_string())?;
+
+    // See comments on this target function, but the gist is that
+    // gcc chokes on verbatim paths which fs::canonicalize generates
+    // so we try to avoid those kinds of paths.
+    Ok(rustc_fs_util::fix_windows_verbatim_for_gcc(&path))
+}
+
+#[cfg(target_os = "wasi")]
+fn current_dll_path() -> Result<PathBuf, String> {
+    Err("current_dll_path is not supported on WASI".to_string())
+}
+
+/// This function checks if sysroot is found using env::args().next(), and if it
+/// is not found, finds sysroot from current rustc_driver dll.
+pub(crate) fn default_sysroot() -> PathBuf {
+    fn default_from_rustc_driver_dll() -> Result<PathBuf, String> {
+        let dll = current_dll_path()?;
+
+        // `dll` will be in one of the following two:
+        // - compiler's libdir: $sysroot/lib/*.dll
+        // - target's libdir: $sysroot/lib/rustlib/$target/lib/*.dll
+        //
+        // use `parent` twice to chop off the file name and then also the
+        // directory containing the dll
+        let dir = dll.parent().and_then(|p| p.parent()).ok_or_else(|| {
+            format!("Could not move 2 levels upper using `parent()` on {}", dll.display())
+        })?;
+
+        // if `dir` points to target's dir, move up to the sysroot
+        let mut sysroot_dir = if dir.ends_with(crate::config::host_tuple()) {
+            dir.parent() // chop off `$target`
+                .and_then(|p| p.parent()) // chop off `rustlib`
+                .and_then(|p| p.parent()) // chop off `lib`
+                .map(|s| s.to_owned())
+                .ok_or_else(|| {
+                    format!("Could not move 3 levels upper using `parent()` on {}", dir.display())
+                })?
+        } else {
+            dir.to_owned()
+        };
+
+        // On multiarch linux systems, there will be multiarch directory named
+        // with the architecture(e.g `x86_64-linux-gnu`) under the `lib` directory.
+        // Which cause us to mistakenly end up in the lib directory instead of the sysroot directory.
+        if sysroot_dir.ends_with("lib") {
+            sysroot_dir =
+                sysroot_dir.parent().map(|real_sysroot| real_sysroot.to_owned()).ok_or_else(
+                    || format!("Could not move to parent path of {}", sysroot_dir.display()),
+                )?
         }
+
+        Ok(sysroot_dir)
     }
 
     // Use env::args().next() to get the path of the executable without
@@ -144,64 +228,26 @@ pub fn get_or_default_sysroot() -> PathBuf {
     // binary able to locate Rust libraries in systems using content-addressable
     // storage (CAS).
     fn from_env_args_next() -> Option<PathBuf> {
-        match env::args_os().next() {
-            Some(first_arg) => {
-                let mut p = PathBuf::from(first_arg);
+        let mut p = PathBuf::from(env::args_os().next()?);
 
-                // Check if sysroot is found using env::args().next() only if the rustc in argv[0]
-                // is a symlink (see #79253). We might want to change/remove it to conform with
-                // https://www.gnu.org/prep/standards/standards.html#Finding-Program-Files in the
-                // future.
-                if fs::read_link(&p).is_err() {
-                    // Path is not a symbolic link or does not exist.
-                    return None;
-                }
-
-                p.pop();
-                p.pop();
-                let mut libdir = PathBuf::from(&p);
-                libdir.push(find_libdir(&p).as_ref());
-                if libdir.exists() { Some(p) } else { None }
-            }
-            None => None,
+        // Check if sysroot is found using env::args().next() only if the rustc in argv[0]
+        // is a symlink (see #79253). We might want to change/remove it to conform with
+        // https://www.gnu.org/prep/standards/standards.html#Finding-Program-Files in the
+        // future.
+        if fs::read_link(&p).is_err() {
+            // Path is not a symbolic link or does not exist.
+            return None;
         }
+
+        // Pop off `bin/rustc`, obtaining the suspected sysroot.
+        p.pop();
+        p.pop();
+        // Look for the target rustlib directory in the suspected sysroot.
+        let mut rustlib_path = rustc_target::relative_target_rustlib_path(&p, "dummy");
+        rustlib_path.pop(); // pop off the dummy target.
+        rustlib_path.exists().then_some(p)
     }
 
-    // Check if sysroot is found using env::args().next(), and if is not found,
-    // use env::current_exe() to imply sysroot.
-    from_env_args_next().unwrap_or_else(from_current_exe)
+    from_env_args_next()
+        .unwrap_or_else(|| default_from_rustc_driver_dll().expect("Failed finding sysroot"))
 }
-
-// The name of the directory rustc expects libraries to be located.
-fn find_libdir(sysroot: &Path) -> Cow<'static, str> {
-    // FIXME: This is a quick hack to make the rustc binary able to locate
-    // Rust libraries in Linux environments where libraries might be installed
-    // to lib64/lib32. This would be more foolproof by basing the sysroot off
-    // of the directory where `librustc_driver` is located, rather than
-    // where the rustc binary is.
-    // If --libdir is set during configuration to the value other than
-    // "lib" (i.e., non-default), this value is used (see issue #16552).
-
-    #[cfg(target_pointer_width = "64")]
-    const PRIMARY_LIB_DIR: &str = "lib64";
-
-    #[cfg(target_pointer_width = "32")]
-    const PRIMARY_LIB_DIR: &str = "lib32";
-
-    const SECONDARY_LIB_DIR: &str = "lib";
-
-    match option_env!("CFG_LIBDIR_RELATIVE") {
-        None | Some("lib") => {
-            if sysroot.join(PRIMARY_LIB_DIR).join(RUST_LIB_DIR).exists() {
-                PRIMARY_LIB_DIR.into()
-            } else {
-                SECONDARY_LIB_DIR.into()
-            }
-        }
-        Some(libdir) => libdir.into(),
-    }
-}
-
-// The name of rustc's own place to organize libraries.
-// Used to be "rustc", now the default is "rustlib"
-const RUST_LIB_DIR: &str = "rustlib";

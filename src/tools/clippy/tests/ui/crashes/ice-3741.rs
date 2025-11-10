@@ -1,4 +1,5 @@
-// aux-build:proc_macro_crash.rs
+//@ check-pass
+//@aux-build:proc_macro_crash.rs
 
 #![warn(clippy::suspicious_else_formatting)]
 

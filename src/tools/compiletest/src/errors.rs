@@ -1,67 +1,85 @@
-use self::WhichLine::*;
-
 use std::fmt;
 use std::fs::File;
-use std::io::prelude::*;
 use std::io::BufReader;
-use std::path::Path;
-use std::str::FromStr;
+use std::io::prelude::*;
+use std::sync::OnceLock;
 
-use lazy_static::lazy_static;
+use camino::Utf8Path;
 use regex::Regex;
 use tracing::*;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
     Help,
     Error,
     Note,
     Suggestion,
     Warning,
+    Raw,
+    /// Used for better recovery and diagnostics in compiletest.
+    Unknown,
 }
 
-impl FromStr for ErrorKind {
-    type Err = ();
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.to_uppercase();
-        let part0: &str = s.split(':').next().unwrap();
-        match part0 {
-            "HELP" => Ok(ErrorKind::Help),
-            "ERROR" => Ok(ErrorKind::Error),
-            "NOTE" => Ok(ErrorKind::Note),
-            "SUGGESTION" => Ok(ErrorKind::Suggestion),
-            "WARN" | "WARNING" => Ok(ErrorKind::Warning),
-            _ => Err(()),
+impl ErrorKind {
+    pub fn from_compiler_str(s: &str) -> ErrorKind {
+        match s {
+            "help" => ErrorKind::Help,
+            "error" | "error: internal compiler error" => ErrorKind::Error,
+            "note" | "failure-note" => ErrorKind::Note,
+            "warning" => ErrorKind::Warning,
+            _ => panic!("unexpected compiler diagnostic kind `{s}`"),
         }
+    }
+
+    /// Either the canonical uppercase string, or some additional versions for compatibility.
+    /// FIXME: consider keeping only the canonical versions here.
+    fn from_user_str(s: &str) -> Option<ErrorKind> {
+        Some(match s {
+            "HELP" | "help" => ErrorKind::Help,
+            "ERROR" | "error" => ErrorKind::Error,
+            "NOTE" | "note" => ErrorKind::Note,
+            "SUGGESTION" => ErrorKind::Suggestion,
+            "WARN" | "WARNING" | "warn" | "warning" => ErrorKind::Warning,
+            "RAW" => ErrorKind::Raw,
+            _ => return None,
+        })
+    }
+
+    pub fn expect_from_user_str(s: &str) -> ErrorKind {
+        ErrorKind::from_user_str(s).unwrap_or_else(|| {
+            panic!(
+                "unexpected diagnostic kind `{s}`, expected \
+                 `ERROR`, `WARN`, `NOTE`, `HELP`, `SUGGESTION` or `RAW`"
+            )
+        })
     }
 }
 
 impl fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            ErrorKind::Help => write!(f, "help message"),
-            ErrorKind::Error => write!(f, "error"),
-            ErrorKind::Note => write!(f, "note"),
-            ErrorKind::Suggestion => write!(f, "suggestion"),
-            ErrorKind::Warning => write!(f, "warning"),
+            ErrorKind::Help => write!(f, "HELP"),
+            ErrorKind::Error => write!(f, "ERROR"),
+            ErrorKind::Note => write!(f, "NOTE"),
+            ErrorKind::Suggestion => write!(f, "SUGGESTION"),
+            ErrorKind::Warning => write!(f, "WARN"),
+            ErrorKind::Raw => write!(f, "RAW"),
+            ErrorKind::Unknown => write!(f, "UNKNOWN"),
         }
     }
 }
 
 #[derive(Debug)]
 pub struct Error {
-    pub line_num: usize,
+    pub line_num: Option<usize>,
+    pub column_num: Option<usize>,
     /// What kind of message we expect (e.g., warning, error, suggestion).
-    /// `None` if not specified or unknown message kind.
-    pub kind: Option<ErrorKind>,
+    pub kind: ErrorKind,
     pub msg: String,
-}
-
-#[derive(PartialEq, Debug)]
-enum WhichLine {
-    ThisLine,
-    FollowPrevious(usize),
-    AdjustBackward(usize),
+    /// For some `Error`s, like secondary lines of multi-line diagnostics, line annotations
+    /// are not mandatory, even if they would otherwise be mandatory for primary errors.
+    /// Only makes sense for "actual" errors, not for "expected" errors.
+    pub require_annotation: bool,
 }
 
 /// Looks for either "//~| KIND MESSAGE" or "//~^^... KIND MESSAGE"
@@ -72,10 +90,10 @@ enum WhichLine {
 /// and also //~^ ERROR message one for the preceding line, and
 ///          //~| ERROR message two for that same line.
 ///
-/// If cfg is not None (i.e., in an incremental test), then we look
-/// for `//[X]~` instead, where `X` is the current `cfg`.
-pub fn load_errors(testfile: &Path, cfg: Option<&str>) -> Vec<Error> {
-    let rdr = BufReader::new(File::open(testfile).unwrap());
+/// If revision is not None, then we look
+/// for `//[X]~` instead, where `X` is the current revision.
+pub fn load_errors(testfile: &Utf8Path, revision: Option<&str>) -> Vec<Error> {
+    let rdr = BufReader::new(File::open(testfile.as_std_path()).unwrap());
 
     // `last_nonfollow_error` tracks the most recently seen
     // line with an error template that did not use the
@@ -89,14 +107,14 @@ pub fn load_errors(testfile: &Path, cfg: Option<&str>) -> Vec<Error> {
 
     rdr.lines()
         .enumerate()
+        // We want to ignore utf-8 failures in tests during collection of annotations.
+        .filter(|(_, line)| line.is_ok())
         .filter_map(|(line_num, line)| {
-            parse_expected(last_nonfollow_error, line_num + 1, &line.unwrap(), cfg).map(
-                |(which, error)| {
-                    match which {
-                        FollowPrevious(_) => {}
-                        _ => last_nonfollow_error = Some(error.line_num),
+            parse_expected(last_nonfollow_error, line_num + 1, &line.unwrap(), revision).map(
+                |(follow_prev, error)| {
+                    if !follow_prev {
+                        last_nonfollow_error = error.line_num;
                     }
-
                     error
                 },
             )
@@ -108,26 +126,33 @@ fn parse_expected(
     last_nonfollow_error: Option<usize>,
     line_num: usize,
     line: &str,
-    cfg: Option<&str>,
-) -> Option<(WhichLine, Error)> {
+    test_revision: Option<&str>,
+) -> Option<(bool, Error)> {
     // Matches comments like:
     //     //~
     //     //~|
     //     //~^
     //     //~^^^^^
-    //     //[cfg1]~
-    //     //[cfg1,cfg2]~^^
-    lazy_static! {
-        static ref RE: Regex =
-            Regex::new(r"//(?:\[(?P<cfgs>[\w,]+)])?~(?P<adjust>\||\^*)").unwrap();
-    }
+    //     //~v
+    //     //~vvvvv
+    //     //~?
+    //     //[rev1]~
+    //     //[rev1,rev2]~^^
+    static RE: OnceLock<Regex> = OnceLock::new();
 
-    let captures = RE.captures(line)?;
+    let captures = RE
+        .get_or_init(|| {
+            Regex::new(r"//(?:\[(?P<revs>[\w\-,]+)])?~(?P<adjust>\?|\||[v\^]*)").unwrap()
+        })
+        .captures(line)?;
 
-    match (cfg, captures.name("cfgs")) {
-        // Only error messages that contain our `cfg` between the square brackets apply to us.
-        (Some(cfg), Some(filter)) if !filter.as_str().split(',').any(|s| s == cfg) => return None,
-        (Some(_), Some(_)) => {}
+    match (test_revision, captures.name("revs")) {
+        // Only error messages that contain our revision between the square brackets apply to us.
+        (Some(test_revision), Some(revision_filters)) => {
+            if !revision_filters.as_str().split(',').any(|r| r == test_revision) {
+                return None;
+            }
+        }
 
         (None, Some(_)) => panic!("Only tests with revisions should use `//[X]~`"),
 
@@ -135,45 +160,39 @@ fn parse_expected(
         (Some(_), None) | (None, None) => {}
     }
 
-    let (follow, adjusts) = match &captures["adjust"] {
-        "|" => (true, 0),
-        circumflexes => (false, circumflexes.len()),
-    };
-
     // Get the part of the comment after the sigil (e.g. `~^^` or ~|).
-    let whole_match = captures.get(0).unwrap();
-    let (_, mut msg) = line.split_at(whole_match.end());
-
-    let first_word = msg.split_whitespace().next().expect("Encountered unexpected empty comment");
-
-    // If we find `//~ ERROR foo` or something like that, skip the first word.
-    let kind = first_word.parse::<ErrorKind>().ok();
-    if kind.is_some() {
-        msg = &msg.trim_start().split_at(first_word.len()).1;
-    }
-
-    let msg = msg.trim().to_owned();
-
-    let (which, line_num) = if follow {
-        assert_eq!(adjusts, 0, "use either //~| or //~^, not both.");
-        let line_num = last_nonfollow_error.expect(
-            "encountered //~| without \
-             preceding //~^ line.",
-        );
-        (FollowPrevious(line_num), line_num)
-    } else {
-        let which = if adjusts > 0 { AdjustBackward(adjusts) } else { ThisLine };
-        let line_num = line_num - adjusts;
-        (which, line_num)
+    let tag = captures.get(0).unwrap();
+    let rest = line[tag.end()..].trim_start();
+    let (kind_str, _) =
+        rest.split_once(|c: char| c != '_' && !c.is_ascii_alphabetic()).unwrap_or((rest, ""));
+    let (kind, untrimmed_msg) = match ErrorKind::from_user_str(kind_str) {
+        Some(kind) => (kind, &rest[kind_str.len()..]),
+        None => (ErrorKind::Unknown, rest),
     };
+    let msg = untrimmed_msg.strip_prefix(':').unwrap_or(untrimmed_msg).trim().to_owned();
+
+    let line_num_adjust = &captures["adjust"];
+    let (follow_prev, line_num) = if line_num_adjust == "|" {
+        (true, Some(last_nonfollow_error.expect("encountered //~| without preceding //~^ line")))
+    } else if line_num_adjust == "?" {
+        (false, None)
+    } else if line_num_adjust.starts_with('v') {
+        (false, Some(line_num + line_num_adjust.len()))
+    } else {
+        (false, Some(line_num - line_num_adjust.len()))
+    };
+    let column_num = Some(tag.start() + 1);
 
     debug!(
-        "line={} tag={:?} which={:?} kind={:?} msg={:?}",
+        "line={:?} tag={:?} follow_prev={:?} kind={:?} msg={:?}",
         line_num,
-        whole_match.as_str(),
-        which,
+        tag.as_str(),
+        follow_prev,
         kind,
         msg
     );
-    Some((which, Error { line_num, kind, msg }))
+    Some((follow_prev, Error { line_num, column_num, kind, msg, require_annotation: true }))
 }
+
+#[cfg(test)]
+mod tests;

@@ -1,5 +1,3 @@
-// run-rustfix
-
 #![warn(clippy::use_self)]
 #![allow(dead_code)]
 #![allow(clippy::should_implement_trait, clippy::boxed_local)]
@@ -19,36 +17,50 @@ struct Bad;
 
 impl SelfTrait for Bad {
     fn refs(p1: &Bad) -> &Bad {
+        //~^ use_self
+        //~| use_self
         p1
     }
 
     fn ref_refs<'a>(p1: &'a &'a Bad) -> &'a &'a Bad {
+        //~^ use_self
+        //~| use_self
         p1
     }
 
     fn mut_refs(p1: &mut Bad) -> &mut Bad {
+        //~^ use_self
+        //~| use_self
         p1
     }
 
     fn nested(_p1: Box<Bad>, _p2: (&u8, &Bad)) {}
+    //~^ use_self
+    //~| use_self
 
     fn vals(_: Bad) -> Bad {
-        Bad::default()
+        //~^ use_self
+        //~| use_self
+        Bad
+        //~^ use_self
     }
 }
 
 impl Mul for Bad {
     type Output = Bad;
+    //~^ use_self
 
     fn mul(self, rhs: Bad) -> Bad {
+        //~^ use_self
+        //~| use_self
         rhs
     }
 }
 
 impl Clone for Bad {
     fn clone(&self) -> Self {
-        // FIXME: applicable here
         Bad
+        //~^ use_self
     }
 }
 
@@ -71,7 +83,7 @@ impl SelfTrait for Good {
     fn nested(_p1: Box<Self>, _p2: (&u8, &Self)) {}
 
     fn vals(_: Self) -> Self {
-        Self::default()
+        Self
     }
 }
 
@@ -109,6 +121,46 @@ impl NameTrait for u8 {
 
     fn vals(_: Self) -> Self {
         Self::default()
+    }
+}
+
+mod impl_in_macro {
+    macro_rules! parse_ip_impl {
+        // minimized from serde=1.0.118
+        ($ty:ty) => {
+            impl FooTrait for $ty {
+                fn new() -> Self {
+                    <$ty>::bar()
+                }
+            }
+        };
+    }
+
+    struct Foo;
+
+    trait FooTrait {
+        fn new() -> Self;
+    }
+
+    impl Foo {
+        fn bar() -> Self {
+            Self
+        }
+    }
+    parse_ip_impl!(Foo); // Should not lint
+}
+
+mod full_path_replacement {
+    trait Error {
+        fn custom<T: std::fmt::Display>(_msg: T) -> Self;
+    }
+
+    impl Error for std::fmt::Error {
+        fn custom<T: std::fmt::Display>(_msg: T) -> Self {
+            std::fmt::Error // Should lint
+            //
+            //~^^ use_self
+        }
     }
 }
 

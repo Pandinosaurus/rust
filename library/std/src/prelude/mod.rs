@@ -25,61 +25,89 @@
 //!
 //! # Prelude contents
 //!
-//! The current version of the prelude (version 1) lives in
-//! [`std::prelude::v1`], and re-exports the following:
+//! The items included in the prelude depend on the edition of the crate.
+//! The first version of the prelude is used in Rust 2015 and Rust 2018,
+//! and lives in [`std::prelude::v1`].
+//! [`std::prelude::rust_2015`] and [`std::prelude::rust_2018`] re-export this prelude.
+//! It re-exports the following:
 //!
-//! * [`std::marker`]::{[`Copy`], [`Send`], [`Sized`], [`Sync`], [`Unpin`]}:
+//! * <code>[std::marker]::{[Copy], [Send], [Sized], [Sync], [Unpin]}</code>,
 //!   marker traits that indicate fundamental properties of types.
-//! * [`std::ops`]::{[`Drop`], [`Fn`], [`FnMut`], [`FnOnce`]}: various
-//!   operations for both destructors and overloading `()`.
-//! * [`std::mem`]::[`drop`][`mem::drop`]: a convenience function for explicitly
+//! * <code>[std::ops]::{[Fn], [FnMut], [FnOnce]}</code>, and their analogous
+//!   async traits, <code>[std::ops]::{[AsyncFn], [AsyncFnMut], [AsyncFnOnce]}</code>.
+//! * <code>[std::ops]::[Drop]</code>, for implementing destructors.
+//! * <code>[std::mem]::[drop]</code>, a convenience function for explicitly
 //!   dropping a value.
-//! * [`std::boxed`]::[`Box`]: a way to allocate values on the heap.
-//! * [`std::borrow`]::[`ToOwned`]: the conversion trait that defines
+//! * <code>[std::mem]::{[size_of], [size_of_val]}</code>, to get the size of
+//!   a type or value.
+//! * <code>[std::mem]::{[align_of], [align_of_val]}</code>, to get the
+//!   alignment of a type or value.
+//! * <code>[std::boxed]::[Box]</code>, a way to allocate values on the heap.
+//! * <code>[std::borrow]::[ToOwned]</code>, the conversion trait that defines
 //!   [`to_owned`], the generic method for creating an owned type from a
 //!   borrowed type.
-//! * [`std::clone`]::[`Clone`]: the ubiquitous trait that defines
-//!   [`clone`][`Clone::clone`], the method for producing a copy of a value.
-//! * [`std::cmp`]::{[`PartialEq`], [`PartialOrd`], [`Eq`], [`Ord`]}: the
+//! * <code>[std::clone]::[Clone]</code>, the ubiquitous trait that defines
+//!   [`clone`][Clone::clone], the method for producing a copy of a value.
+//! * <code>[std::cmp]::{[PartialEq], [PartialOrd], [Eq], [Ord]}</code>, the
 //!   comparison traits, which implement the comparison operators and are often
 //!   seen in trait bounds.
-//! * [`std::convert`]::{[`AsRef`], [`AsMut`], [`Into`], [`From`]}: generic
+//! * <code>[std::convert]::{[AsRef], [AsMut], [Into], [From]}</code>, generic
 //!   conversions, used by savvy API authors to create overloaded methods.
-//! * [`std::default`]::[`Default`], types that have default values.
-//! * [`std::iter`]::{[`Iterator`], [`Extend`], [`IntoIterator`],
-//!   [`DoubleEndedIterator`], [`ExactSizeIterator`]}: iterators of various
+//! * <code>[std::default]::[Default]</code>, types that have default values.
+//! * <code>[std::iter]::{[Iterator], [Extend], [IntoIterator], [DoubleEndedIterator], [ExactSizeIterator]}</code>,
+//!   iterators of various
 //!   kinds.
-//! * [`std::option`]::[`Option`]::{[`self`][`Option`], [`Some`], [`None`]}, a
+//! * <code>[std::option]::[Option]::{[self][Option], [Some], [None]}</code>, a
 //!   type which expresses the presence or absence of a value. This type is so
 //!   commonly used, its variants are also exported.
-//! * [`std::result`]::[`Result`]::{[`self`][`Result`], [`Ok`], [`Err`]}: a type
+//! * <code>[std::result]::[Result]::{[self][Result], [Ok], [Err]}</code>, a type
 //!   for functions that may succeed or fail. Like [`Option`], its variants are
 //!   exported as well.
-//! * [`std::string`]::{[`String`], [`ToString`]}: heap-allocated strings.
-//! * [`std::vec`]::[`Vec`]: a growable, heap-allocated vector.
+//! * <code>[std::string]::{[String], [ToString]}</code>, heap-allocated strings.
+//! * <code>[std::vec]::[Vec]</code>, a growable, heap-allocated vector.
 //!
-//! [`mem::drop`]: crate::mem::drop
-//! [`std::borrow`]: crate::borrow
-//! [`std::boxed`]: crate::boxed
-//! [`std::clone`]: crate::clone
-//! [`std::cmp`]: crate::cmp
-//! [`std::convert`]: crate::convert
-//! [`std::default`]: crate::default
-//! [`std::iter`]: crate::iter
-//! [`std::marker`]: crate::marker
-//! [`std::mem`]: crate::mem
-//! [`std::ops`]: crate::ops
-//! [`std::option`]: crate::option
+//! The prelude used in Rust 2021, [`std::prelude::rust_2021`], includes all of the above,
+//! and in addition re-exports:
+//!
+//! * <code>[std::convert]::{[TryFrom], [TryInto]}</code>.
+//! * <code>[std::iter]::[FromIterator]</code>.
+//!
+//! The prelude used in Rust 2024, [`std::prelude::rust_2024`], includes all of the above,
+//! and in addition re-exports:
+//!
+//! * <code>[std::future]::{[Future], [IntoFuture]}</code>.
+//!
+//! [std::borrow]: crate::borrow
+//! [std::boxed]: crate::boxed
+//! [std::clone]: crate::clone
+//! [std::cmp]: crate::cmp
+//! [std::convert]: crate::convert
+//! [std::default]: crate::default
+//! [std::future]: crate::future
+//! [std::iter]: crate::iter
+//! [std::marker]: crate::marker
+//! [std::mem]: crate::mem
+//! [std::ops]: crate::ops
+//! [std::option]: crate::option
 //! [`std::prelude::v1`]: v1
-//! [`std::result`]: crate::result
-//! [`std::slice`]: crate::slice
-//! [`std::string`]: crate::string
-//! [`std::vec`]: mod@crate::vec
+//! [`std::prelude::rust_2015`]: rust_2015
+//! [`std::prelude::rust_2018`]: rust_2018
+//! [`std::prelude::rust_2021`]: rust_2021
+//! [`std::prelude::rust_2024`]: rust_2024
+//! [std::result]: crate::result
+//! [std::slice]: crate::slice
+//! [std::string]: crate::string
+//! [std::vec]: mod@crate::vec
 //! [`to_owned`]: crate::borrow::ToOwned::to_owned
 //! [book-closures]: ../../book/ch13-01-closures.html
 //! [book-dtor]: ../../book/ch15-03-drop.html
 //! [book-enums]: ../../book/ch06-01-defining-an-enum.html
 //! [book-iter]: ../../book/ch13-02-iterators.html
+//! [Future]: crate::future::Future
+//! [IntoFuture]: crate::future::IntoFuture
+
+// No formatting: this file is nothing but re-exports, and their order is worth preserving.
+#![cfg_attr(rustfmt, rustfmt::skip)]
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
@@ -88,9 +116,9 @@ pub mod v1;
 /// The 2015 version of the prelude of The Rust Standard Library.
 ///
 /// See the [module-level documentation](self) for more.
-#[unstable(feature = "prelude_2015", issue = "none")]
+#[stable(feature = "prelude_2015", since = "1.55.0")]
 pub mod rust_2015 {
-    #[unstable(feature = "prelude_2015", issue = "none")]
+    #[stable(feature = "prelude_2015", since = "1.55.0")]
     #[doc(no_inline)]
     pub use super::v1::*;
 }
@@ -98,9 +126,9 @@ pub mod rust_2015 {
 /// The 2018 version of the prelude of The Rust Standard Library.
 ///
 /// See the [module-level documentation](self) for more.
-#[unstable(feature = "prelude_2018", issue = "none")]
+#[stable(feature = "prelude_2018", since = "1.55.0")]
 pub mod rust_2018 {
-    #[unstable(feature = "prelude_2018", issue = "none")]
+    #[stable(feature = "prelude_2018", since = "1.55.0")]
     #[doc(no_inline)]
     pub use super::v1::*;
 }
@@ -108,13 +136,42 @@ pub mod rust_2018 {
 /// The 2021 version of the prelude of The Rust Standard Library.
 ///
 /// See the [module-level documentation](self) for more.
-#[unstable(feature = "prelude_2021", issue = "none")]
+#[stable(feature = "prelude_2021", since = "1.55.0")]
 pub mod rust_2021 {
-    #[unstable(feature = "prelude_2021", issue = "none")]
+    #[stable(feature = "prelude_2021", since = "1.55.0")]
     #[doc(no_inline)]
     pub use super::v1::*;
 
-    #[unstable(feature = "prelude_2021", issue = "none")]
+    #[stable(feature = "prelude_2021", since = "1.55.0")]
     #[doc(no_inline)]
     pub use core::prelude::rust_2021::*;
+}
+
+/// The 2024 version of the prelude of The Rust Standard Library.
+///
+/// See the [module-level documentation](self) for more.
+#[stable(feature = "prelude_2024", since = "1.85.0")]
+pub mod rust_2024 {
+    #[stable(feature = "rust1", since = "1.0.0")]
+    #[doc(no_inline)]
+    pub use super::v1::*;
+
+    #[stable(feature = "prelude_2024", since = "1.85.0")]
+    #[doc(no_inline)]
+    pub use core::prelude::rust_2024::*;
+}
+
+/// The Future version of the prelude of The Rust Standard Library.
+///
+/// See the [module-level documentation](self) for more.
+#[doc(hidden)]
+#[unstable(feature = "prelude_future", issue = "none")]
+pub mod rust_future {
+    #[stable(feature = "rust1", since = "1.0.0")]
+    #[doc(no_inline)]
+    pub use super::v1::*;
+
+    #[unstable(feature = "prelude_next", issue = "none")]
+    #[doc(no_inline)]
+    pub use core::prelude::rust_future::*;
 }

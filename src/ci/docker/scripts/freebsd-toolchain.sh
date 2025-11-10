@@ -4,9 +4,9 @@
 set -eux
 
 arch=$1
-binutils_version=2.25.1
-freebsd_version=11.4
-triple=$arch-unknown-freebsd11
+binutils_version=2.40
+freebsd_version=12.3
+triple=$arch-unknown-freebsd12
 sysroot=/usr/local/$triple
 
 hide_output() {
@@ -28,7 +28,9 @@ exit 1
 # First up, build binutils
 mkdir binutils
 cd binutils
-curl https://ftp.gnu.org/gnu/binutils/binutils-${binutils_version}.tar.bz2 | tar xjf -
+# Originally downloaded from:
+# https://sourceware.org/pub/binutils/releases/binutils-${binutils_version}.tar.bz2
+curl https://ci-mirrors.rust-lang.org/rustc/binutils-${binutils_version}.tar.bz2 | tar xjf -
 mkdir binutils-build
 cd binutils-build
 hide_output ../binutils-${binutils_version}/configure \
@@ -53,13 +55,13 @@ files_to_extract=(
 for lib in c cxxrt gcc_s m thr util; do
   files_to_extract=("${files_to_extract[@]}" "./lib/lib${lib}.*" "./usr/lib/lib${lib}.*")
 done
-for lib in c++ c_nonshared compiler_rt execinfo gcc pthread rt ssp_nonshared; do
+for lib in c++ c_nonshared compiler_rt execinfo gcc pthread rt ssp_nonshared procstat devstat kvm memstat; do
   files_to_extract=("${files_to_extract[@]}" "./usr/lib/lib${lib}.*")
 done
 
 # Originally downloaded from:
 # URL=https://download.freebsd.org/ftp/releases/${freebsd_arch}/${freebsd_version}-RELEASE/base.txz
-URL=https://ci-mirrors.rust-lang.org/rustc/2020-08-09-freebsd-${freebsd_arch}-${freebsd_version}-RELEASE-base.txz
+URL=https://ci-mirrors.rust-lang.org/rustc/2022-05-06-freebsd-${freebsd_version}-${freebsd_arch}-base.txz
 curl "$URL" | tar xJf - -C "$sysroot" --wildcards "${files_to_extract[@]}"
 
 # Clang can do cross-builds out of the box, if we give it the right
@@ -68,7 +70,7 @@ curl "$URL" | tar xJf - -C "$sysroot" --wildcards "${files_to_extract[@]}"
 # there might be other problems.)
 #
 # The --target option is last because the cross-build of LLVM uses
-# --target without an OS version ("-freebsd" vs. "-freebsd11").  This
+# --target without an OS version ("-freebsd" vs. "-freebsd12").  This
 # makes Clang default to libstdc++ (which no longer exists), and also
 # controls other features, like GNU-style symbol table hashing and
 # anything predicated on the version number in the __FreeBSD__

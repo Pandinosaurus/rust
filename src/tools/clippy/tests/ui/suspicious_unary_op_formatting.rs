@@ -1,4 +1,5 @@
 #![warn(clippy::suspicious_unary_op_formatting)]
+#![allow(clippy::needless_ifs)]
 
 #[rustfmt::skip]
 fn main() {
@@ -6,14 +7,22 @@ fn main() {
     let a = 42;
 
     if a >- 30 {}
+    //~^ suspicious_unary_op_formatting
+
     if a >=- 30 {}
+    //~^ suspicious_unary_op_formatting
+
 
     let b = true;
     let c = false;
 
     if b &&! c {}
+    //~^ suspicious_unary_op_formatting
+
 
     if a >-   30 {}
+    //~^ suspicious_unary_op_formatting
+
 
     // those are ok:
     if a >-30 {}

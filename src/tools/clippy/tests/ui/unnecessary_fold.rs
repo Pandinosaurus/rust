@@ -1,22 +1,32 @@
-// run-rustfix
-
 #![allow(dead_code)]
+
+fn is_any(acc: bool, x: usize) -> bool {
+    acc || x > 2
+}
 
 /// Calls which should trigger the `UNNECESSARY_FOLD` lint
 fn unnecessary_fold() {
     // Can be replaced by .any
     let _ = (0..3).fold(false, |acc, x| acc || x > 2);
+    //~^ unnecessary_fold
+    // Can be replaced by .any (checking suggestion)
+    let _ = (0..3).fold(false, |acc, x| is_any(acc, x));
+    //~^ redundant_closure
     // Can be replaced by .all
     let _ = (0..3).fold(true, |acc, x| acc && x > 2);
+    //~^ unnecessary_fold
     // Can be replaced by .sum
     let _: i32 = (0..3).fold(0, |acc, x| acc + x);
+    //~^ unnecessary_fold
     // Can be replaced by .product
     let _: i32 = (0..3).fold(1, |acc, x| acc * x);
+    //~^ unnecessary_fold
 }
 
 /// Should trigger the `UNNECESSARY_FOLD` lint, with an error span including exactly `.fold(...)`
 fn unnecessary_fold_span_for_multi_element_chain() {
     let _: bool = (0..3).map(|x| 2 * x).fold(false, |acc, x| acc || x > 2);
+    //~^ unnecessary_fold
 }
 
 /// Calls which should not trigger the `UNNECESSARY_FOLD` lint
@@ -47,6 +57,40 @@ fn unnecessary_fold_over_multiple_lines() {
         .map(|x| x + 1)
         .filter(|x| x % 2 == 0)
         .fold(false, |acc, x| acc || x > 2);
+    //~^ unnecessary_fold
+}
+
+fn issue10000() {
+    use std::collections::HashMap;
+    use std::hash::BuildHasher;
+
+    fn anything<T>(_: T) {}
+    fn num(_: i32) {}
+    fn smoketest_map<S: BuildHasher>(mut map: HashMap<i32, i32, S>) {
+        map.insert(0, 0);
+        assert_eq!(map.values().fold(0, |x, y| x + y), 0);
+        //~^ unnecessary_fold
+
+        // more cases:
+        let _ = map.values().fold(0, |x, y| x + y);
+        //~^ unnecessary_fold
+        let _ = map.values().fold(1, |x, y| x * y);
+        //~^ unnecessary_fold
+        let _: i32 = map.values().fold(0, |x, y| x + y);
+        //~^ unnecessary_fold
+        let _: i32 = map.values().fold(1, |x, y| x * y);
+        //~^ unnecessary_fold
+        anything(map.values().fold(0, |x, y| x + y));
+        //~^ unnecessary_fold
+        anything(map.values().fold(1, |x, y| x * y));
+        //~^ unnecessary_fold
+        num(map.values().fold(0, |x, y| x + y));
+        //~^ unnecessary_fold
+        num(map.values().fold(1, |x, y| x * y));
+        //~^ unnecessary_fold
+    }
+
+    smoketest_map(HashMap::new());
 }
 
 fn main() {}

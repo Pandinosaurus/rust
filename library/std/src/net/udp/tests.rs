@@ -1,8 +1,7 @@
 use crate::io::ErrorKind;
-use crate::net::test::{next_test_ip4, next_test_ip6};
+use crate::net::test::{compare_ignore_zoneid, next_test_ip4, next_test_ip6};
 use crate::net::*;
 use crate::sync::mpsc::channel;
-use crate::sys_common::AsInner;
 use crate::thread;
 use crate::time::{Duration, Instant};
 
@@ -29,6 +28,7 @@ fn bind_error() {
 }
 
 #[test]
+#[cfg_attr(target_os = "wasi", ignore)] // no threads
 fn socket_smoke_test_ip4() {
     each_ip(&mut |server_ip, client_ip| {
         let (tx1, rx1) = channel();
@@ -47,7 +47,7 @@ fn socket_smoke_test_ip4() {
         let (nread, src) = t!(server.recv_from(&mut buf));
         assert_eq!(nread, 1);
         assert_eq!(buf[0], 99);
-        assert_eq!(src, client_ip);
+        assert_eq!(compare_ignore_zoneid(&src, &client_ip), true);
         rx2.recv().unwrap();
     })
 }
@@ -71,6 +71,7 @@ fn socket_peer() {
 }
 
 #[test]
+#[cfg_attr(target_os = "wasi", ignore)] // no threads
 fn udp_clone_smoke() {
     each_ip(&mut |addr1, addr2| {
         let sock1 = t!(UdpSocket::bind(&addr1));
@@ -78,7 +79,9 @@ fn udp_clone_smoke() {
 
         let _t = thread::spawn(move || {
             let mut buf = [0, 0];
-            assert_eq!(sock2.recv_from(&mut buf).unwrap(), (1, addr1));
+            let res = sock2.recv_from(&mut buf).unwrap();
+            assert_eq!(res.0, 1);
+            assert_eq!(compare_ignore_zoneid(&res.1, &addr1), true);
             assert_eq!(buf[0], 1);
             t!(sock2.send_to(&[2], &addr1));
         });
@@ -94,12 +97,15 @@ fn udp_clone_smoke() {
         });
         tx1.send(()).unwrap();
         let mut buf = [0, 0];
-        assert_eq!(sock1.recv_from(&mut buf).unwrap(), (1, addr2));
+        let res = sock1.recv_from(&mut buf).unwrap();
+        assert_eq!(res.0, 1);
+        assert_eq!(compare_ignore_zoneid(&res.1, &addr2), true);
         rx2.recv().unwrap();
     })
 }
 
 #[test]
+#[cfg_attr(target_os = "wasi", ignore)] // no threads
 fn udp_clone_two_read() {
     each_ip(&mut |addr1, addr2| {
         let sock1 = t!(UdpSocket::bind(&addr1));
@@ -132,6 +138,7 @@ fn udp_clone_two_read() {
 }
 
 #[test]
+#[cfg_attr(target_os = "wasi", ignore)] // no threads
 fn udp_clone_two_write() {
     each_ip(&mut |addr1, addr2| {
         let sock1 = t!(UdpSocket::bind(&addr1));
@@ -173,15 +180,19 @@ fn debug() {
     let socket_addr = next_test_ip4();
 
     let udpsock = t!(UdpSocket::bind(&socket_addr));
-    let udpsock_inner = udpsock.0.socket().as_inner();
-    let compare = format!("UdpSocket {{ addr: {:?}, {}: {:?} }}", socket_addr, name, udpsock_inner);
-    assert_eq!(format!("{:?}", udpsock), compare);
+    let udpsock_inner = udpsock.0.socket().as_raw();
+    let compare = format!("UdpSocket {{ addr: {socket_addr:?}, {name}: {udpsock_inner:?} }}");
+    assert_eq!(format!("{udpsock:?}"), compare);
 }
 
 // FIXME: re-enabled openbsd/netbsd tests once their socket timeout code
 //        no longer has rounding errors.
 // VxWorks ignores SO_SNDTIMEO.
-#[cfg_attr(any(target_os = "netbsd", target_os = "openbsd", target_os = "vxworks"), ignore)]
+#[cfg_attr(
+    any(target_os = "netbsd", target_os = "openbsd", target_os = "vxworks", target_os = "nto"),
+    ignore
+)]
+#[cfg_attr(target_os = "wasi", ignore)] // timeout not supported
 #[test]
 fn timeouts() {
     let addr = next_test_ip4();
@@ -207,6 +218,7 @@ fn timeouts() {
 }
 
 #[test]
+#[cfg_attr(target_os = "wasi", ignore)] // timeout not supported
 fn test_read_timeout() {
     let addr = next_test_ip4();
 
@@ -231,6 +243,7 @@ fn test_read_timeout() {
 }
 
 #[test]
+#[cfg_attr(target_os = "wasi", ignore)] // timeout not supported
 fn test_read_with_timeout() {
     let addr = next_test_ip4();
 
@@ -290,6 +303,7 @@ fn connect_send_recv() {
 }
 
 #[test]
+#[cfg_attr(target_os = "wasi", ignore)] // peek not supported
 fn connect_send_peek_recv() {
     each_ip(&mut |addr, _| {
         let socket = t!(UdpSocket::bind(&addr));
@@ -312,6 +326,7 @@ fn connect_send_peek_recv() {
 }
 
 #[test]
+#[cfg_attr(target_os = "wasi", ignore)] // peek_from not supported
 fn peek_from() {
     each_ip(&mut |addr, _| {
         let socket = t!(UdpSocket::bind(&addr));
@@ -360,7 +375,7 @@ fn set_nonblocking() {
         match socket.recv(&mut buf) {
             Ok(_) => panic!("expected error"),
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
-            Err(e) => panic!("unexpected error {}", e),
+            Err(e) => panic!("unexpected error {e}"),
         }
     })
 }

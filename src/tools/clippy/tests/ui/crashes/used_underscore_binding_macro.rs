@@ -1,4 +1,4 @@
-// edition:2018
+//@ check-pass
 
 use serde::Deserialize;
 

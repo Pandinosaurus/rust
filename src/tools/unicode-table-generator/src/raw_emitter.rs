@@ -1,8 +1,8 @@
-use crate::fmt_list;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::convert::TryFrom;
 use std::fmt::{self, Write};
 use std::ops::Range;
+
+use crate::fmt_list;
 
 #[derive(Clone)]
 pub struct RawEmitter {
@@ -23,7 +23,8 @@ impl RawEmitter {
         writeln!(&mut self.file).unwrap();
     }
 
-    fn emit_bitset(&mut self, ranges: &[Range<u32>]) {
+    fn emit_bitset(&mut self, ranges: &[Range<u32>]) -> Result<(), String> {
+        let first_code_point = ranges.first().unwrap().start;
         let last_code_point = ranges.last().unwrap().end;
         // bitset for every bit in the codepoint range
         //
@@ -44,7 +45,7 @@ impl RawEmitter {
         let unique_words =
             words.iter().cloned().collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
         if unique_words.len() > u8::MAX as usize {
-            panic!("cannot pack {} into 8 bits", unique_words.len());
+            return Err(format!("cannot pack {} into 8 bits", unique_words.len()));
         }
         // needed for the chunk mapping to work
         assert_eq!(unique_words[0], 0, "has a zero word");
@@ -96,8 +97,12 @@ impl RawEmitter {
 
         self.blank_line();
 
-        writeln!(&mut self.file, "pub fn lookup(c: char) -> bool {{").unwrap();
-        writeln!(&mut self.file, "    super::bitset_search(",).unwrap();
+        writeln!(&mut self.file, "pub const fn lookup(c: char) -> bool {{").unwrap();
+        writeln!(&mut self.file, "    debug_assert!(!c.is_ascii());").unwrap();
+        if first_code_point > 0x7f {
+            writeln!(&mut self.file, "    (c as u32) >= {first_code_point:#04x} &&").unwrap();
+        }
+        writeln!(&mut self.file, "    super::bitset_search(").unwrap();
         writeln!(&mut self.file, "        c as u32,").unwrap();
         writeln!(&mut self.file, "        &BITSET_CHUNKS_MAP,").unwrap();
         writeln!(&mut self.file, "        &BITSET_INDEX_CHUNKS,").unwrap();
@@ -105,6 +110,8 @@ impl RawEmitter {
         writeln!(&mut self.file, "        &BITSET_MAPPING,").unwrap();
         writeln!(&mut self.file, "    )").unwrap();
         writeln!(&mut self.file, "}}").unwrap();
+
+        Ok(())
     }
 
     fn emit_chunk_map(&mut self, zero_at: u8, compressed_words: &[u8], chunk_length: usize) {
@@ -119,12 +126,8 @@ impl RawEmitter {
         for chunk in compressed_words.chunks(chunk_length) {
             chunks.insert(chunk);
         }
-        let chunk_map = chunks
-            .clone()
-            .into_iter()
-            .enumerate()
-            .map(|(idx, chunk)| (chunk, idx))
-            .collect::<HashMap<_, _>>();
+        let chunk_map =
+            chunks.iter().enumerate().map(|(idx, &chunk)| (chunk, idx)).collect::<HashMap<_, _>>();
         let mut chunk_indices = Vec::new();
         for chunk in compressed_words.chunks(chunk_length) {
             chunk_indices.push(chunk_map[chunk]);
@@ -154,18 +157,27 @@ pub fn emit_codepoints(emitter: &mut RawEmitter, ranges: &[Range<u32>]) {
     emitter.blank_line();
 
     let mut bitset = emitter.clone();
-    bitset.emit_bitset(&ranges);
+    let bitset_ok = bitset.emit_bitset(ranges).is_ok();
 
     let mut skiplist = emitter.clone();
-    skiplist.emit_skiplist(&ranges);
+    skiplist.emit_skiplist(ranges);
 
-    if bitset.bytes_used <= skiplist.bytes_used {
+    if bitset_ok && bitset.bytes_used <= skiplist.bytes_used {
         *emitter = bitset;
         emitter.desc = String::from("bitset");
     } else {
         *emitter = skiplist;
         emitter.desc = String::from("skiplist");
     }
+}
+
+pub fn emit_whitespace(emitter: &mut RawEmitter, ranges: &[Range<u32>]) {
+    emitter.blank_line();
+
+    let mut cascading = emitter.clone();
+    cascading.emit_cascading_map(ranges);
+    *emitter = cascading;
+    emitter.desc = String::from("cascading");
 }
 
 struct Canonicalized {
@@ -261,7 +273,7 @@ impl Canonicalized {
         // for canonical when possible.
         while let Some((&to, _)) = mappings
             .iter()
-            .find(|(&to, _)| to == 0)
+            .find(|&(&to, _)| to == 0)
             .or_else(|| mappings.iter().max_by_key(|m| m.1.len()))
         {
             // Get the mapping with the most entries. Currently, no mapping can
@@ -300,10 +312,9 @@ impl Canonicalized {
                     }
                 }
             }
-            assert!(
-                unique_mapping
-                    .insert(to, UniqueMapping::Canonical(canonical_words.len()))
-                    .is_none()
+            assert_eq!(
+                unique_mapping.insert(to, UniqueMapping::Canonical(canonical_words.len())),
+                None
             );
             canonical_words.push(to);
 
@@ -329,14 +340,10 @@ impl Canonicalized {
         // We'll probably always have some slack though so this loop will still
         // be needed.
         for &w in unique_words {
-            if !unique_mapping.contains_key(&w) {
-                assert!(
-                    unique_mapping
-                        .insert(w, UniqueMapping::Canonical(canonical_words.len()))
-                        .is_none()
-                );
+            unique_mapping.entry(w).or_insert_with(|| {
                 canonical_words.push(w);
-            }
+                UniqueMapping::Canonical(canonical_words.len() - 1)
+            });
         }
         assert_eq!(canonicalized_words.len() + canonical_words.len(), unique_words.len());
         assert_eq!(unique_mapping.len(), unique_words.len());

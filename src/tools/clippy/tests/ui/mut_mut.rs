@@ -1,8 +1,19 @@
-#![allow(unused, clippy::no_effect, clippy::unnecessary_operation)]
-#![warn(clippy::mut_mut)]
+//@aux-build:proc_macros.rs
 
-fn fun(x: &mut &mut u32) -> bool {
-    **x > 0
+#![warn(clippy::mut_mut)]
+#![allow(unused)]
+#![allow(
+    clippy::no_effect,
+    clippy::uninlined_format_args,
+    clippy::unnecessary_operation,
+    clippy::needless_pass_by_ref_mut
+)]
+
+extern crate proc_macros;
+use proc_macros::{external, inline_macros};
+
+fn fun(x: &mut &mut u32) {
+    //~^ mut_mut
 }
 
 fn less_fun(x: *mut *mut u32) {
@@ -16,23 +27,28 @@ macro_rules! mut_ptr {
 }
 
 #[allow(unused_mut, unused_variables)]
+#[inline_macros]
 fn main() {
     let mut x = &mut &mut 1u32;
+    //~^ mut_mut
     {
         let mut y = &mut x;
+        //~^ mut_mut
     }
 
-    if fun(x) {
+    {
         let y: &mut &mut u32 = &mut &mut 2;
-        **y + **x;
+        //~^ mut_mut
+        //~| mut_mut
     }
 
-    if fun(x) {
+    {
         let y: &mut &mut &mut u32 = &mut &mut &mut 2;
-        ***y + **x;
+        //~^ mut_mut
+        //~| mut_mut
     }
 
-    let mut z = mut_ptr!(&mut 3u32);
+    let mut z = inline!(&mut $(&mut 3u32));
 }
 
 fn issue939() {
@@ -46,4 +62,31 @@ fn issue939() {
     for arg in args {
         println!(":{}", arg);
     }
+}
+
+fn issue6922() {
+    // do not lint from an external macro
+    external!(let mut_mut_ty: &mut &mut u32 = &mut &mut 1u32;);
+}
+
+mod issue9035 {
+    use std::fmt::Display;
+
+    struct Foo<'a> {
+        inner: &'a mut dyn Display,
+    }
+
+    impl Foo<'_> {
+        fn foo(&mut self) {
+            let hlp = &mut self.inner;
+            bar(hlp);
+        }
+    }
+
+    fn bar(_: &mut impl Display) {}
+}
+
+fn allow_works() {
+    #[allow(clippy::mut_mut)]
+    let _ = &mut &mut 1;
 }

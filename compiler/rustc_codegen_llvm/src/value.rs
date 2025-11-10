@@ -1,10 +1,7 @@
-pub use crate::llvm::Value;
-
-use crate::llvm;
-
-use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::ptr;
+use std::{fmt, ptr};
+
+use crate::llvm::{self, Value};
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {

@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_variables)]
+#![allow(dead_code, unused_variables, clippy::return_self_not_must_use)]
 
 /// Utility macro to test linting behavior in `option_methods()`
 /// The lints included in `option_methods()` should not lint if the call to map is partially
@@ -22,6 +22,10 @@ impl IteratorFalsePositives {
     }
 
     pub fn next(self) -> IteratorFalsePositives {
+        self
+    }
+
+    pub fn next_back(self) -> IteratorFalsePositives {
         self
     }
 
@@ -51,5 +55,14 @@ impl IteratorFalsePositives {
 
     pub fn count(self) -> usize {
         self.foo as usize
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct IteratorMethodFalsePositives;
+
+impl IteratorMethodFalsePositives {
+    pub fn filter(&self, _s: i32) -> std::vec::IntoIter<i32> {
+        unimplemented!();
     }
 }

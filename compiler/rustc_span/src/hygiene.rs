@@ -24,43 +24,160 @@
 // because getting it wrong can lead to nested `HygieneData::with` calls that
 // trigger runtime aborts. (Fortunately these are obvious and easy to fix.)
 
-use crate::edition::Edition;
-use crate::symbol::{kw, sym, Symbol};
-use crate::SESSION_GLOBALS;
-use crate::{BytePos, CachingSourceMapView, ExpnIdCache, SourceFile, Span, DUMMY_SP};
+use std::hash::Hash;
+use std::sync::Arc;
+use std::{fmt, iter, mem};
 
-use crate::def_id::{CrateNum, DefId, CRATE_DEF_INDEX, LOCAL_CRATE};
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
-use rustc_data_structures::sync::{Lock, Lrc};
-use rustc_macros::HashStable_Generic;
+use rustc_data_structures::stable_hasher::{HashStable, HashingControls, StableHasher};
+use rustc_data_structures::sync::Lock;
+use rustc_data_structures::unhash::UnhashMap;
+use rustc_hashes::Hash64;
+use rustc_index::IndexVec;
+use rustc_macros::{Decodable, Encodable, HashStable_Generic};
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
-use std::fmt;
-use std::hash::Hash;
-use std::thread::LocalKey;
-use tracing::*;
+use tracing::{debug, trace};
+
+use crate::def_id::{CRATE_DEF_ID, CrateNum, DefId, LOCAL_CRATE, StableCrateId};
+use crate::edition::Edition;
+use crate::source_map::SourceMap;
+use crate::symbol::{Symbol, kw, sym};
+use crate::{DUMMY_SP, HashStableContext, Span, SpanDecoder, SpanEncoder, with_session_globals};
 
 /// A `SyntaxContext` represents a chain of pairs `(ExpnId, Transparency)` named "marks".
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// See <https://rustc-dev-guide.rust-lang.org/macro-expansion.html> for more explanation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SyntaxContext(u32);
 
-#[derive(Debug, Encodable, Decodable, Clone)]
-pub struct SyntaxContextData {
+// To ensure correctness of incremental compilation,
+// `SyntaxContext` must not implement `Ord` or `PartialOrd`.
+// See https://github.com/rust-lang/rust/issues/90317.
+impl !Ord for SyntaxContext {}
+impl !PartialOrd for SyntaxContext {}
+
+/// If this part of two syntax contexts is equal, then the whole syntax contexts should be equal.
+/// The other fields are only for caching.
+pub type SyntaxContextKey = (SyntaxContext, ExpnId, Transparency);
+
+#[derive(Clone, Copy, Debug)]
+struct SyntaxContextData {
+    /// The last macro expansion in the chain.
+    /// (Here we say the most deeply nested macro expansion is the "outermost" expansion.)
     outer_expn: ExpnId,
+    /// Transparency of the last macro expansion
     outer_transparency: Transparency,
     parent: SyntaxContext,
-    /// This context, but with all transparent and semi-transparent expansions filtered away.
+    /// This context, but with all transparent and semi-opaque expansions filtered away.
     opaque: SyntaxContext,
     /// This context, but with all transparent expansions filtered away.
-    opaque_and_semitransparent: SyntaxContext,
+    opaque_and_semiopaque: SyntaxContext,
     /// Name of the crate to which `$crate` with this context would resolve.
     dollar_crate_name: Symbol,
 }
 
+impl SyntaxContextData {
+    fn root() -> SyntaxContextData {
+        SyntaxContextData {
+            outer_expn: ExpnId::root(),
+            outer_transparency: Transparency::Opaque,
+            parent: SyntaxContext::root(),
+            opaque: SyntaxContext::root(),
+            opaque_and_semiopaque: SyntaxContext::root(),
+            dollar_crate_name: kw::DollarCrate,
+        }
+    }
+
+    fn key(&self) -> SyntaxContextKey {
+        (self.parent, self.outer_expn, self.outer_transparency)
+    }
+}
+
+rustc_index::newtype_index! {
+    /// A unique ID associated with a macro invocation and expansion.
+    #[orderable]
+    pub struct ExpnIndex {}
+}
+
 /// A unique ID associated with a macro invocation and expansion.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct ExpnId(u32);
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExpnId {
+    pub krate: CrateNum,
+    pub local_id: ExpnIndex,
+}
+
+impl fmt::Debug for ExpnId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Generate crate_::{{expn_}}.
+        write!(f, "{:?}::{{{{expn{}}}}}", self.krate, self.local_id.as_u32())
+    }
+}
+
+rustc_index::newtype_index! {
+    /// A unique ID associated with a macro invocation and expansion.
+    #[debug_format = "expn{}"]
+    pub struct LocalExpnId {}
+}
+
+// To ensure correctness of incremental compilation,
+// `LocalExpnId` must not implement `Ord` or `PartialOrd`.
+// See https://github.com/rust-lang/rust/issues/90317.
+impl !Ord for LocalExpnId {}
+impl !PartialOrd for LocalExpnId {}
+
+/// Assert that the provided `HashStableContext` is configured with the 'default'
+/// `HashingControls`. We should always have bailed out before getting to here
+/// with a non-default mode. With this check in place, we can avoid the need
+/// to maintain separate versions of `ExpnData` hashes for each permutation
+/// of `HashingControls` settings.
+fn assert_default_hashing_controls(ctx: &impl HashStableContext, msg: &str) {
+    match ctx.hashing_controls() {
+        // Note that we require that `hash_spans` be set according to the global
+        // `-Z incremental-ignore-spans` option. Normally, this option is disabled,
+        // which will cause us to require that this method always be called with `Span` hashing
+        // enabled.
+        //
+        // Span hashing can also be disabled without `-Z incremental-ignore-spans`.
+        // This is the case for instance when building a hash for name mangling.
+        // Such configuration must not be used for metadata.
+        HashingControls { hash_spans }
+            if hash_spans != ctx.unstable_opts_incremental_ignore_spans() => {}
+        other => panic!("Attempted hashing of {msg} with non-default HashingControls: {other:?}"),
+    }
+}
+
+/// A unique hash value associated to an expansion.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Encodable, Decodable, HashStable_Generic)]
+pub struct ExpnHash(Fingerprint);
+
+impl ExpnHash {
+    /// Returns the [StableCrateId] identifying the crate this [ExpnHash]
+    /// originates from.
+    #[inline]
+    pub fn stable_crate_id(self) -> StableCrateId {
+        StableCrateId(self.0.split().0)
+    }
+
+    /// Returns the crate-local part of the [ExpnHash].
+    ///
+    /// Used for assertions.
+    #[inline]
+    pub fn local_hash(self) -> Hash64 {
+        self.0.split().1
+    }
+
+    #[inline]
+    pub fn is_root(self) -> bool {
+        self.0 == Fingerprint::ZERO
+    }
+
+    /// Builds a new [ExpnHash] with the given [StableCrateId] and
+    /// `local_hash`, where `local_hash` must be unique within its crate.
+    fn new(stable_crate_id: StableCrateId, local_hash: Hash64) -> ExpnHash {
+        ExpnHash(Fingerprint::new(stable_crate_id.0, local_hash))
+    }
+}
 
 /// A property of a macro expansion that determines how identifiers
 /// produced by that expansion are resolved.
@@ -70,42 +187,125 @@ pub enum Transparency {
     /// Identifier produced by a transparent expansion is always resolved at call-site.
     /// Call-site spans in procedural macros, hygiene opt-out in `macro` should use this.
     Transparent,
-    /// Identifier produced by a semi-transparent expansion may be resolved
+    /// Identifier produced by a semi-opaque expansion may be resolved
     /// either at call-site or at definition-site.
     /// If it's a local variable, label or `$crate` then it's resolved at def-site.
     /// Otherwise it's resolved at call-site.
     /// `macro_rules` macros behave like this, built-in macros currently behave like this too,
     /// but that's an implementation detail.
-    SemiTransparent,
+    SemiOpaque,
     /// Identifier produced by an opaque expansion is always resolved at definition-site.
     /// Def-site spans in procedural macros, identifiers from `macro` by default use this.
     Opaque,
 }
 
-impl ExpnId {
-    pub fn fresh(expn_data: Option<ExpnData>) -> Self {
-        let has_data = expn_data.is_some();
-        let expn_id = HygieneData::with(|data| data.fresh_expn(expn_data));
-        if has_data {
-            update_disambiguator(expn_id);
-        }
-        expn_id
+impl Transparency {
+    pub fn fallback(macro_rules: bool) -> Self {
+        if macro_rules { Transparency::SemiOpaque } else { Transparency::Opaque }
     }
+}
 
+impl LocalExpnId {
     /// The ID of the theoretical expansion that generates freshly parsed, unexpanded AST.
+    pub const ROOT: LocalExpnId = LocalExpnId::ZERO;
+
     #[inline]
-    pub fn root() -> Self {
-        ExpnId(0)
+    fn from_raw(idx: ExpnIndex) -> LocalExpnId {
+        LocalExpnId::from_u32(idx.as_u32())
     }
 
     #[inline]
-    pub fn as_u32(self) -> u32 {
-        self.0
+    pub fn as_raw(self) -> ExpnIndex {
+        ExpnIndex::from_u32(self.as_u32())
+    }
+
+    pub fn fresh_empty() -> LocalExpnId {
+        HygieneData::with(|data| {
+            let expn_id = data.local_expn_data.push(None);
+            let _eid = data.local_expn_hashes.push(ExpnHash(Fingerprint::ZERO));
+            debug_assert_eq!(expn_id, _eid);
+            expn_id
+        })
+    }
+
+    pub fn fresh(mut expn_data: ExpnData, ctx: impl HashStableContext) -> LocalExpnId {
+        debug_assert_eq!(expn_data.parent.krate, LOCAL_CRATE);
+        let expn_hash = update_disambiguator(&mut expn_data, ctx);
+        HygieneData::with(|data| {
+            let expn_id = data.local_expn_data.push(Some(expn_data));
+            let _eid = data.local_expn_hashes.push(expn_hash);
+            debug_assert_eq!(expn_id, _eid);
+            let _old_id = data.expn_hash_to_expn_id.insert(expn_hash, expn_id.to_expn_id());
+            debug_assert!(_old_id.is_none());
+            expn_id
+        })
     }
 
     #[inline]
-    pub fn from_u32(raw: u32) -> ExpnId {
-        ExpnId(raw)
+    pub fn expn_data(self) -> ExpnData {
+        HygieneData::with(|data| data.local_expn_data(self).clone())
+    }
+
+    #[inline]
+    pub fn to_expn_id(self) -> ExpnId {
+        ExpnId { krate: LOCAL_CRATE, local_id: self.as_raw() }
+    }
+
+    #[inline]
+    pub fn set_expn_data(self, mut expn_data: ExpnData, ctx: impl HashStableContext) {
+        debug_assert_eq!(expn_data.parent.krate, LOCAL_CRATE);
+        let expn_hash = update_disambiguator(&mut expn_data, ctx);
+        HygieneData::with(|data| {
+            let old_expn_data = &mut data.local_expn_data[self];
+            assert!(old_expn_data.is_none(), "expansion data is reset for an expansion ID");
+            *old_expn_data = Some(expn_data);
+            debug_assert_eq!(data.local_expn_hashes[self].0, Fingerprint::ZERO);
+            data.local_expn_hashes[self] = expn_hash;
+            let _old_id = data.expn_hash_to_expn_id.insert(expn_hash, self.to_expn_id());
+            debug_assert!(_old_id.is_none());
+        });
+    }
+
+    #[inline]
+    pub fn is_descendant_of(self, ancestor: LocalExpnId) -> bool {
+        self.to_expn_id().is_descendant_of(ancestor.to_expn_id())
+    }
+
+    /// Returns span for the macro which originally caused this expansion to happen.
+    ///
+    /// Stops backtracing at include! boundary.
+    #[inline]
+    pub fn expansion_cause(self) -> Option<Span> {
+        self.to_expn_id().expansion_cause()
+    }
+}
+
+impl ExpnId {
+    /// The ID of the theoretical expansion that generates freshly parsed, unexpanded AST.
+    /// Invariant: we do not create any ExpnId with local_id == 0 and krate != 0.
+    pub const fn root() -> ExpnId {
+        ExpnId { krate: LOCAL_CRATE, local_id: ExpnIndex::ZERO }
+    }
+
+    #[inline]
+    pub fn expn_hash(self) -> ExpnHash {
+        HygieneData::with(|data| data.expn_hash(self))
+    }
+
+    #[inline]
+    pub fn from_hash(hash: ExpnHash) -> Option<ExpnId> {
+        HygieneData::with(|data| data.expn_hash_to_expn_id.get(&hash).copied())
+    }
+
+    #[inline]
+    pub fn as_local(self) -> Option<LocalExpnId> {
+        if self.krate == LOCAL_CRATE { Some(LocalExpnId::from_raw(self.local_id)) } else { None }
+    }
+
+    #[inline]
+    #[track_caller]
+    pub fn expect_local(self) -> LocalExpnId {
+        self.as_local().unwrap()
     }
 
     #[inline]
@@ -114,23 +314,20 @@ impl ExpnId {
     }
 
     #[inline]
-    pub fn set_expn_data(self, mut expn_data: ExpnData) {
-        HygieneData::with(|data| {
-            let old_expn_data = &mut data.expn_data[self.0 as usize];
-            assert!(old_expn_data.is_none(), "expansion data is reset for an expansion ID");
-            assert_eq!(expn_data.orig_id, None);
-            expn_data.orig_id = Some(self.as_u32());
-            *old_expn_data = Some(expn_data);
-        });
-        update_disambiguator(self)
-    }
-
     pub fn is_descendant_of(self, ancestor: ExpnId) -> bool {
+        // a few "fast path" cases to avoid locking HygieneData
+        if ancestor == ExpnId::root() || ancestor == self {
+            return true;
+        }
+        if ancestor.krate != self.krate {
+            return false;
+        }
         HygieneData::with(|data| data.is_descendant_of(self, ancestor))
     }
 
     /// `expn_id.outer_expn_is_descendant_of(ctxt)` is equivalent to but faster than
     /// `expn_id.is_descendant_of(ctxt.outer_expn())`.
+    #[inline]
     pub fn outer_expn_is_descendant_of(self, ctxt: SyntaxContext) -> bool {
         HygieneData::with(|data| data.is_descendant_of(self, data.outer_expn(ctxt)))
     }
@@ -141,11 +338,13 @@ impl ExpnId {
     pub fn expansion_cause(mut self) -> Option<Span> {
         let mut last_macro = None;
         loop {
+            // Fast path to avoid locking.
+            if self == ExpnId::root() {
+                break;
+            }
             let expn_data = self.expn_data();
             // Stop going up the backtrace once include! is encountered
-            if expn_data.is_root()
-                || expn_data.kind == ExpnKind::Macro(MacroKind::Bang, sym::include)
-            {
+            if expn_data.kind == ExpnKind::Macro(MacroKind::Bang, sym::include) {
                 break;
             }
             self = expn_data.call_site.ctxt().outer_expn();
@@ -156,91 +355,120 @@ impl ExpnId {
 }
 
 #[derive(Debug)]
-pub struct HygieneData {
+pub(crate) struct HygieneData {
     /// Each expansion should have an associated expansion data, but sometimes there's a delay
     /// between creation of an expansion ID and obtaining its data (e.g. macros are collected
     /// first and then resolved later), so we use an `Option` here.
-    expn_data: Vec<Option<ExpnData>>,
+    local_expn_data: IndexVec<LocalExpnId, Option<ExpnData>>,
+    local_expn_hashes: IndexVec<LocalExpnId, ExpnHash>,
+    /// Data and hash information from external crates. We may eventually want to remove these
+    /// maps, and fetch the information directly from the other crate's metadata like DefIds do.
+    foreign_expn_data: FxHashMap<ExpnId, ExpnData>,
+    foreign_expn_hashes: FxHashMap<ExpnId, ExpnHash>,
+    expn_hash_to_expn_id: UnhashMap<ExpnHash, ExpnId>,
     syntax_context_data: Vec<SyntaxContextData>,
-    syntax_context_map: FxHashMap<(SyntaxContext, ExpnId, Transparency), SyntaxContext>,
-    /// Maps the `Fingerprint` of an `ExpnData` to the next disambiguator value.
+    syntax_context_map: FxHashMap<SyntaxContextKey, SyntaxContext>,
+    /// Maps the `local_hash` of an `ExpnData` to the next disambiguator value.
     /// This is used by `update_disambiguator` to keep track of which `ExpnData`s
     /// would have collisions without a disambiguator.
     /// The keys of this map are always computed with `ExpnData.disambiguator`
     /// set to 0.
-    expn_data_disambiguators: FxHashMap<Fingerprint, u32>,
+    expn_data_disambiguators: UnhashMap<Hash64, u32>,
 }
 
 impl HygieneData {
-    crate fn new(edition: Edition) -> Self {
-        let mut root_data = ExpnData::default(
+    pub(crate) fn new(edition: Edition) -> Self {
+        let root_data = ExpnData::default(
             ExpnKind::Root,
             DUMMY_SP,
             edition,
-            Some(DefId::local(CRATE_DEF_INDEX)),
+            Some(CRATE_DEF_ID.to_def_id()),
+            None,
         );
-        root_data.orig_id = Some(0);
 
+        let root_ctxt_data = SyntaxContextData::root();
         HygieneData {
-            expn_data: vec![Some(root_data)],
-            syntax_context_data: vec![SyntaxContextData {
-                outer_expn: ExpnId::root(),
-                outer_transparency: Transparency::Opaque,
-                parent: SyntaxContext(0),
-                opaque: SyntaxContext(0),
-                opaque_and_semitransparent: SyntaxContext(0),
-                dollar_crate_name: kw::DollarCrate,
-            }],
-            syntax_context_map: FxHashMap::default(),
-            expn_data_disambiguators: FxHashMap::default(),
+            local_expn_data: IndexVec::from_elem_n(Some(root_data), 1),
+            local_expn_hashes: IndexVec::from_elem_n(ExpnHash(Fingerprint::ZERO), 1),
+            foreign_expn_data: FxHashMap::default(),
+            foreign_expn_hashes: FxHashMap::default(),
+            expn_hash_to_expn_id: iter::once((ExpnHash(Fingerprint::ZERO), ExpnId::root()))
+                .collect(),
+            syntax_context_data: vec![root_ctxt_data],
+            syntax_context_map: iter::once((root_ctxt_data.key(), SyntaxContext(0))).collect(),
+            expn_data_disambiguators: UnhashMap::default(),
         }
     }
 
-    pub fn with<T, F: FnOnce(&mut HygieneData) -> T>(f: F) -> T {
-        SESSION_GLOBALS.with(|session_globals| f(&mut *session_globals.hygiene_data.borrow_mut()))
+    #[inline]
+    fn with<R>(f: impl FnOnce(&mut HygieneData) -> R) -> R {
+        with_session_globals(|session_globals| f(&mut session_globals.hygiene_data.borrow_mut()))
     }
 
-    fn fresh_expn(&mut self, mut expn_data: Option<ExpnData>) -> ExpnId {
-        let raw_id = self.expn_data.len() as u32;
-        if let Some(data) = expn_data.as_mut() {
-            assert_eq!(data.orig_id, None);
-            data.orig_id = Some(raw_id);
+    #[inline]
+    fn expn_hash(&self, expn_id: ExpnId) -> ExpnHash {
+        match expn_id.as_local() {
+            Some(expn_id) => self.local_expn_hashes[expn_id],
+            None => self.foreign_expn_hashes[&expn_id],
         }
-        self.expn_data.push(expn_data);
-        ExpnId(raw_id)
+    }
+
+    #[inline]
+    fn local_expn_data(&self, expn_id: LocalExpnId) -> &ExpnData {
+        self.local_expn_data[expn_id].as_ref().expect("no expansion data for an expansion ID")
     }
 
     fn expn_data(&self, expn_id: ExpnId) -> &ExpnData {
-        self.expn_data[expn_id.0 as usize].as_ref().expect("no expansion data for an expansion ID")
+        if let Some(expn_id) = expn_id.as_local() {
+            self.local_expn_data[expn_id].as_ref().expect("no expansion data for an expansion ID")
+        } else {
+            &self.foreign_expn_data[&expn_id]
+        }
     }
 
     fn is_descendant_of(&self, mut expn_id: ExpnId, ancestor: ExpnId) -> bool {
-        while expn_id != ancestor {
+        // a couple "fast path" cases to avoid traversing parents in the loop below
+        if ancestor == ExpnId::root() {
+            return true;
+        }
+        if expn_id.krate != ancestor.krate {
+            return false;
+        }
+        loop {
+            if expn_id == ancestor {
+                return true;
+            }
             if expn_id == ExpnId::root() {
                 return false;
             }
             expn_id = self.expn_data(expn_id).parent;
         }
-        true
     }
 
+    #[inline]
     fn normalize_to_macros_2_0(&self, ctxt: SyntaxContext) -> SyntaxContext {
         self.syntax_context_data[ctxt.0 as usize].opaque
     }
 
+    #[inline]
     fn normalize_to_macro_rules(&self, ctxt: SyntaxContext) -> SyntaxContext {
-        self.syntax_context_data[ctxt.0 as usize].opaque_and_semitransparent
+        self.syntax_context_data[ctxt.0 as usize].opaque_and_semiopaque
     }
 
+    /// See [`SyntaxContextData::outer_expn`]
+    #[inline]
     fn outer_expn(&self, ctxt: SyntaxContext) -> ExpnId {
         self.syntax_context_data[ctxt.0 as usize].outer_expn
     }
 
+    /// The last macro expansion and its Transparency
+    #[inline]
     fn outer_mark(&self, ctxt: SyntaxContext) -> (ExpnId, Transparency) {
         let data = &self.syntax_context_data[ctxt.0 as usize];
         (data.outer_expn, data.outer_transparency)
     }
 
+    #[inline]
     fn parent_ctxt(&self, ctxt: SyntaxContext) -> SyntaxContext {
         self.syntax_context_data[ctxt.0 as usize].parent
     }
@@ -253,7 +481,7 @@ impl HygieneData {
 
     fn marks(&self, mut ctxt: SyntaxContext) -> Vec<(ExpnId, Transparency)> {
         let mut marks = Vec::new();
-        while ctxt != SyntaxContext::root() {
+        while !ctxt.is_root() {
             debug!("marks: getting parent of {:?}", ctxt);
             marks.push(self.outer_mark(ctxt));
             ctxt = self.parent_ctxt(ctxt);
@@ -263,16 +491,40 @@ impl HygieneData {
     }
 
     fn walk_chain(&self, mut span: Span, to: SyntaxContext) -> Span {
+        let orig_span = span;
         debug!("walk_chain({:?}, {:?})", span, to);
         debug!("walk_chain: span ctxt = {:?}", span.ctxt());
-        while span.from_expansion() && span.ctxt() != to {
+        while span.ctxt() != to && span.from_expansion() {
             let outer_expn = self.outer_expn(span.ctxt());
             debug!("walk_chain({:?}): outer_expn={:?}", span, outer_expn);
             let expn_data = self.expn_data(outer_expn);
             debug!("walk_chain({:?}): expn_data={:?}", span, expn_data);
             span = expn_data.call_site;
         }
+        debug!("walk_chain: for span {:?} >>> return span = {:?}", orig_span, span);
         span
+    }
+
+    fn walk_chain_collapsed(&self, mut span: Span, to: Span) -> Span {
+        let orig_span = span;
+        let mut ret_span = span;
+        debug!("walk_chain_collapsed({:?}, {:?})", span, to);
+        debug!("walk_chain_collapsed: span ctxt = {:?}", span.ctxt());
+        while let ctxt = span.ctxt()
+            && !ctxt.is_root()
+            && ctxt != to.ctxt()
+        {
+            let outer_expn = self.outer_expn(ctxt);
+            debug!("walk_chain_collapsed({:?}): outer_expn={:?}", span, outer_expn);
+            let expn_data = self.expn_data(outer_expn);
+            debug!("walk_chain_collapsed({:?}): expn_data={:?}", span, expn_data);
+            span = expn_data.call_site;
+            if expn_data.collapse_debuginfo {
+                ret_span = span;
+            }
+        }
+        debug!("walk_chain_collapsed: for span {:?} >>> return span = {:?}", orig_span, ret_span);
+        ret_span
     }
 
     fn adjust(&self, ctxt: &mut SyntaxContext, expn_id: ExpnId) -> Option<ExpnId> {
@@ -291,18 +543,18 @@ impl HygieneData {
     ) -> SyntaxContext {
         assert_ne!(expn_id, ExpnId::root());
         if transparency == Transparency::Opaque {
-            return self.apply_mark_internal(ctxt, expn_id, transparency);
+            return self.alloc_ctxt(ctxt, expn_id, transparency);
         }
 
         let call_site_ctxt = self.expn_data(expn_id).call_site.ctxt();
-        let mut call_site_ctxt = if transparency == Transparency::SemiTransparent {
+        let mut call_site_ctxt = if transparency == Transparency::SemiOpaque {
             self.normalize_to_macros_2_0(call_site_ctxt)
         } else {
             self.normalize_to_macro_rules(call_site_ctxt)
         };
 
-        if call_site_ctxt == SyntaxContext::root() {
-            return self.apply_mark_internal(ctxt, expn_id, transparency);
+        if call_site_ctxt.is_root() {
+            return self.alloc_ctxt(ctxt, expn_id, transparency);
         }
 
         // Otherwise, `expn_id` is a macros 1.0 definition and the call site is in a
@@ -315,128 +567,134 @@ impl HygieneData {
         //
         // See the example at `test/ui/hygiene/legacy_interaction.rs`.
         for (expn_id, transparency) in self.marks(ctxt) {
-            call_site_ctxt = self.apply_mark_internal(call_site_ctxt, expn_id, transparency);
+            call_site_ctxt = self.alloc_ctxt(call_site_ctxt, expn_id, transparency);
         }
-        self.apply_mark_internal(call_site_ctxt, expn_id, transparency)
+        self.alloc_ctxt(call_site_ctxt, expn_id, transparency)
     }
 
-    fn apply_mark_internal(
+    /// Allocate a new context with the given key, or retrieve it from cache if the given key
+    /// already exists. The auxiliary fields are calculated from the key.
+    fn alloc_ctxt(
         &mut self,
-        ctxt: SyntaxContext,
+        parent: SyntaxContext,
         expn_id: ExpnId,
         transparency: Transparency,
     ) -> SyntaxContext {
-        let syntax_context_data = &mut self.syntax_context_data;
-        let mut opaque = syntax_context_data[ctxt.0 as usize].opaque;
-        let mut opaque_and_semitransparent =
-            syntax_context_data[ctxt.0 as usize].opaque_and_semitransparent;
-
-        if transparency >= Transparency::Opaque {
-            let parent = opaque;
-            opaque = *self
-                .syntax_context_map
-                .entry((parent, expn_id, transparency))
-                .or_insert_with(|| {
-                    let new_opaque = SyntaxContext(syntax_context_data.len() as u32);
-                    syntax_context_data.push(SyntaxContextData {
-                        outer_expn: expn_id,
-                        outer_transparency: transparency,
-                        parent,
-                        opaque: new_opaque,
-                        opaque_and_semitransparent: new_opaque,
-                        dollar_crate_name: kw::DollarCrate,
-                    });
-                    new_opaque
-                });
+        // Look into the cache first.
+        let key = (parent, expn_id, transparency);
+        if let Some(ctxt) = self.syntax_context_map.get(&key) {
+            return *ctxt;
         }
 
-        if transparency >= Transparency::SemiTransparent {
-            let parent = opaque_and_semitransparent;
-            opaque_and_semitransparent = *self
-                .syntax_context_map
-                .entry((parent, expn_id, transparency))
-                .or_insert_with(|| {
-                    let new_opaque_and_semitransparent =
-                        SyntaxContext(syntax_context_data.len() as u32);
-                    syntax_context_data.push(SyntaxContextData {
-                        outer_expn: expn_id,
-                        outer_transparency: transparency,
-                        parent,
-                        opaque,
-                        opaque_and_semitransparent: new_opaque_and_semitransparent,
-                        dollar_crate_name: kw::DollarCrate,
-                    });
-                    new_opaque_and_semitransparent
-                });
-        }
+        // Reserve a new syntax context.
+        // The inserted dummy data can only be potentially accessed by nested `alloc_ctxt` calls,
+        // the assert below ensures that it doesn't happen.
+        let ctxt = SyntaxContext::from_usize(self.syntax_context_data.len());
+        self.syntax_context_data
+            .push(SyntaxContextData { dollar_crate_name: sym::dummy, ..SyntaxContextData::root() });
+        self.syntax_context_map.insert(key, ctxt);
 
-        let parent = ctxt;
-        *self.syntax_context_map.entry((parent, expn_id, transparency)).or_insert_with(|| {
-            let new_opaque_and_semitransparent_and_transparent =
-                SyntaxContext(syntax_context_data.len() as u32);
-            syntax_context_data.push(SyntaxContextData {
-                outer_expn: expn_id,
-                outer_transparency: transparency,
-                parent,
-                opaque,
-                opaque_and_semitransparent,
-                dollar_crate_name: kw::DollarCrate,
-            });
-            new_opaque_and_semitransparent_and_transparent
-        })
+        // Opaque and semi-opaque versions of the parent. Note that they may be equal to the
+        // parent itself. E.g. `parent_opaque` == `parent` if the expn chain contains only opaques,
+        // and `parent_opaque_and_semiopaque` == `parent` if the expn contains only (semi-)opaques.
+        let parent_data = &self.syntax_context_data[parent.0 as usize];
+        assert_ne!(parent_data.dollar_crate_name, sym::dummy);
+        let parent_opaque = parent_data.opaque;
+        let parent_opaque_and_semiopaque = parent_data.opaque_and_semiopaque;
+
+        // Evaluate opaque and semi-opaque versions of the new syntax context.
+        let (opaque, opaque_and_semiopaque) = match transparency {
+            Transparency::Transparent => (parent_opaque, parent_opaque_and_semiopaque),
+            Transparency::SemiOpaque => (
+                parent_opaque,
+                // Will be the same as `ctxt` if the expn chain contains only (semi-)opaques.
+                self.alloc_ctxt(parent_opaque_and_semiopaque, expn_id, transparency),
+            ),
+            Transparency::Opaque => (
+                // Will be the same as `ctxt` if the expn chain contains only opaques.
+                self.alloc_ctxt(parent_opaque, expn_id, transparency),
+                // Will be the same as `ctxt` if the expn chain contains only (semi-)opaques.
+                self.alloc_ctxt(parent_opaque_and_semiopaque, expn_id, transparency),
+            ),
+        };
+
+        // Fill the full data, now that we have it.
+        self.syntax_context_data[ctxt.as_u32() as usize] = SyntaxContextData {
+            outer_expn: expn_id,
+            outer_transparency: transparency,
+            parent,
+            opaque,
+            opaque_and_semiopaque,
+            dollar_crate_name: kw::DollarCrate,
+        };
+        ctxt
     }
-}
-
-pub fn clear_syntax_context_map() {
-    HygieneData::with(|data| data.syntax_context_map = FxHashMap::default());
 }
 
 pub fn walk_chain(span: Span, to: SyntaxContext) -> Span {
     HygieneData::with(|data| data.walk_chain(span, to))
 }
 
+/// In order to have good line stepping behavior in debugger, for the given span we return its
+/// outermost macro call site that still has a `#[collapse_debuginfo(yes)]` property on it.
+/// We also stop walking call sites at the function body level because no line stepping can occur
+/// at the level above that.
+/// The returned span can then be used in emitted debuginfo.
+pub fn walk_chain_collapsed(span: Span, to: Span) -> Span {
+    HygieneData::with(|data| data.walk_chain_collapsed(span, to))
+}
+
 pub fn update_dollar_crate_names(mut get_name: impl FnMut(SyntaxContext) -> Symbol) {
     // The new contexts that need updating are at the end of the list and have `$crate` as a name.
-    let (len, to_update) = HygieneData::with(|data| {
-        (
-            data.syntax_context_data.len(),
-            data.syntax_context_data
-                .iter()
-                .rev()
-                .take_while(|scdata| scdata.dollar_crate_name == kw::DollarCrate)
-                .count(),
-        )
+    let mut to_update = vec![];
+    HygieneData::with(|data| {
+        for (idx, scdata) in data.syntax_context_data.iter().enumerate().rev() {
+            if scdata.dollar_crate_name == kw::DollarCrate {
+                to_update.push((idx, kw::DollarCrate));
+            } else {
+                break;
+            }
+        }
     });
     // The callback must be called from outside of the `HygieneData` lock,
     // since it will try to acquire it too.
-    let range_to_update = len - to_update..len;
-    let names: Vec<_> =
-        range_to_update.clone().map(|idx| get_name(SyntaxContext::from_u32(idx as u32))).collect();
+    for (idx, name) in &mut to_update {
+        *name = get_name(SyntaxContext::from_usize(*idx));
+    }
     HygieneData::with(|data| {
-        range_to_update.zip(names.into_iter()).for_each(|(idx, name)| {
+        for (idx, name) in to_update {
             data.syntax_context_data[idx].dollar_crate_name = name;
-        })
+        }
     })
 }
 
 pub fn debug_hygiene_data(verbose: bool) -> String {
     HygieneData::with(|data| {
         if verbose {
-            format!("{:#?}", data)
+            format!("{data:#?}")
         } else {
-            let mut s = String::from("");
-            s.push_str("Expansions:");
-            data.expn_data.iter().enumerate().for_each(|(id, expn_info)| {
-                let expn_info = expn_info.as_ref().expect("no expansion data for an expansion ID");
+            let mut s = String::from("Expansions:");
+            let mut debug_expn_data = |(id, expn_data): (&ExpnId, &ExpnData)| {
                 s.push_str(&format!(
-                    "\n{}: parent: {:?}, call_site_ctxt: {:?}, def_site_ctxt: {:?}, kind: {:?}",
+                    "\n{:?}: parent: {:?}, call_site_ctxt: {:?}, def_site_ctxt: {:?}, kind: {:?}",
                     id,
-                    expn_info.parent,
-                    expn_info.call_site.ctxt(),
-                    expn_info.def_site.ctxt(),
-                    expn_info.kind,
-                ));
+                    expn_data.parent,
+                    expn_data.call_site.ctxt(),
+                    expn_data.def_site.ctxt(),
+                    expn_data.kind,
+                ))
+            };
+            data.local_expn_data.iter_enumerated().for_each(|(id, expn_data)| {
+                let expn_data = expn_data.as_ref().expect("no expansion data for an expansion ID");
+                debug_expn_data((&id.to_expn_id(), expn_data))
             });
+
+            // Sort the hash map for more reproducible output.
+            // Because of this, it is fine to rely on the unstable iteration order of the map.
+            #[allow(rustc::potential_query_instability)]
+            let mut foreign_expn_data: Vec<_> = data.foreign_expn_data.iter().collect();
+            foreign_expn_data.sort_by_key(|(id, _)| (id.krate, id.local_id));
+            foreign_expn_data.into_iter().for_each(debug_expn_data);
             s.push_str("\n\nSyntaxContexts:");
             data.syntax_context_data.iter().enumerate().for_each(|(id, ctxt)| {
                 s.push_str(&format!(
@@ -456,17 +714,33 @@ impl SyntaxContext {
     }
 
     #[inline]
-    crate fn as_u32(self) -> u32 {
+    pub const fn is_root(self) -> bool {
+        self.0 == SyntaxContext::root().as_u32()
+    }
+
+    #[inline]
+    pub(crate) const fn as_u32(self) -> u32 {
         self.0
     }
 
     #[inline]
-    crate fn from_u32(raw: u32) -> SyntaxContext {
+    pub(crate) const fn from_u32(raw: u32) -> SyntaxContext {
         SyntaxContext(raw)
     }
 
+    #[inline]
+    pub(crate) const fn from_u16(raw: u16) -> SyntaxContext {
+        SyntaxContext(raw as u32)
+    }
+
+    #[inline]
+    fn from_usize(raw: usize) -> SyntaxContext {
+        SyntaxContext(u32::try_from(raw).unwrap())
+    }
+
     /// Extend a syntax context with a given expansion and transparency.
-    crate fn apply_mark(self, expn_id: ExpnId, transparency: Transparency) -> SyntaxContext {
+    #[inline]
+    pub fn apply_mark(self, expn_id: ExpnId, transparency: Transparency) -> SyntaxContext {
         HygieneData::with(|data| data.apply_mark(self, expn_id, transparency))
     }
 
@@ -474,7 +748,7 @@ impl SyntaxContext {
     /// context up one macro definition level. That is, if we have a nested macro
     /// definition as follows:
     ///
-    /// ```rust
+    /// ```ignore (illustrative)
     /// macro_rules! f {
     ///    macro_rules! g {
     ///        ...
@@ -486,10 +760,12 @@ impl SyntaxContext {
     /// of g (call it g1), calling remove_mark will result in the SyntaxContext for the
     /// invocation of f that created g1.
     /// Returns the mark that was removed.
+    #[inline]
     pub fn remove_mark(&mut self) -> ExpnId {
         HygieneData::with(|data| data.remove_mark(self).0)
     }
 
+    #[inline]
     pub fn marks(self) -> Vec<(ExpnId, Transparency)> {
         HygieneData::with(|data| data.marks(self))
     }
@@ -498,7 +774,10 @@ impl SyntaxContext {
     /// For example, consider the following three resolutions of `f`:
     ///
     /// ```rust
-    /// mod foo { pub fn f() {} } // `f`'s `SyntaxContext` is empty.
+    /// #![feature(decl_macro)]
+    /// mod foo {
+    ///     pub fn f() {} // `f`'s `SyntaxContext` is empty.
+    /// }
     /// m!(f);
     /// macro m($f:ident) {
     ///     mod bar {
@@ -518,12 +797,14 @@ impl SyntaxContext {
     /// ```
     /// This returns the expansion whose definition scope we use to privacy check the resolution,
     /// or `None` if we privacy check as usual (i.e., not w.r.t. a macro definition scope).
+    #[inline]
     pub fn adjust(&mut self, expn_id: ExpnId) -> Option<ExpnId> {
         HygieneData::with(|data| data.adjust(self, expn_id))
     }
 
     /// Like `SyntaxContext::adjust`, but also normalizes `self` to macros 2.0.
-    pub fn normalize_to_macros_2_0_and_adjust(&mut self, expn_id: ExpnId) -> Option<ExpnId> {
+    #[inline]
+    pub(crate) fn normalize_to_macros_2_0_and_adjust(&mut self, expn_id: ExpnId) -> Option<ExpnId> {
         HygieneData::with(|data| {
             *self = data.normalize_to_macros_2_0(*self);
             data.adjust(self, expn_id)
@@ -534,14 +815,15 @@ impl SyntaxContext {
     /// via a glob import with the given `SyntaxContext`.
     /// For example:
     ///
-    /// ```rust
+    /// ```compile_fail,E0425
+    /// #![feature(decl_macro)]
     /// m!(f);
     /// macro m($i:ident) {
     ///     mod foo {
     ///         pub fn f() {} // `f`'s `SyntaxContext` has a single `ExpnId` from `m`.
     ///         pub fn $i() {} // `$i`'s `SyntaxContext` is empty.
     ///     }
-    ///     n(f);
+    ///     n!(f);
     ///     macro n($j:ident) {
     ///         use foo::*;
     ///         f(); // `f`'s `SyntaxContext` has a mark from `m` and a mark from `n`
@@ -555,7 +837,11 @@ impl SyntaxContext {
     /// ```
     /// This returns `None` if the context cannot be glob-adjusted.
     /// Otherwise, it returns the scope to use when privacy checking (see `adjust` for details).
-    pub fn glob_adjust(&mut self, expn_id: ExpnId, glob_span: Span) -> Option<Option<ExpnId>> {
+    pub(crate) fn glob_adjust(
+        &mut self,
+        expn_id: ExpnId,
+        glob_span: Span,
+    ) -> Option<Option<ExpnId>> {
         HygieneData::with(|data| {
             let mut scope = None;
             let mut glob_ctxt = data.normalize_to_macros_2_0(glob_span.ctxt());
@@ -574,12 +860,12 @@ impl SyntaxContext {
 
     /// Undo `glob_adjust` if possible:
     ///
-    /// ```rust
+    /// ```ignore (illustrative)
     /// if let Some(privacy_checking_scope) = self.reverse_glob_adjust(expansion, glob_ctxt) {
     ///     assert!(self.glob_adjust(expansion, glob_ctxt) == Some(privacy_checking_scope));
     /// }
     /// ```
-    pub fn reverse_glob_adjust(
+    pub(crate) fn reverse_glob_adjust(
         &mut self,
         expn_id: ExpnId,
         glob_span: Span,
@@ -621,6 +907,7 @@ impl SyntaxContext {
         HygieneData::with(|data| data.normalize_to_macro_rules(self))
     }
 
+    /// See [`SyntaxContextData::outer_expn`]
     #[inline]
     pub fn outer_expn(self) -> ExpnId {
         HygieneData::with(|data| data.outer_expn(self))
@@ -633,17 +920,44 @@ impl SyntaxContext {
         HygieneData::with(|data| data.expn_data(data.outer_expn(self)).clone())
     }
 
+    /// See [`HygieneData::outer_mark`]
     #[inline]
-    pub fn outer_mark(self) -> (ExpnId, Transparency) {
+    fn outer_mark(self) -> (ExpnId, Transparency) {
         HygieneData::with(|data| data.outer_mark(self))
     }
 
-    pub fn dollar_crate_name(self) -> Symbol {
+    #[inline]
+    pub(crate) fn dollar_crate_name(self) -> Symbol {
         HygieneData::with(|data| data.syntax_context_data[self.0 as usize].dollar_crate_name)
     }
 
+    #[inline]
     pub fn edition(self) -> Edition {
-        self.outer_expn_data().edition
+        HygieneData::with(|data| data.expn_data(data.outer_expn(self)).edition)
+    }
+
+    /// Returns whether this context originates in a foreign crate's external macro.
+    ///
+    /// This is used to test whether a lint should not even begin to figure out whether it should
+    /// be reported on the current node.
+    pub fn in_external_macro(self, sm: &SourceMap) -> bool {
+        let expn_data = self.outer_expn_data();
+        match expn_data.kind {
+            ExpnKind::Root
+            | ExpnKind::Desugaring(
+                DesugaringKind::ForLoop
+                | DesugaringKind::WhileLoop
+                | DesugaringKind::OpaqueTy
+                | DesugaringKind::Async
+                | DesugaringKind::Await,
+            ) => false,
+            ExpnKind::AstPass(_) | ExpnKind::Desugaring(_) => true, // well, it's "external"
+            ExpnKind::Macro(MacroKind::Bang, _) => {
+                // Dummy span for the `def_site` means it's an external macro.
+                expn_data.def_site.is_dummy() || sm.is_imported(expn_data.def_site)
+            }
+            ExpnKind::Macro { .. } => true, // definitely a plugin
+        }
     }
 }
 
@@ -654,38 +968,21 @@ impl fmt::Debug for SyntaxContext {
 }
 
 impl Span {
-    /// Creates a fresh expansion with given properties.
-    /// Expansions are normally created by macros, but in some cases expansions are created for
-    /// other compiler-generated code to set per-span properties like allowed unstable features.
-    /// The returned span belongs to the created expansion and has the new properties,
-    /// but its location is inherited from the current span.
-    pub fn fresh_expansion(self, expn_data: ExpnData) -> Span {
-        self.fresh_expansion_with_transparency(expn_data, Transparency::Transparent)
-    }
-
-    pub fn fresh_expansion_with_transparency(
-        self,
-        expn_data: ExpnData,
-        transparency: Transparency,
-    ) -> Span {
-        let expn_id = ExpnId::fresh(Some(expn_data));
-        HygieneData::with(|data| {
-            self.with_ctxt(data.apply_mark(SyntaxContext::root(), expn_id, transparency))
-        })
-    }
-
     /// Reuses the span but adds information like the kind of the desugaring and features that are
     /// allowed inside this span.
     pub fn mark_with_reason(
         self,
-        allow_internal_unstable: Option<Lrc<[Symbol]>>,
+        allow_internal_unstable: Option<Arc<[Symbol]>>,
         reason: DesugaringKind,
         edition: Edition,
+        ctx: impl HashStableContext,
     ) -> Span {
-        self.fresh_expansion(ExpnData {
+        let expn_data = ExpnData {
             allow_internal_unstable,
-            ..ExpnData::default(ExpnKind::Desugaring(reason), self, edition, None)
-        })
+            ..ExpnData::default(ExpnKind::Desugaring(reason), self, edition, None, None)
+        };
+        let expn_id = LocalExpnId::fresh(expn_data, ctx);
+        self.apply_mark(expn_id.to_expn_id(), Transparency::Transparent)
     }
 }
 
@@ -694,20 +991,32 @@ impl Span {
 #[derive(Clone, Debug, Encodable, Decodable, HashStable_Generic)]
 pub struct ExpnData {
     // --- The part unique to each expansion.
-    /// The kind of this expansion - macro or compiler desugaring.
     pub kind: ExpnKind,
-    /// The expansion that produced this expansion.
+    /// The expansion that contains the definition of the macro for this expansion.
     pub parent: ExpnId,
-    /// The location of the actual macro invocation or syntax sugar , e.g.
-    /// `let x = foo!();` or `if let Some(y) = x {}`
+    /// The span of the macro call which produced this expansion.
     ///
-    /// This may recursively refer to other macro invocations, e.g., if
-    /// `foo!()` invoked `bar!()` internally, and there was an
-    /// expression inside `bar!`; the call_site of the expression in
-    /// the expansion would point to the `bar!` invocation; that
-    /// call_site span would have its own ExpnData, with the call_site
-    /// pointing to the `foo!` invocation.
+    /// This span will typically have a different `ExpnData` and `call_site`.
+    /// This recursively traces back through any macro calls which expanded into further
+    /// macro calls, until the "source call-site" is reached at the root SyntaxContext.
+    /// For example, if `food!()` expands to `fruit!()` which then expands to `grape`,
+    /// then the call-site of `grape` is `fruit!()` and the call-site of `fruit!()`
+    /// is `food!()`.
+    ///
+    /// For a desugaring expansion, this is the span of the expression or node that was
+    /// desugared.
     pub call_site: Span,
+    /// Used to force two `ExpnData`s to have different `Fingerprint`s.
+    /// Due to macro expansion, it's possible to end up with two `ExpnId`s
+    /// that have identical `ExpnData`s. This violates the contract of `HashStable`
+    /// - the two `ExpnId`s are not equal, but their `Fingerprint`s are equal
+    /// (since the numerical `ExpnId` value is not considered by the `HashStable`
+    /// implementation).
+    ///
+    /// The `disambiguator` field is set by `update_disambiguator` when two distinct
+    /// `ExpnId`s would end up with the same `Fingerprint`. Since `ExpnData` includes
+    /// a `krate` field, this value only needs to be unique within a single crate.
+    disambiguator: u32,
 
     // --- The part specific to the macro/desugaring definition.
     // --- It may be reasonable to share this part between expansions with the same definition,
@@ -719,47 +1028,25 @@ pub struct ExpnData {
     /// List of `#[unstable]`/feature-gated features that the macro is allowed to use
     /// internally without forcing the whole crate to opt-in
     /// to them.
-    pub allow_internal_unstable: Option<Lrc<[Symbol]>>,
-    /// Whether the macro is allowed to use `unsafe` internally
-    /// even if the user crate has `#![forbid(unsafe_code)]`.
-    pub allow_internal_unsafe: bool,
-    /// Enables the macro helper hack (`ident!(...)` -> `$crate::ident!(...)`)
-    /// for a given macro.
-    pub local_inner_macros: bool,
+    pub allow_internal_unstable: Option<Arc<[Symbol]>>,
     /// Edition of the crate in which the macro is defined.
     pub edition: Edition,
     /// The `DefId` of the macro being invoked,
     /// if this `ExpnData` corresponds to a macro invocation
     pub macro_def_id: Option<DefId>,
-    /// The crate that originally created this `ExpnData`. During
-    /// metadata serialization, we only encode `ExpnData`s that were
-    /// created locally - when our serialized metadata is decoded,
-    /// foreign `ExpnId`s will have their `ExpnData` looked up
-    /// from the crate specified by `Crate
-    krate: CrateNum,
-    /// The raw that this `ExpnData` had in its original crate.
-    /// An `ExpnData` can be created before being assigned an `ExpnId`,
-    /// so this might be `None` until `set_expn_data` is called
-    // This is used only for serialization/deserialization purposes:
-    // two `ExpnData`s that differ only in their `orig_id` should
-    // be considered equivalent.
-    #[stable_hasher(ignore)]
-    orig_id: Option<u32>,
-
-    /// Used to force two `ExpnData`s to have different `Fingerprint`s.
-    /// Due to macro expansion, it's possible to end up with two `ExpnId`s
-    /// that have identical `ExpnData`s. This violates the constract of `HashStable`
-    /// - the two `ExpnId`s are not equal, but their `Fingerprint`s are equal
-    /// (since the numerical `ExpnId` value is not considered by the `HashStable`
-    /// implementation).
-    ///
-    /// The `disambiguator` field is set by `update_disambiguator` when two distinct
-    /// `ExpnId`s would end up with the same `Fingerprint`. Since `ExpnData` includes
-    /// a `krate` field, this value only needs to be unique within a single crate.
-    disambiguator: u32,
+    /// The normal module (`mod`) in which the expanded macro was defined.
+    pub parent_module: Option<DefId>,
+    /// Suppresses the `unsafe_code` lint for code produced by this macro.
+    pub(crate) allow_internal_unsafe: bool,
+    /// Enables the macro helper hack (`ident!(...)` -> `$crate::ident!(...)`) for this macro.
+    pub local_inner_macros: bool,
+    /// Should debuginfo for the macro be collapsed to the outermost expansion site (in other
+    /// words, was the macro definition annotated with `#[collapse_debuginfo]`)?
+    pub(crate) collapse_debuginfo: bool,
+    /// When true, we do not display the note telling people to use the `-Zmacro-backtrace` flag.
+    pub hide_backtrace: bool,
 }
 
-// These would require special handling of `orig_id`.
 impl !PartialEq for ExpnData {}
 impl !Hash for ExpnData {}
 
@@ -769,11 +1056,14 @@ impl ExpnData {
         parent: ExpnId,
         call_site: Span,
         def_site: Span,
-        allow_internal_unstable: Option<Lrc<[Symbol]>>,
-        allow_internal_unsafe: bool,
-        local_inner_macros: bool,
+        allow_internal_unstable: Option<Arc<[Symbol]>>,
         edition: Edition,
         macro_def_id: Option<DefId>,
+        parent_module: Option<DefId>,
+        allow_internal_unsafe: bool,
+        local_inner_macros: bool,
+        collapse_debuginfo: bool,
+        hide_backtrace: bool,
     ) -> ExpnData {
         ExpnData {
             kind,
@@ -781,13 +1071,14 @@ impl ExpnData {
             call_site,
             def_site,
             allow_internal_unstable,
-            allow_internal_unsafe,
-            local_inner_macros,
             edition,
             macro_def_id,
-            krate: LOCAL_CRATE,
-            orig_id: None,
+            parent_module,
             disambiguator: 0,
+            allow_internal_unsafe,
+            local_inner_macros,
+            collapse_debuginfo,
+            hide_backtrace,
         }
     }
 
@@ -797,6 +1088,7 @@ impl ExpnData {
         call_site: Span,
         edition: Edition,
         macro_def_id: Option<DefId>,
+        parent_module: Option<DefId>,
     ) -> ExpnData {
         ExpnData {
             kind,
@@ -804,13 +1096,14 @@ impl ExpnData {
             call_site,
             def_site: DUMMY_SP,
             allow_internal_unstable: None,
-            allow_internal_unsafe: false,
-            local_inner_macros: false,
             edition,
             macro_def_id,
-            krate: LOCAL_CRATE,
-            orig_id: None,
+            parent_module,
             disambiguator: 0,
+            allow_internal_unsafe: false,
+            local_inner_macros: false,
+            collapse_debuginfo: false,
+            hide_backtrace: false,
         }
     }
 
@@ -818,18 +1111,26 @@ impl ExpnData {
         kind: ExpnKind,
         call_site: Span,
         edition: Edition,
-        allow_internal_unstable: Lrc<[Symbol]>,
+        allow_internal_unstable: Arc<[Symbol]>,
         macro_def_id: Option<DefId>,
+        parent_module: Option<DefId>,
     ) -> ExpnData {
         ExpnData {
             allow_internal_unstable: Some(allow_internal_unstable),
-            ..ExpnData::default(kind, call_site, edition, macro_def_id)
+            ..ExpnData::default(kind, call_site, edition, macro_def_id, parent_module)
         }
     }
 
     #[inline]
     pub fn is_root(&self) -> bool {
         matches!(self.kind, ExpnKind::Root)
+    }
+
+    #[inline]
+    fn hash_expn(&self, ctx: &mut impl HashStableContext) -> Hash64 {
+        let mut hasher = StableHasher::new();
+        self.hash_stable(ctx, &mut hasher);
+        hasher.finish()
     }
 }
 
@@ -842,10 +1143,8 @@ pub enum ExpnKind {
     Macro(MacroKind, Symbol),
     /// Transform done by the compiler on the AST.
     AstPass(AstPass),
-    /// Desugaring done by the compiler during HIR lowering.
+    /// Desugaring done by the compiler during AST lowering.
     Desugaring(DesugaringKind),
-    /// MIR inlining
-    Inlined,
 }
 
 impl ExpnKind {
@@ -853,19 +1152,18 @@ impl ExpnKind {
         match *self {
             ExpnKind::Root => kw::PathRoot.to_string(),
             ExpnKind::Macro(macro_kind, name) => match macro_kind {
-                MacroKind::Bang => format!("{}!", name),
-                MacroKind::Attr => format!("#[{}]", name),
-                MacroKind::Derive => format!("#[derive({})]", name),
+                MacroKind::Bang => format!("{name}!"),
+                MacroKind::Attr => format!("#[{name}]"),
+                MacroKind::Derive => format!("#[derive({name})]"),
             },
             ExpnKind::AstPass(kind) => kind.descr().to_string(),
             ExpnKind::Desugaring(kind) => format!("desugaring of {}", kind.descr()),
-            ExpnKind::Inlined => "inlined source".to_string(),
         }
     }
 }
 
 /// The kind of macro invocation or definition.
-#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encodable, Decodable, Hash, Debug)]
 #[derive(HashStable_Generic)]
 pub enum MacroKind {
     /// A bang macro `foo!()`.
@@ -909,7 +1207,7 @@ pub enum AstPass {
 }
 
 impl AstPass {
-    fn descr(self) -> &'static str {
+    pub fn descr(self) -> &'static str {
         match self {
             AstPass::StdImports => "standard library imports",
             AstPass::TestHarness => "test harness",
@@ -921,40 +1219,77 @@ impl AstPass {
 /// The kind of compiler desugaring.
 #[derive(Clone, Copy, PartialEq, Debug, Encodable, Decodable, HashStable_Generic)]
 pub enum DesugaringKind {
-    /// We desugar `if c { i } else { e }` to `match $ExprKind::Use(c) { true => i, _ => e }`.
-    /// However, we do not want to blame `c` for unreachability but rather say that `i`
-    /// is unreachable. This desugaring kind allows us to avoid blaming `c`.
-    /// This also applies to `while` loops.
-    CondTemporary,
     QuestionMark,
     TryBlock,
+    YeetExpr,
     /// Desugaring of an `impl Trait` in return type position
     /// to an `type Foo = impl Trait;` and replacing the
     /// `impl Trait` with `Foo`.
     OpaqueTy,
     Async,
     Await,
-    ForLoop(ForLoopLoc),
-}
-
-/// A location in the desugaring of a `for` loop
-#[derive(Clone, Copy, PartialEq, Debug, Encodable, Decodable, HashStable_Generic)]
-pub enum ForLoopLoc {
-    Head,
-    IntoIter,
+    ForLoop,
+    WhileLoop,
+    /// `async Fn()` bound modifier
+    BoundModifier,
+    /// Calls to contract checks (`#[requires]` to precond, `#[ensures]` to postcond)
+    Contract,
+    /// A pattern type range start/end
+    PatTyRange,
+    /// A format literal.
+    FormatLiteral {
+        /// Was this format literal written in the source?
+        /// - `format!("boo")` => Yes,
+        /// - `format!(concat!("b", "o", "o"))` => No,
+        /// - `format!(include_str!("boo.txt"))` => No,
+        ///
+        /// If it wasn't written in the source then we have to be careful with suggestions about
+        /// rewriting it.
+        source: bool,
+    },
+    RangeExpr,
 }
 
 impl DesugaringKind {
     /// The description wording should combine well with "desugaring of {}".
-    fn descr(self) -> &'static str {
+    pub fn descr(self) -> &'static str {
         match self {
-            DesugaringKind::CondTemporary => "`if` or `while` condition",
             DesugaringKind::Async => "`async` block or function",
             DesugaringKind::Await => "`await` expression",
             DesugaringKind::QuestionMark => "operator `?`",
             DesugaringKind::TryBlock => "`try` block",
+            DesugaringKind::YeetExpr => "`do yeet` expression",
             DesugaringKind::OpaqueTy => "`impl Trait`",
-            DesugaringKind::ForLoop(_) => "`for` loop",
+            DesugaringKind::ForLoop => "`for` loop",
+            DesugaringKind::WhileLoop => "`while` loop",
+            DesugaringKind::BoundModifier => "trait bound modifier",
+            DesugaringKind::Contract => "contract check",
+            DesugaringKind::PatTyRange => "pattern type",
+            DesugaringKind::FormatLiteral { source: true } => "format string literal",
+            DesugaringKind::FormatLiteral { source: false } => {
+                "expression that expanded into a format string literal"
+            }
+            DesugaringKind::RangeExpr => "range expression",
+        }
+    }
+
+    /// For use with `rustc_unimplemented` to support conditions
+    /// like `from_desugaring = "QuestionMark"`
+    pub fn matches(&self, value: &str) -> bool {
+        match self {
+            DesugaringKind::Async => value == "Async",
+            DesugaringKind::Await => value == "Await",
+            DesugaringKind::QuestionMark => value == "QuestionMark",
+            DesugaringKind::TryBlock => value == "TryBlock",
+            DesugaringKind::YeetExpr => value == "YeetExpr",
+            DesugaringKind::OpaqueTy => value == "OpaqueTy",
+            DesugaringKind::ForLoop => value == "ForLoop",
+            DesugaringKind::WhileLoop => value == "WhileLoop",
+            DesugaringKind::BoundModifier => value == "BoundModifier",
+            DesugaringKind::Contract => value == "Contract",
+            DesugaringKind::PatTyRange => value == "PatTyRange",
+            DesugaringKind::FormatLiteral { .. } => value == "FormatLiteral",
+            DesugaringKind::RangeExpr => value == "RangeExpr",
         }
     }
 }
@@ -966,7 +1301,7 @@ pub struct HygieneEncodeContext {
     /// that we don't accidentally try to encode any more `SyntaxContexts`
     serialized_ctxts: Lock<FxHashSet<SyntaxContext>>,
     /// The `SyntaxContexts` that we have serialized (e.g. as a result of encoding `Spans`)
-    /// in the most recent 'round' of serializnig. Serializing `SyntaxContextData`
+    /// in the most recent 'round' of serializing. Serializing `SyntaxContextData`
     /// may cause us to serialize more `SyntaxContext`s, so serialize in a loop
     /// until we reach a fixed point.
     latest_ctxts: Lock<FxHashSet<SyntaxContext>>,
@@ -977,338 +1312,190 @@ pub struct HygieneEncodeContext {
 }
 
 impl HygieneEncodeContext {
-    pub fn encode<
-        T,
-        R,
-        F: FnMut(&mut T, u32, &SyntaxContextData) -> Result<(), R>,
-        G: FnMut(&mut T, u32, &ExpnData) -> Result<(), R>,
-    >(
+    /// Record the fact that we need to serialize the corresponding `ExpnData`.
+    pub fn schedule_expn_data_for_encoding(&self, expn: ExpnId) {
+        if !self.serialized_expns.lock().contains(&expn) {
+            self.latest_expns.lock().insert(expn);
+        }
+    }
+
+    pub fn encode<T>(
         &self,
         encoder: &mut T,
-        mut encode_ctxt: F,
-        mut encode_expn: G,
-    ) -> Result<(), R> {
+        mut encode_ctxt: impl FnMut(&mut T, u32, &SyntaxContextKey),
+        mut encode_expn: impl FnMut(&mut T, ExpnId, &ExpnData, ExpnHash),
+    ) {
         // When we serialize a `SyntaxContextData`, we may end up serializing
         // a `SyntaxContext` that we haven't seen before
         while !self.latest_ctxts.lock().is_empty() || !self.latest_expns.lock().is_empty() {
             debug!(
-                "encode_hygiene: Serializing a round of {:?} SyntaxContextDatas: {:?}",
+                "encode_hygiene: Serializing a round of {:?} SyntaxContextData: {:?}",
                 self.latest_ctxts.lock().len(),
                 self.latest_ctxts
             );
 
-            // Consume the current round of SyntaxContexts.
-            // Drop the lock() temporary early
-            let latest_ctxts = { std::mem::take(&mut *self.latest_ctxts.lock()) };
-
-            // It's fine to iterate over a HashMap, because the serialization
-            // of the table that we insert data into doesn't depend on insertion
-            // order
-            for_all_ctxts_in(latest_ctxts.into_iter(), |(index, ctxt, data)| {
+            // Consume the current round of syntax contexts.
+            // Drop the lock() temporary early.
+            // It's fine to iterate over a HashMap, because the serialization of the table
+            // that we insert data into doesn't depend on insertion order.
+            #[allow(rustc::potential_query_instability)]
+            let latest_ctxts = { mem::take(&mut *self.latest_ctxts.lock()) }.into_iter();
+            let all_ctxt_data: Vec<_> = HygieneData::with(|data| {
+                latest_ctxts
+                    .map(|ctxt| (ctxt, data.syntax_context_data[ctxt.0 as usize].key()))
+                    .collect()
+            });
+            for (ctxt, ctxt_key) in all_ctxt_data {
                 if self.serialized_ctxts.lock().insert(ctxt) {
-                    encode_ctxt(encoder, index, data)?;
+                    encode_ctxt(encoder, ctxt.0, &ctxt_key);
                 }
-                Ok(())
-            })?;
+            }
 
-            let latest_expns = { std::mem::take(&mut *self.latest_expns.lock()) };
-
-            for_all_expns_in(latest_expns.into_iter(), |index, expn, data| {
+            // Same as above, but for expansions instead of syntax contexts.
+            #[allow(rustc::potential_query_instability)]
+            let latest_expns = { mem::take(&mut *self.latest_expns.lock()) }.into_iter();
+            let all_expn_data: Vec<_> = HygieneData::with(|data| {
+                latest_expns
+                    .map(|expn| (expn, data.expn_data(expn).clone(), data.expn_hash(expn)))
+                    .collect()
+            });
+            for (expn, expn_data, expn_hash) in all_expn_data {
                 if self.serialized_expns.lock().insert(expn) {
-                    encode_expn(encoder, index, data)?;
+                    encode_expn(encoder, expn, &expn_data, expn_hash);
                 }
-                Ok(())
-            })?;
+            }
         }
         debug!("encode_hygiene: Done serializing SyntaxContextData");
-        Ok(())
     }
 }
 
-#[derive(Default)]
 /// Additional information used to assist in decoding hygiene data
+#[derive(Default)]
 pub struct HygieneDecodeContext {
-    // Maps serialized `SyntaxContext` ids to a `SyntaxContext` in the current
-    // global `HygieneData`. When we deserialize a `SyntaxContext`, we need to create
-    // a new id in the global `HygieneData`. This map tracks the ID we end up picking,
-    // so that multiple occurrences of the same serialized id are decoded to the same
-    // `SyntaxContext`
-    remapped_ctxts: Lock<Vec<Option<SyntaxContext>>>,
-    // The same as `remapepd_ctxts`, but for `ExpnId`s
-    remapped_expns: Lock<Vec<Option<ExpnId>>>,
+    // A cache mapping raw serialized per-crate syntax context ids to corresponding decoded
+    // `SyntaxContext`s in the current global `HygieneData`.
+    remapped_ctxts: Lock<IndexVec<u32, Option<SyntaxContext>>>,
 }
 
-pub fn decode_expn_id<
-    'a,
-    D: Decoder,
-    F: FnOnce(&mut D, u32) -> Result<ExpnData, D::Error>,
-    G: FnOnce(CrateNum) -> &'a HygieneDecodeContext,
->(
-    d: &mut D,
-    mode: ExpnDataDecodeMode<'a, G>,
-    decode_data: F,
-) -> Result<ExpnId, D::Error> {
-    let index = u32::decode(d)?;
-    let context = match mode {
-        ExpnDataDecodeMode::IncrComp(context) => context,
-        ExpnDataDecodeMode::Metadata(get_context) => {
-            let krate = CrateNum::decode(d)?;
-            get_context(krate)
-        }
-    };
+/// Register an expansion which has been decoded from the on-disk-cache for the local crate.
+pub fn register_local_expn_id(data: ExpnData, hash: ExpnHash) -> ExpnId {
+    HygieneData::with(|hygiene_data| {
+        let expn_id = hygiene_data.local_expn_data.next_index();
+        hygiene_data.local_expn_data.push(Some(data));
+        let _eid = hygiene_data.local_expn_hashes.push(hash);
+        debug_assert_eq!(expn_id, _eid);
 
-    // Do this after decoding, so that we decode a `CrateNum`
-    // if necessary
-    if index == ExpnId::root().as_u32() {
-        debug!("decode_expn_id: deserialized root");
-        return Ok(ExpnId::root());
+        let expn_id = expn_id.to_expn_id();
+
+        let _old_id = hygiene_data.expn_hash_to_expn_id.insert(hash, expn_id);
+        debug_assert!(_old_id.is_none());
+        expn_id
+    })
+}
+
+/// Register an expansion which has been decoded from the metadata of a foreign crate.
+pub fn register_expn_id(
+    krate: CrateNum,
+    local_id: ExpnIndex,
+    data: ExpnData,
+    hash: ExpnHash,
+) -> ExpnId {
+    debug_assert!(data.parent == ExpnId::root() || krate == data.parent.krate);
+    let expn_id = ExpnId { krate, local_id };
+    HygieneData::with(|hygiene_data| {
+        let _old_data = hygiene_data.foreign_expn_data.insert(expn_id, data);
+        let _old_hash = hygiene_data.foreign_expn_hashes.insert(expn_id, hash);
+        debug_assert!(_old_hash.is_none() || _old_hash == Some(hash));
+        let _old_id = hygiene_data.expn_hash_to_expn_id.insert(hash, expn_id);
+        debug_assert!(_old_id.is_none() || _old_id == Some(expn_id));
+    });
+    expn_id
+}
+
+/// Decode an expansion from the metadata of a foreign crate.
+pub fn decode_expn_id(
+    krate: CrateNum,
+    index: u32,
+    decode_data: impl FnOnce(ExpnId) -> (ExpnData, ExpnHash),
+) -> ExpnId {
+    if index == 0 {
+        trace!("decode_expn_id: deserialized root");
+        return ExpnId::root();
     }
 
-    let outer_expns = &context.remapped_expns;
+    let index = ExpnIndex::from_u32(index);
 
-    // Ensure that the lock() temporary is dropped early
-    {
-        if let Some(expn_id) = outer_expns.lock().get(index as usize).copied().flatten() {
-            return Ok(expn_id);
-        }
+    // This function is used to decode metadata, so it cannot decode information about LOCAL_CRATE.
+    debug_assert_ne!(krate, LOCAL_CRATE);
+    let expn_id = ExpnId { krate, local_id: index };
+
+    // Fast path if the expansion has already been decoded.
+    if HygieneData::with(|hygiene_data| hygiene_data.foreign_expn_data.contains_key(&expn_id)) {
+        return expn_id;
     }
 
     // Don't decode the data inside `HygieneData::with`, since we need to recursively decode
     // other ExpnIds
-    let mut expn_data = decode_data(d, index)?;
+    let (expn_data, hash) = decode_data(expn_id);
 
-    let expn_id = HygieneData::with(|hygiene_data| {
-        let expn_id = ExpnId(hygiene_data.expn_data.len() as u32);
-
-        // If we just deserialized an `ExpnData` owned by
-        // the local crate, its `orig_id` will be stale,
-        // so we need to update it to its own value.
-        // This only happens when we deserialize the incremental cache,
-        // since a crate will never decode its own metadata.
-        if expn_data.krate == LOCAL_CRATE {
-            expn_data.orig_id = Some(expn_id.0);
-        }
-
-        hygiene_data.expn_data.push(Some(expn_data));
-
-        let mut expns = outer_expns.lock();
-        let new_len = index as usize + 1;
-        if expns.len() < new_len {
-            expns.resize(new_len, None);
-        }
-        expns[index as usize] = Some(expn_id);
-        drop(expns);
-        expn_id
-    });
-    Ok(expn_id)
+    register_expn_id(krate, index, expn_data, hash)
 }
 
 // Decodes `SyntaxContext`, using the provided `HygieneDecodeContext`
 // to track which `SyntaxContext`s we have already decoded.
 // The provided closure will be invoked to deserialize a `SyntaxContextData`
 // if we haven't already seen the id of the `SyntaxContext` we are deserializing.
-pub fn decode_syntax_context<
-    D: Decoder,
-    F: FnOnce(&mut D, u32) -> Result<SyntaxContextData, D::Error>,
->(
+pub fn decode_syntax_context<D: Decoder>(
     d: &mut D,
     context: &HygieneDecodeContext,
-    decode_data: F,
-) -> Result<SyntaxContext, D::Error> {
-    let raw_id: u32 = Decodable::decode(d)?;
+    decode_data: impl FnOnce(&mut D, u32) -> SyntaxContextKey,
+) -> SyntaxContext {
+    let raw_id: u32 = Decodable::decode(d);
     if raw_id == 0 {
-        debug!("decode_syntax_context: deserialized root");
+        trace!("decode_syntax_context: deserialized root");
         // The root is special
-        return Ok(SyntaxContext::root());
+        return SyntaxContext::root();
     }
 
-    let outer_ctxts = &context.remapped_ctxts;
-
-    // Ensure that the lock() temporary is dropped early
-    {
-        if let Some(ctxt) = outer_ctxts.lock().get(raw_id as usize).copied().flatten() {
-            return Ok(ctxt);
-        }
+    // Look into the cache first.
+    // Reminder: `HygieneDecodeContext` is per-crate, so there are no collisions between
+    // raw ids from different crate metadatas.
+    if let Some(Some(ctxt)) = context.remapped_ctxts.lock().get(raw_id) {
+        return *ctxt;
     }
-
-    // Allocate and store SyntaxContext id *before* calling the decoder function,
-    // as the SyntaxContextData may reference itself.
-    let new_ctxt = HygieneData::with(|hygiene_data| {
-        let new_ctxt = SyntaxContext(hygiene_data.syntax_context_data.len() as u32);
-        // Push a dummy SyntaxContextData to ensure that nobody else can get the
-        // same ID as us. This will be overwritten after call `decode_Data`
-        hygiene_data.syntax_context_data.push(SyntaxContextData {
-            outer_expn: ExpnId::root(),
-            outer_transparency: Transparency::Transparent,
-            parent: SyntaxContext::root(),
-            opaque: SyntaxContext::root(),
-            opaque_and_semitransparent: SyntaxContext::root(),
-            dollar_crate_name: kw::Empty,
-        });
-        let mut ctxts = outer_ctxts.lock();
-        let new_len = raw_id as usize + 1;
-        if ctxts.len() < new_len {
-            ctxts.resize(new_len, None);
-        }
-        ctxts[raw_id as usize] = Some(new_ctxt);
-        drop(ctxts);
-        new_ctxt
-    });
 
     // Don't try to decode data while holding the lock, since we need to
     // be able to recursively decode a SyntaxContext
-    let mut ctxt_data = decode_data(d, raw_id)?;
-    // Reset `dollar_crate_name` so that it will be updated by `update_dollar_crate_names`
-    // We don't care what the encoding crate set this to - we want to resolve it
-    // from the perspective of the current compilation session
-    ctxt_data.dollar_crate_name = kw::DollarCrate;
+    let (parent, expn_id, transparency) = decode_data(d, raw_id);
+    let ctxt =
+        HygieneData::with(|hygiene_data| hygiene_data.alloc_ctxt(parent, expn_id, transparency));
 
-    // Overwrite the dummy data with our decoded SyntaxContextData
-    HygieneData::with(|hygiene_data| {
-        let dummy = std::mem::replace(
-            &mut hygiene_data.syntax_context_data[new_ctxt.as_u32() as usize],
-            ctxt_data,
-        );
-        // Make sure nothing weird happening while `decode_data` was running
-        assert_eq!(dummy.dollar_crate_name, kw::Empty);
-    });
+    context.remapped_ctxts.lock().insert(raw_id, ctxt);
 
-    Ok(new_ctxt)
+    ctxt
 }
 
-pub fn num_syntax_ctxts() -> usize {
-    HygieneData::with(|data| data.syntax_context_data.len())
-}
-
-pub fn for_all_ctxts_in<E, F: FnMut((u32, SyntaxContext, &SyntaxContextData)) -> Result<(), E>>(
-    ctxts: impl Iterator<Item = SyntaxContext>,
-    mut f: F,
-) -> Result<(), E> {
-    let all_data: Vec<_> = HygieneData::with(|data| {
-        ctxts.map(|ctxt| (ctxt, data.syntax_context_data[ctxt.0 as usize].clone())).collect()
-    });
-    for (ctxt, data) in all_data.into_iter() {
-        f((ctxt.0, ctxt, &data))?;
-    }
-    Ok(())
-}
-
-pub fn for_all_expns_in<E, F: FnMut(u32, ExpnId, &ExpnData) -> Result<(), E>>(
-    expns: impl Iterator<Item = ExpnId>,
-    mut f: F,
-) -> Result<(), E> {
-    let all_data: Vec<_> = HygieneData::with(|data| {
-        expns.map(|expn| (expn, data.expn_data[expn.0 as usize].clone())).collect()
-    });
-    for (expn, data) in all_data.into_iter() {
-        f(expn.0, expn, &data.unwrap_or_else(|| panic!("Missing data for {:?}", expn)))?;
-    }
-    Ok(())
-}
-
-pub fn for_all_data<E, F: FnMut((u32, SyntaxContext, &SyntaxContextData)) -> Result<(), E>>(
-    mut f: F,
-) -> Result<(), E> {
-    let all_data = HygieneData::with(|data| data.syntax_context_data.clone());
-    for (i, data) in all_data.into_iter().enumerate() {
-        f((i as u32, SyntaxContext(i as u32), &data))?;
-    }
-    Ok(())
-}
-
-impl<E: Encoder> Encodable<E> for ExpnId {
-    default fn encode(&self, _: &mut E) -> Result<(), E::Error> {
-        panic!("cannot encode `ExpnId` with `{}`", std::any::type_name::<E>());
+impl<E: SpanEncoder> Encodable<E> for LocalExpnId {
+    fn encode(&self, e: &mut E) {
+        self.to_expn_id().encode(e);
     }
 }
 
-impl<D: Decoder> Decodable<D> for ExpnId {
-    default fn decode(_: &mut D) -> Result<Self, D::Error> {
-        panic!("cannot decode `ExpnId` with `{}`", std::any::type_name::<D>());
+impl<D: SpanDecoder> Decodable<D> for LocalExpnId {
+    fn decode(d: &mut D) -> Self {
+        ExpnId::expect_local(ExpnId::decode(d))
     }
 }
 
-pub fn for_all_expn_data<E, F: FnMut(u32, &ExpnData) -> Result<(), E>>(mut f: F) -> Result<(), E> {
-    let all_data = HygieneData::with(|data| data.expn_data.clone());
-    for (i, data) in all_data.into_iter().enumerate() {
-        f(i as u32, &data.unwrap_or_else(|| panic!("Missing ExpnData!")))?;
-    }
-    Ok(())
-}
-
-pub fn raw_encode_syntax_context<E: Encoder>(
+pub fn raw_encode_syntax_context(
     ctxt: SyntaxContext,
     context: &HygieneEncodeContext,
-    e: &mut E,
-) -> Result<(), E::Error> {
+    e: &mut impl Encoder,
+) {
     if !context.serialized_ctxts.lock().contains(&ctxt) {
         context.latest_ctxts.lock().insert(ctxt);
     }
-    ctxt.0.encode(e)
-}
-
-pub fn raw_encode_expn_id<E: Encoder>(
-    expn: ExpnId,
-    context: &HygieneEncodeContext,
-    mode: ExpnDataEncodeMode,
-    e: &mut E,
-) -> Result<(), E::Error> {
-    // Record the fact that we need to serialize the corresponding
-    // `ExpnData`
-    let needs_data = || {
-        if !context.serialized_expns.lock().contains(&expn) {
-            context.latest_expns.lock().insert(expn);
-        }
-    };
-
-    match mode {
-        ExpnDataEncodeMode::IncrComp => {
-            // Always serialize the `ExpnData` in incr comp mode
-            needs_data();
-            expn.0.encode(e)
-        }
-        ExpnDataEncodeMode::Metadata => {
-            let data = expn.expn_data();
-            // We only need to serialize the ExpnData
-            // if it comes from this crate.
-            // We currently don't serialize any hygiene information data for
-            // proc-macro crates: see the `SpecializedEncoder<Span>` impl
-            // for crate metadata.
-            if data.krate == LOCAL_CRATE {
-                needs_data();
-            }
-            data.orig_id.expect("Missing orig_id").encode(e)?;
-            data.krate.encode(e)
-        }
-    }
-}
-
-pub enum ExpnDataEncodeMode {
-    IncrComp,
-    Metadata,
-}
-
-pub enum ExpnDataDecodeMode<'a, F: FnOnce(CrateNum) -> &'a HygieneDecodeContext> {
-    IncrComp(&'a HygieneDecodeContext),
-    Metadata(F),
-}
-
-impl<'a> ExpnDataDecodeMode<'a, Box<dyn FnOnce(CrateNum) -> &'a HygieneDecodeContext>> {
-    pub fn incr_comp(ctxt: &'a HygieneDecodeContext) -> Self {
-        ExpnDataDecodeMode::IncrComp(ctxt)
-    }
-}
-
-impl<E: Encoder> Encodable<E> for SyntaxContext {
-    default fn encode(&self, _: &mut E) -> Result<(), E::Error> {
-        panic!("cannot encode `SyntaxContext` with `{}`", std::any::type_name::<E>());
-    }
-}
-
-impl<D: Decoder> Decodable<D> for SyntaxContext {
-    default fn decode(_: &mut D) -> Result<Self, D::Error> {
-        panic!("cannot decode `SyntaxContext` with `{}`", std::any::type_name::<D>());
-    }
+    ctxt.0.encode(e);
 }
 
 /// Updates the `disambiguator` field of the corresponding `ExpnData`
@@ -1318,106 +1505,69 @@ impl<D: Decoder> Decodable<D> for SyntaxContext {
 /// This method is called only when an `ExpnData` is first associated
 /// with an `ExpnId` (when the `ExpnId` is initially constructed, or via
 /// `set_expn_data`). It is *not* called for foreign `ExpnId`s deserialized
-/// from another crate's metadata - since `ExpnData` includes a `krate` field,
+/// from another crate's metadata - since `ExpnHash` includes the stable crate id,
 /// collisions are only possible between `ExpnId`s within the same crate.
-fn update_disambiguator(expn_id: ExpnId) {
-    /// A `HashStableContext` which hashes the raw id values for `DefId`
-    /// and `CrateNum`, rather than using their computed stable hash.
-    ///
-    /// This allows us to use the `HashStable` implementation on `ExpnId`
-    /// early on in compilation, before we've constructed a `TyCtxt`.
-    /// The `Fingerprint`s created by this context are not 'stable', since
-    /// the raw `CrateNum` and `DefId` values for an item may change between
-    /// sessions due to unrelated changes (e.g. adding/removing an different item).
-    ///
-    /// However, this is fine for our purposes - we only need to detect
-    /// when two `ExpnData`s have the same `Fingerprint`. Since the hashes produced
-    /// by this context still obey the properties of `HashStable`, we have
-    /// that
-    /// `hash_stable(expn1, DummyHashStableContext) == hash_stable(expn2, DummyHashStableContext)`
-    /// iff `hash_stable(expn1, StableHashingContext) == hash_stable(expn2, StableHasingContext)`.
-    ///
-    /// This is sufficient for determining when we need to update the disambiguator.
-    struct DummyHashStableContext<'a> {
-        caching_source_map: CachingSourceMapView<'a>,
-    }
-
-    impl<'a> crate::HashStableContext for DummyHashStableContext<'a> {
-        fn hash_def_id(&mut self, def_id: DefId, hasher: &mut StableHasher) {
-            def_id.krate.as_u32().hash_stable(self, hasher);
-            def_id.index.as_u32().hash_stable(self, hasher);
-        }
-
-        fn expn_id_cache() -> &'static LocalKey<ExpnIdCache> {
-            // This cache is only used by `DummyHashStableContext`,
-            // so we won't pollute the cache values of the normal `StableHashingContext`
-            thread_local! {
-                static CACHE: ExpnIdCache = Default::default();
-            }
-
-            &CACHE
-        }
-
-        fn hash_crate_num(&mut self, krate: CrateNum, hasher: &mut StableHasher) {
-            krate.as_u32().hash_stable(self, hasher);
-        }
-        fn hash_spans(&self) -> bool {
-            true
-        }
-        fn span_data_to_lines_and_cols(
-            &mut self,
-            span: &crate::SpanData,
-        ) -> Option<(Lrc<SourceFile>, usize, BytePos, usize, BytePos)> {
-            self.caching_source_map.span_data_to_lines_and_cols(span)
-        }
-    }
-
-    let source_map = SESSION_GLOBALS
-        .with(|session_globals| session_globals.source_map.borrow().as_ref().unwrap().clone());
-
-    let mut ctx =
-        DummyHashStableContext { caching_source_map: CachingSourceMapView::new(&source_map) };
-
-    let mut hasher = StableHasher::new();
-
-    let expn_data = expn_id.expn_data();
+fn update_disambiguator(expn_data: &mut ExpnData, mut ctx: impl HashStableContext) -> ExpnHash {
     // This disambiguator should not have been set yet.
-    assert_eq!(
-        expn_data.disambiguator, 0,
-        "Already set disambiguator for ExpnData: {:?}",
-        expn_data
-    );
-    expn_data.hash_stable(&mut ctx, &mut hasher);
-    let first_hash = hasher.finish();
+    assert_eq!(expn_data.disambiguator, 0, "Already set disambiguator for ExpnData: {expn_data:?}");
+    assert_default_hashing_controls(&ctx, "ExpnData (disambiguator)");
+    let mut expn_hash = expn_data.hash_expn(&mut ctx);
 
-    let modified = HygieneData::with(|data| {
+    let disambiguator = HygieneData::with(|data| {
         // If this is the first ExpnData with a given hash, then keep our
         // disambiguator at 0 (the default u32 value)
-        let disambig = data.expn_data_disambiguators.entry(first_hash).or_default();
-        data.expn_data[expn_id.0 as usize].as_mut().unwrap().disambiguator = *disambig;
+        let disambig = data.expn_data_disambiguators.entry(expn_hash).or_default();
+        let disambiguator = *disambig;
         *disambig += 1;
-
-        *disambig != 1
+        disambiguator
     });
 
-    if modified {
-        debug!("Set disambiguator for {:?} (hash {:?})", expn_id, first_hash);
-        debug!("expn_data = {:?}", expn_id.expn_data());
+    if disambiguator != 0 {
+        debug!("Set disambiguator for expn_data={:?} expn_hash={:?}", expn_data, expn_hash);
+
+        expn_data.disambiguator = disambiguator;
+        expn_hash = expn_data.hash_expn(&mut ctx);
 
         // Verify that the new disambiguator makes the hash unique
         #[cfg(debug_assertions)]
-        {
-            hasher = StableHasher::new();
-            expn_id.expn_data().hash_stable(&mut ctx, &mut hasher);
-            let new_hash: Fingerprint = hasher.finish();
+        HygieneData::with(|data| {
+            assert_eq!(
+                data.expn_data_disambiguators.get(&expn_hash),
+                None,
+                "Hash collision after disambiguator update!",
+            );
+        });
+    }
 
-            HygieneData::with(|data| {
-                assert_eq!(
-                    data.expn_data_disambiguators.get(&new_hash),
-                    None,
-                    "Hash collision after disambiguator update!",
-                );
-            });
+    ExpnHash::new(ctx.def_path_hash(LOCAL_CRATE.as_def_id()).stable_crate_id(), expn_hash)
+}
+
+impl<CTX: HashStableContext> HashStable<CTX> for SyntaxContext {
+    fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
+        const TAG_EXPANSION: u8 = 0;
+        const TAG_NO_EXPANSION: u8 = 1;
+
+        if self.is_root() {
+            TAG_NO_EXPANSION.hash_stable(ctx, hasher);
+        } else {
+            TAG_EXPANSION.hash_stable(ctx, hasher);
+            let (expn_id, transparency) = self.outer_mark();
+            expn_id.hash_stable(ctx, hasher);
+            transparency.hash_stable(ctx, hasher);
+        }
+    }
+}
+
+impl<CTX: HashStableContext> HashStable<CTX> for ExpnId {
+    fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
+        assert_default_hashing_controls(ctx, "ExpnId");
+        let hash = if *self == ExpnId::root() {
+            // Avoid fetching TLS storage for a trivial often-used value.
+            Fingerprint::ZERO
+        } else {
+            self.expn_hash().0
         };
+
+        hash.hash_stable(ctx, hasher);
     }
 }

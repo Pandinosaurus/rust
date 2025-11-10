@@ -1,5 +1,3 @@
-// run-rustfix
-
 #![warn(clippy::needless_question_mark)]
 #![allow(
     clippy::needless_return,
@@ -8,7 +6,6 @@
     dead_code,
     unused_must_use
 )]
-#![feature(custom_inner_attributes)]
 
 struct TO {
     magic: Option<usize>,
@@ -21,6 +18,7 @@ struct TR {
 fn simple_option_bad1(to: TO) -> Option<usize> {
     // return as a statement
     return Some(to.magic?);
+    //~^ needless_question_mark
 }
 
 // formatting will add a semi-colon, which would make
@@ -29,16 +27,19 @@ fn simple_option_bad1(to: TO) -> Option<usize> {
 fn simple_option_bad2(to: TO) -> Option<usize> {
     // return as an expression
     return Some(to.magic?)
+    //~^ needless_question_mark
 }
 
 fn simple_option_bad3(to: TO) -> Option<usize> {
     // block value "return"
     Some(to.magic?)
+    //~^ needless_question_mark
 }
 
 fn simple_option_bad4(to: Option<TO>) -> Option<usize> {
     // single line closure
     to.and_then(|t| Some(t.magic?))
+    //~^ needless_question_mark
 }
 
 // formatting this will remove the block brackets, making
@@ -48,11 +49,13 @@ fn simple_option_bad5(to: Option<TO>) -> Option<usize> {
     // closure with body
     to.and_then(|t| {
         Some(t.magic?)
+        //~^ needless_question_mark
     })
 }
 
 fn simple_result_bad1(tr: TR) -> Result<usize, bool> {
     return Ok(tr.magic?);
+    //~^ needless_question_mark
 }
 
 // formatting will add a semi-colon, which would make
@@ -60,14 +63,17 @@ fn simple_result_bad1(tr: TR) -> Result<usize, bool> {
 #[rustfmt::skip]
 fn simple_result_bad2(tr: TR) -> Result<usize, bool> {
     return Ok(tr.magic?)
+    //~^ needless_question_mark
 }
 
 fn simple_result_bad3(tr: TR) -> Result<usize, bool> {
     Ok(tr.magic?)
+    //~^ needless_question_mark
 }
 
 fn simple_result_bad4(tr: Result<TR, bool>) -> Result<usize, bool> {
     tr.and_then(|t| Ok(t.magic?))
+    //~^ needless_question_mark
 }
 
 // formatting this will remove the block brackets, making
@@ -76,6 +82,7 @@ fn simple_result_bad4(tr: Result<TR, bool>) -> Result<usize, bool> {
 fn simple_result_bad5(tr: Result<TR, bool>) -> Result<usize, bool> {
     tr.and_then(|t| {
         Ok(t.magic?)
+        //~^ needless_question_mark
     })
 }
 
@@ -83,6 +90,7 @@ fn also_bad(tr: Result<TR, bool>) -> Result<usize, bool> {
     if tr.is_ok() {
         let t = tr.unwrap();
         return Ok(t.magic?);
+        //~^ needless_question_mark
     }
     Err(false)
 }
@@ -94,79 +102,12 @@ where
     Ok(x?)
 }
 
+// not quite needless
+fn deref_ref(s: Option<&String>) -> Option<&str> {
+    Some(s?)
+}
+
 fn main() {}
-
-mod question_mark_none {
-    #![clippy::msrv = "1.12.0"]
-    fn needless_question_mark_option() -> Option<usize> {
-        struct TO {
-            magic: Option<usize>,
-        }
-        let to = TO { magic: None };
-        Some(to.magic?) // should not be triggered
-    }
-
-    fn needless_question_mark_result() -> Result<usize, bool> {
-        struct TO {
-            magic: Result<usize, bool>,
-        }
-        let to = TO { magic: Ok(1_usize) };
-        Ok(to.magic?) // should not be triggered
-    }
-
-    fn main() {
-        needless_question_mark_option();
-        needless_question_mark_result();
-    }
-}
-
-mod question_mark_result {
-    #![clippy::msrv = "1.21.0"]
-    fn needless_question_mark_option() -> Option<usize> {
-        struct TO {
-            magic: Option<usize>,
-        }
-        let to = TO { magic: None };
-        Some(to.magic?) // should not be triggered
-    }
-
-    fn needless_question_mark_result() -> Result<usize, bool> {
-        struct TO {
-            magic: Result<usize, bool>,
-        }
-        let to = TO { magic: Ok(1_usize) };
-        Ok(to.magic?) // should be triggered
-    }
-
-    fn main() {
-        needless_question_mark_option();
-        needless_question_mark_result();
-    }
-}
-
-mod question_mark_both {
-    #![clippy::msrv = "1.22.0"]
-    fn needless_question_mark_option() -> Option<usize> {
-        struct TO {
-            magic: Option<usize>,
-        }
-        let to = TO { magic: None };
-        Some(to.magic?) // should be triggered
-    }
-
-    fn needless_question_mark_result() -> Result<usize, bool> {
-        struct TO {
-            magic: Result<usize, bool>,
-        }
-        let to = TO { magic: Ok(1_usize) };
-        Ok(to.magic?) // should be triggered
-    }
-
-    fn main() {
-        needless_question_mark_option();
-        needless_question_mark_result();
-    }
-}
 
 // #6921 if a macro wraps an expr in Some(  ) and the ? is in the macro use,
 // the suggestion fails to apply; do not lint
@@ -185,10 +126,31 @@ pub fn test1() {
 macro_rules! some_and_qmark_in_macro {
     ($expr:expr) => {
         || -> Option<_> { Some(Some($expr)?) }()
+        //~^ needless_question_mark
     };
 }
 
 pub fn test2() {
     let x = Some(3);
     let _x = some_and_qmark_in_macro!(x?);
+}
+
+async fn async_option_bad(to: TO) -> Option<usize> {
+    let _ = Some(3);
+    Some(to.magic?)
+    //~^ needless_question_mark
+}
+
+async fn async_deref_ref(s: Option<&String>) -> Option<&str> {
+    Some(s?)
+}
+
+async fn async_result_bad(s: TR) -> Result<usize, bool> {
+    Ok(s.magic?)
+    //~^ needless_question_mark
+}
+
+async fn async_wrapped<T>(a: Option<T>) -> Option<T> {
+    { Some(a?) }
+    //~^ needless_question_mark
 }

@@ -3,10 +3,19 @@
 
 fn main() {
     eprint!("Hello\n");
+    //~^ print_with_newline
+
     eprint!("Hello {}\n", "world");
+    //~^ print_with_newline
+
     eprint!("Hello {} {}\n", "world", "#2");
+    //~^ print_with_newline
+
     eprint!("{}\n", 1265);
+    //~^ print_with_newline
+
     eprint!("\n");
+    //~^ print_with_newline
 
     // these are all fine
     eprint!("");
@@ -20,23 +29,31 @@ fn main() {
     eprint!("\n\n");
     eprint!("like eof\n\n");
     eprint!("Hello {} {}\n\n", "world", "#2");
-    eprintln!("\ndon't\nwarn\nfor\nmultiple\nnewlines\n"); // #3126
-    eprintln!("\nbla\n\n"); // #3126
+    // #3126
+    eprintln!("\ndon't\nwarn\nfor\nmultiple\nnewlines\n");
+    // #3126
+    eprintln!("\nbla\n\n");
 
     // Escaping
-    eprint!("\\n"); // #3514
-    eprint!("\\\n"); // should fail
+    // #3514
+    eprint!("\\n");
+    eprint!("\\\n");
+    //~^ print_with_newline
+
     eprint!("\\\\n");
 
     // Raw strings
-    eprint!(r"\n"); // #3778
+    // #3778
+    eprint!(r"\n");
 
     // Literal newlines should also fail
     eprint!(
+        //~^ print_with_newline
         "
 "
     );
     eprint!(
+        //~^ print_with_newline
         r"
 "
     );
@@ -44,6 +61,16 @@ fn main() {
     // Don't warn on CRLF (#4208)
     eprint!("\r\n");
     eprint!("foo\r\n");
-    eprint!("\\r\n"); //~ ERROR
-    eprint!("foo\rbar\n") // ~ ERROR
+    eprint!("\\r\n");
+    //~^ print_with_newline
+
+    eprint!("foo\rbar\n");
+
+    // Ignore expanded format strings
+    macro_rules! newline {
+        () => {
+            "\n"
+        };
+    }
+    eprint!(newline!());
 }

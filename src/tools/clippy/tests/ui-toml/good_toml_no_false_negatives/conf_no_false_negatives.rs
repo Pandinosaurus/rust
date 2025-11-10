@@ -1,3 +1,2 @@
-// error-pattern: should give absolutely no error
-
+//@check-pass
 fn main() {}

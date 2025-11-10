@@ -1,5 +1,8 @@
-use crate::iter::adapters::{zip::try_get_unchecked, TrustedRandomAccess};
-use crate::iter::{FusedIterator, TrustedLen};
+use core::num::NonZero;
+
+use crate::iter::adapters::zip::try_get_unchecked;
+use crate::iter::adapters::{SourceIter, TrustedRandomAccess, TrustedRandomAccessNoCoerce};
+use crate::iter::{FusedIterator, InPlaceIterable, TrustedLen, UncheckedIterator};
 use crate::ops::Try;
 
 /// An iterator that clones the elements of an underlying iterator.
@@ -46,7 +49,7 @@ where
     where
         Self: Sized,
         F: FnMut(B, Self::Item) -> R,
-        R: Try<Ok = B>,
+        R: Try<Output = B>,
     {
         self.it.try_fold(init, clone_try_fold(f))
     }
@@ -60,7 +63,7 @@ where
 
     unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> T
     where
-        Self: TrustedRandomAccess,
+        Self: TrustedRandomAccessNoCoerce,
     {
         // SAFETY: the caller must uphold the contract for
         // `Iterator::__iterator_get_unchecked`.
@@ -82,7 +85,7 @@ where
     where
         Self: Sized,
         F: FnMut(B, Self::Item) -> R,
-        R: Try<Ok = B>,
+        R: Try<Output = B>,
     {
         self.it.try_rfold(init, clone_try_fold(f))
     }
@@ -120,9 +123,13 @@ where
 
 #[doc(hidden)]
 #[unstable(feature = "trusted_random_access", issue = "none")]
-unsafe impl<I> TrustedRandomAccess for Cloned<I>
+unsafe impl<I> TrustedRandomAccess for Cloned<I> where I: TrustedRandomAccess {}
+
+#[doc(hidden)]
+#[unstable(feature = "trusted_random_access", issue = "none")]
+unsafe impl<I> TrustedRandomAccessNoCoerce for Cloned<I>
 where
-    I: TrustedRandomAccess,
+    I: TrustedRandomAccessNoCoerce,
 {
     const MAY_HAVE_SIDE_EFFECT: bool = true;
 }
@@ -133,4 +140,51 @@ where
     I: TrustedLen<Item = &'a T>,
     T: Clone,
 {
+}
+
+impl<'a, I, T: 'a> UncheckedIterator for Cloned<I>
+where
+    I: UncheckedIterator<Item = &'a T>,
+    T: Clone,
+{
+    unsafe fn next_unchecked(&mut self) -> T {
+        // SAFETY: `Cloned` is 1:1 with the inner iterator, so if the caller promised
+        // that there's an element left, the inner iterator has one too.
+        let item = unsafe { self.it.next_unchecked() };
+        item.clone()
+    }
+}
+
+#[stable(feature = "default_iters", since = "1.70.0")]
+impl<I: Default> Default for Cloned<I> {
+    /// Creates a `Cloned` iterator from the default value of `I`
+    /// ```
+    /// # use core::slice;
+    /// # use core::iter::Cloned;
+    /// let iter: Cloned<slice::Iter<'_, u8>> = Default::default();
+    /// assert_eq!(iter.len(), 0);
+    /// ```
+    fn default() -> Self {
+        Self::new(Default::default())
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<I> SourceIter for Cloned<I>
+where
+    I: SourceIter,
+{
+    type Source = I::Source;
+
+    #[inline]
+    unsafe fn as_inner(&mut self) -> &mut I::Source {
+        // SAFETY: unsafe function forwarding to unsafe function with the same requirements
+        unsafe { SourceIter::as_inner(&mut self.it) }
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<I: InPlaceIterable> InPlaceIterable for Cloned<I> {
+    const EXPAND_BY: Option<NonZero<usize>> = I::EXPAND_BY;
+    const MERGE_BY: Option<NonZero<usize>> = I::MERGE_BY;
 }

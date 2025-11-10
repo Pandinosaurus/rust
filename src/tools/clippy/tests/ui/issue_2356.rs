@@ -1,4 +1,5 @@
 #![deny(clippy::while_let_on_iterator)]
+#![allow(unused_mut)]
 
 use std::iter::Iterator;
 
@@ -13,7 +14,8 @@ impl Foo {
 
     fn foo2<I: Iterator<Item = usize>>(mut it: I) {
         while let Some(e) = it.next() {
-            println!("{:?}", e);
+            //~^ while_let_on_iterator
+            println!("{e:?}");
         }
     }
 }

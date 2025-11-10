@@ -1,11 +1,14 @@
-// run-rustfix
-// aux-build:macro_rules.rs
-
+//@aux-build:proc_macros.rs
+#![feature(try_blocks)]
 #![deny(clippy::try_err)]
-#![allow(clippy::unnecessary_wraps, clippy::needless_question_mark)]
+#![allow(
+    clippy::unnecessary_wraps,
+    clippy::needless_question_mark,
+    clippy::needless_return_with_question_mark
+)]
 
-#[macro_use]
-extern crate macro_rules;
+extern crate proc_macros;
+use proc_macros::{external, inline_macros};
 
 use std::io;
 use std::task::Poll;
@@ -17,6 +20,7 @@ pub fn basic_test() -> Result<i32, i32> {
     // To avoid warnings during rustfix
     if true {
         Err(err)?;
+        //~^ try_err
     }
     Ok(0)
 }
@@ -27,6 +31,7 @@ pub fn into_test() -> Result<i32, i32> {
     // To avoid warnings during rustfix
     if true {
         Err(err)?;
+        //~^ try_err
     }
     Ok(0)
 }
@@ -47,6 +52,7 @@ pub fn closure_matches_test() -> Result<i32, i32> {
             // To avoid warnings during rustfix
             if true {
                 Err(err)?;
+                //~^ try_err
             }
             Ok(i)
         })
@@ -66,6 +72,7 @@ pub fn closure_into_test() -> Result<i32, i32> {
             // To avoid warnings during rustfix
             if true {
                 Err(err)?;
+                //~^ try_err
             }
             Ok(i)
         })
@@ -79,36 +86,24 @@ fn nested_error() -> Result<i32, i32> {
     Ok(1)
 }
 
-// Bad suggestion when in macro (see #6242)
-macro_rules! try_validation {
-    ($e: expr) => {{
-        match $e {
-            Ok(_) => 0,
-            Err(_) => Err(1)?,
-        }
-    }};
-}
-
-macro_rules! ret_one {
-    () => {
-        1
-    };
-}
-
-macro_rules! try_validation_in_macro {
-    ($e: expr) => {{
-        match $e {
-            Ok(_) => 0,
-            Err(_) => Err(ret_one!())?,
-        }
-    }};
-}
-
+#[inline_macros]
 fn calling_macro() -> Result<i32, i32> {
     // macro
-    try_validation!(Ok::<_, i32>(5));
+    inline!(
+        match $(Ok::<_, i32>(5)) {
+            Ok(_) => 0,
+            Err(_) => Err(1)?,
+            //~^ try_err
+        }
+    );
     // `Err` arg is another macro
-    try_validation_in_macro!(Ok::<_, i32>(5));
+    inline!(
+        match $(Ok::<_, i32>(5)) {
+            Ok(_) => 0,
+            Err(_) => Err(inline!(1))?,
+            //~^ try_err
+        }
+    );
     Ok(5)
 }
 
@@ -121,24 +116,20 @@ fn main() {
     calling_macro().unwrap();
 
     // We don't want to lint in external macros
-    try_err!();
+    external! {
+        pub fn try_err_fn() -> Result<i32, i32> {
+            let err: i32 = 1;
+            // To avoid warnings during rustfix
+            if true { Err(err)? } else { Ok(2) }
+        }
+    }
 }
 
-macro_rules! bar {
-    () => {
-        String::from("aasdfasdfasdfa")
-    };
-}
-
-macro_rules! foo {
-    () => {
-        bar!()
-    };
-}
-
+#[inline_macros]
 pub fn macro_inside(fail: bool) -> Result<i32, String> {
     if fail {
-        Err(foo!())?;
+        Err(inline!(inline!(String::from("aasdfasdfasdfa"))))?;
+        //~^ try_err
     }
     Ok(0)
 }
@@ -146,8 +137,10 @@ pub fn macro_inside(fail: bool) -> Result<i32, String> {
 pub fn poll_write(n: usize) -> Poll<io::Result<usize>> {
     if n == 0 {
         Err(io::ErrorKind::WriteZero)?
+        //~^ try_err
     } else if n == 1 {
         Err(io::Error::new(io::ErrorKind::InvalidInput, "error"))?
+        //~^ try_err
     };
 
     Poll::Ready(Ok(n))
@@ -156,7 +149,25 @@ pub fn poll_write(n: usize) -> Poll<io::Result<usize>> {
 pub fn poll_next(ready: bool) -> Poll<Option<io::Result<()>>> {
     if !ready {
         Err(io::ErrorKind::NotFound)?
+        //~^ try_err
     }
 
     Poll::Ready(None)
+}
+
+// Tests that `return` is not duplicated
+pub fn try_return(x: bool) -> Result<i32, i32> {
+    if x {
+        return Err(42)?;
+        //~^ try_err
+    }
+    Ok(0)
+}
+
+// Test that the lint is suppressed in try block.
+pub fn try_block() -> Result<(), i32> {
+    let _: Result<_, i32> = try {
+        Err(1)?;
+    };
+    Ok(())
 }

@@ -1,3 +1,4 @@
+//@no-rustfix: overlapping suggestions
 #![allow(unused_must_use)]
 #![warn(clippy::write_literal)]
 
@@ -6,22 +7,59 @@ use std::io::Write;
 fn main() {
     let mut v = Vec::new();
 
-    writeln!(&mut v, "{}", "{hello}");
-    writeln!(&mut v, r"{}", r"{hello}");
-    writeln!(&mut v, "{}", '\'');
-    writeln!(&mut v, "{}", '"');
-    writeln!(&mut v, r"{}", '"'); // don't lint
-    writeln!(&mut v, r"{}", '\'');
+    writeln!(v, "{}", "{hello}");
+    //~^ write_literal
+
+    writeln!(v, r"{}", r"{hello}");
+    //~^ write_literal
+
+    writeln!(v, "{}", '\'');
+    //~^ write_literal
+
+    writeln!(v, "{}", '"');
+    //~^ write_literal
+
+    writeln!(v, r"{}", '"');
+    //~^ write_literal
+
+    writeln!(v, r"{}", '\'');
+    //~^ write_literal
+
     writeln!(
-        &mut v,
+        v,
         "some {}",
         "hello \
-        world!"
+        //~^ write_literal
+        world!",
     );
     writeln!(
-        &mut v,
+        v,
         "some {}\
         {} \\ {}",
-        "1", "2", "3",
+        "1",
+        "2",
+        "3",
+        //~^^^ write_literal
     );
+    writeln!(v, "{}", "\\");
+    //~^ write_literal
+
+    writeln!(v, r"{}", "\\");
+    //~^ write_literal
+
+    writeln!(v, r#"{}"#, "\\");
+    //~^ write_literal
+
+    writeln!(v, "{}", r"\");
+    //~^ write_literal
+
+    writeln!(v, "{}", "\r");
+    //~^ write_literal
+
+    // hard mode
+    writeln!(v, r#"{}{}"#, '#', '"');
+    //~^ write_literal
+
+    // should not lint
+    writeln!(v, r"{}", "\r");
 }

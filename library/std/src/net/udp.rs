@@ -1,10 +1,19 @@
-#[cfg(all(test, not(any(target_os = "emscripten", target_env = "sgx"))))]
+#[cfg(all(
+    test,
+    not(any(
+        target_os = "emscripten",
+        all(target_os = "wasi", target_env = "p1"),
+        target_env = "sgx",
+        target_os = "xous",
+        target_os = "trusty",
+    ))
+))]
 mod tests;
 
 use crate::fmt;
-use crate::io::{self, Error, ErrorKind};
+use crate::io::{self, ErrorKind};
 use crate::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use crate::sys_common::net as net_imp;
+use crate::sys::net as net_imp;
 use crate::sys_common::{AsInner, FromInner, IntoInner};
 use crate::time::Duration;
 
@@ -39,7 +48,7 @@ use crate::time::Duration;
 ///
 /// fn main() -> std::io::Result<()> {
 ///     {
-///         let mut socket = UdpSocket::bind("127.0.0.1:34254")?;
+///         let socket = UdpSocket::bind("127.0.0.1:34254")?;
 ///
 ///         // Receives a single datagram message on the socket. If `buf` is too small to hold
 ///         // the message, it will be cut off.
@@ -90,9 +99,28 @@ impl UdpSocket {
     /// ];
     /// let socket = UdpSocket::bind(&addrs[..]).expect("couldn't bind to address");
     /// ```
+    ///
+    /// Creates a UDP socket bound to a port assigned by the operating system
+    /// at `127.0.0.1`.
+    ///
+    /// ```no_run
+    /// use std::net::UdpSocket;
+    ///
+    /// let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    /// ```
+    ///
+    /// Note that `bind` declares the scope of your network connection.
+    /// You can only receive datagrams from and send datagrams to
+    /// participants in that view of the network.
+    /// For instance, binding to a loopback address as in the example
+    /// above will prevent you from sending datagrams to another device
+    /// in your local network.
+    ///
+    /// In order to limit your view of the network the least, `bind` to
+    /// [`Ipv4Addr::UNSPECIFIED`] or [`Ipv6Addr::UNSPECIFIED`].
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
-        super::each_addr(addr, net_imp::UdpSocket::bind).map(UdpSocket)
+        net_imp::UdpSocket::bind(addr).map(UdpSocket)
     }
 
     /// Receives a single datagram message on the socket. On success, returns the number
@@ -148,7 +176,9 @@ impl UdpSocket {
     }
 
     /// Sends data on the socket to the given address. On success, returns the
-    /// number of bytes written.
+    /// number of bytes written. Note that the operating system may refuse
+    /// buffers larger than 65507. However, partial writes are not possible
+    /// until buffer sizes above `i32::MAX`.
     ///
     /// Address type can be any implementor of [`ToSocketAddrs`] trait. See its
     /// documentation for concrete examples.
@@ -159,7 +189,7 @@ impl UdpSocket {
     /// This will return an error when the IP version of the local socket
     /// does not match that returned from [`ToSocketAddrs`].
     ///
-    /// See issue #34202 for more details.
+    /// See [Issue #34202] for more details.
     ///
     /// # Examples
     ///
@@ -169,11 +199,13 @@ impl UdpSocket {
     /// let socket = UdpSocket::bind("127.0.0.1:34254").expect("couldn't bind to address");
     /// socket.send_to(&[0; 10], "127.0.0.1:4242").expect("couldn't send data");
     /// ```
+    ///
+    /// [Issue #34202]: https://github.com/rust-lang/rust/issues/34202
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize> {
         match addr.to_socket_addrs()?.next() {
             Some(addr) => self.0.send_to(buf, &addr),
-            None => Err(Error::new_const(ErrorKind::InvalidInput, &"no addresses to send data to")),
+            None => Err(io::const_error!(ErrorKind::InvalidInput, "no addresses to send data to")),
         }
     }
 
@@ -406,7 +438,7 @@ impl UdpSocket {
     /// Sets the value of the `IP_MULTICAST_LOOP` option for this socket.
     ///
     /// If enabled, multicast packets will be looped back to the local socket.
-    /// Note that this may not have any effect on IPv6 sockets.
+    /// Note that this might not have any effect on IPv6 sockets.
     ///
     /// # Examples
     ///
@@ -445,7 +477,7 @@ impl UdpSocket {
     /// this socket. The default value is 1 which means that multicast packets
     /// don't leave the local network unless explicitly requested.
     ///
-    /// Note that this may not have any effect on IPv6 sockets.
+    /// Note that this might not have any effect on IPv6 sockets.
     ///
     /// # Examples
     ///
@@ -481,7 +513,7 @@ impl UdpSocket {
     /// Sets the value of the `IPV6_MULTICAST_LOOP` option for this socket.
     ///
     /// Controls whether this socket sees the multicast packets it sends itself.
-    /// Note that this may not have any affect on IPv4 sockets.
+    /// Note that this might not have any affect on IPv4 sockets.
     ///
     /// # Examples
     ///
@@ -555,8 +587,8 @@ impl UdpSocket {
     /// This function specifies a new multicast group for this socket to join.
     /// The address must be a valid multicast address, and `interface` is the
     /// address of the local interface with which the system should join the
-    /// multicast group. If it's equal to `INADDR_ANY` then an appropriate
-    /// interface is chosen by the system.
+    /// multicast group. If it's equal to [`UNSPECIFIED`](Ipv4Addr::UNSPECIFIED)
+    /// then an appropriate interface is chosen by the system.
     #[stable(feature = "net2_mutators", since = "1.9.0")]
     pub fn join_multicast_v4(&self, multiaddr: &Ipv4Addr, interface: &Ipv4Addr) -> io::Result<()> {
         self.0.join_multicast_v4(multiaddr, interface)
@@ -601,9 +633,9 @@ impl UdpSocket {
     ///
     /// let socket = UdpSocket::bind("127.0.0.1:34254").expect("couldn't bind to address");
     /// match socket.take_error() {
-    ///     Ok(Some(error)) => println!("UdpSocket error: {:?}", error),
+    ///     Ok(Some(error)) => println!("UdpSocket error: {error:?}"),
     ///     Ok(None) => println!("No error"),
-    ///     Err(error) => println!("UdpSocket.take_error failed: {:?}", error),
+    ///     Err(error) => println!("UdpSocket.take_error failed: {error:?}"),
     /// }
     /// ```
     #[stable(feature = "net2_mutators", since = "1.9.0")]
@@ -639,12 +671,19 @@ impl UdpSocket {
     /// function of a UDP socket is not a useful thing to do: The OS will be
     /// unable to determine whether something is listening on the remote
     /// address without the application sending data.
+    ///
+    /// If your first `connect` is to a loopback address, subsequent
+    /// `connect`s to non-loopback addresses might fail, depending
+    /// on the platform.
     #[stable(feature = "net2_mutators", since = "1.9.0")]
     pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
-        super::each_addr(addr, |addr| self.0.connect(addr))
+        self.0.connect(addr)
     }
 
     /// Sends data on the socket to the remote address to which it is connected.
+    /// On success, returns the number of bytes written. Note that the operating
+    /// system may refuse buffers larger than 65507. However, partial writes are
+    /// not possible until buffer sizes above `i32::MAX`.
     ///
     /// [`UdpSocket::connect`] will connect this socket to a remote address. This
     /// method will fail if the socket is not connected.
@@ -682,8 +721,8 @@ impl UdpSocket {
     /// socket.connect("127.0.0.1:8080").expect("connect function failed");
     /// let mut buf = [0; 10];
     /// match socket.recv(&mut buf) {
-    ///     Ok(received) => println!("received {} bytes {:?}", received, &buf[..received]),
-    ///     Err(e) => println!("recv function failed: {:?}", e),
+    ///     Ok(received) => println!("received {received} bytes {:?}", &buf[..received]),
+    ///     Err(e) => println!("recv function failed: {e:?}"),
     /// }
     /// ```
     #[stable(feature = "net2_mutators", since = "1.9.0")]
@@ -722,8 +761,8 @@ impl UdpSocket {
     /// socket.connect("127.0.0.1:8080").expect("connect function failed");
     /// let mut buf = [0; 10];
     /// match socket.peek(&mut buf) {
-    ///     Ok(received) => println!("received {} bytes", received),
-    ///     Err(e) => println!("peek function failed: {:?}", e),
+    ///     Ok(received) => println!("received {received} bytes"),
+    ///     Err(e) => println!("peek function failed: {e:?}"),
     /// }
     /// ```
     #[stable(feature = "peek", since = "1.18.0")]
@@ -733,7 +772,7 @@ impl UdpSocket {
 
     /// Moves this UDP socket into or out of nonblocking mode.
     ///
-    /// This will result in `recv`, `recv_from`, `send`, and `send_to`
+    /// This will result in `recv`, `recv_from`, `send`, and `send_to` system
     /// operations becoming nonblocking, i.e., immediately returning from their
     /// calls. If the IO operation is successful, `Ok` is returned and no
     /// further action is required. If the IO operation could not be completed
@@ -766,7 +805,7 @@ impl UdpSocket {
     ///             // via platform-specific APIs such as epoll or IOCP
     ///             wait_for_fd();
     ///         }
-    ///         Err(e) => panic!("encountered IO error: {}", e),
+    ///         Err(e) => panic!("encountered IO error: {e}"),
     ///     }
     /// };
     /// println!("bytes: {:?}", &buf[..num_bytes_read]);
@@ -777,7 +816,14 @@ impl UdpSocket {
     }
 }
 
+// In addition to the `impl`s here, `UdpSocket` also has `impl`s for
+// `AsFd`/`From<OwnedFd>`/`Into<OwnedFd>` and
+// `AsRawFd`/`IntoRawFd`/`FromRawFd`, on Unix and WASI, and
+// `AsSocket`/`From<OwnedSocket>`/`Into<OwnedSocket>` and
+// `AsRawSocket`/`IntoRawSocket`/`FromRawSocket` on Windows.
+
 impl AsInner<net_imp::UdpSocket> for UdpSocket {
+    #[inline]
     fn as_inner(&self) -> &net_imp::UdpSocket {
         &self.0
     }

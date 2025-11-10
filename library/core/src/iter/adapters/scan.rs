@@ -1,5 +1,7 @@
 use crate::fmt;
-use crate::iter::{adapters::SourceIter, InPlaceIterable};
+use crate::iter::InPlaceIterable;
+use crate::iter::adapters::SourceIter;
+use crate::num::NonZero;
 use crate::ops::{ControlFlow, Try};
 
 /// An iterator to maintain state while iterating another iterator.
@@ -56,9 +58,9 @@ where
     where
         Self: Sized,
         Fold: FnMut(Acc, Self::Item) -> R,
-        R: Try<Ok = Acc>,
+        R: Try<Output = Acc>,
     {
-        fn scan<'a, T, St, B, Acc, R: Try<Ok = Acc>>(
+        fn scan<'a, T, St, B, Acc, R: Try<Output = Acc>>(
             state: &'a mut St,
             f: &'a mut impl FnMut(&mut St, T) -> Option<B>,
             mut fold: impl FnMut(Acc, B) -> R + 'a,
@@ -74,38 +76,25 @@ where
         self.iter.try_fold(init, scan(state, f, fold)).into_try()
     }
 
-    #[inline]
-    fn fold<Acc, Fold>(mut self, init: Acc, fold: Fold) -> Acc
-    where
-        Self: Sized,
-        Fold: FnMut(Acc, Self::Item) -> Acc,
-    {
-        #[inline]
-        fn ok<B, T>(mut f: impl FnMut(B, T) -> B) -> impl FnMut(B, T) -> Result<B, !> {
-            move |acc, x| Ok(f(acc, x))
-        }
-
-        self.try_fold(init, ok(fold)).unwrap()
-    }
+    impl_fold_via_try_fold! { fold -> try_fold }
 }
 
 #[unstable(issue = "none", feature = "inplace_iteration")]
-unsafe impl<St, F, B, S: Iterator, I: Iterator> SourceIter for Scan<I, St, F>
+unsafe impl<St, F, I> SourceIter for Scan<I, St, F>
 where
-    I: SourceIter<Source = S>,
-    F: FnMut(&mut St, I::Item) -> Option<B>,
+    I: SourceIter,
 {
-    type Source = S;
+    type Source = I::Source;
 
     #[inline]
-    unsafe fn as_inner(&mut self) -> &mut S {
+    unsafe fn as_inner(&mut self) -> &mut I::Source {
         // SAFETY: unsafe function forwarding to unsafe function with the same requirements
         unsafe { SourceIter::as_inner(&mut self.iter) }
     }
 }
 
 #[unstable(issue = "none", feature = "inplace_iteration")]
-unsafe impl<St, F, B, I: InPlaceIterable> InPlaceIterable for Scan<I, St, F> where
-    F: FnMut(&mut St, I::Item) -> Option<B>
-{
+unsafe impl<St, F, I: InPlaceIterable> InPlaceIterable for Scan<I, St, F> {
+    const EXPAND_BY: Option<NonZero<usize>> = I::EXPAND_BY;
+    const MERGE_BY: Option<NonZero<usize>> = I::MERGE_BY;
 }

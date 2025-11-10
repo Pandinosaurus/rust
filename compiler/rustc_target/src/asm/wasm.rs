@@ -1,5 +1,6 @@
-use super::{InlineAsmArch, InlineAsmType};
-use rustc_macros::HashStable_Generic;
+use rustc_span::Symbol;
+
+use super::{InlineAsmArch, InlineAsmType, ModifierInfo};
 
 def_reg_class! {
     Wasm WasmInlineAsmRegClass {
@@ -20,18 +21,18 @@ impl WasmInlineAsmRegClass {
         self,
         _arch: InlineAsmArch,
         _ty: InlineAsmType,
-    ) -> Option<(char, &'static str)> {
+    ) -> Option<ModifierInfo> {
         None
     }
 
-    pub fn default_modifier(self, _arch: InlineAsmArch) -> Option<(char, &'static str)> {
+    pub fn default_modifier(self, _arch: InlineAsmArch) -> Option<ModifierInfo> {
         None
     }
 
     pub fn supported_types(
         self,
         _arch: InlineAsmArch,
-    ) -> &'static [(InlineAsmType, Option<&'static str>)] {
+    ) -> &'static [(InlineAsmType, Option<Symbol>)] {
         match self {
             Self::local => {
                 types! { _: I8, I16, I32, I64, F32, F64; }

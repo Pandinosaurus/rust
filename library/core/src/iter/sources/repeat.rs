@@ -1,4 +1,5 @@
 use crate::iter::{FusedIterator, TrustedLen};
+use crate::num::NonZero;
 
 /// Creates a new iterator that endlessly repeats a single element.
 ///
@@ -7,11 +8,19 @@ use crate::iter::{FusedIterator, TrustedLen};
 /// Infinite iterators like `repeat()` are often used with adapters like
 /// [`Iterator::take()`], in order to make them finite.
 ///
+/// If you know the number of repetitions in advance, consider using [`repeat_n()`]
+/// instead, as it is more efficient and conveys the intent more clearly.
+///
+/// Use [`str::repeat()`] instead of this function if you just want to repeat
+/// a char/string `n` times.
+///
 /// If the element type of the iterator you need does not implement `Clone`,
 /// or if you do not want to keep the repeated element in memory, you can
 /// instead use the [`repeat_with()`] function.
 ///
+/// [`repeat_n()`]: crate::iter::repeat_n
 /// [`repeat_with()`]: crate::iter::repeat_with
+/// [`str::repeat()`]: ../../std/primitive.str.html#method.repeat
 ///
 /// # Examples
 ///
@@ -51,6 +60,7 @@ use crate::iter::{FusedIterator, TrustedLen};
 /// ```
 #[inline]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_diagnostic_item = "iter_repeat"]
 pub fn repeat<T: Clone>(elt: T) -> Repeat<T> {
     Repeat { element: elt }
 }
@@ -72,9 +82,33 @@ impl<A: Clone> Iterator for Repeat<A> {
     fn next(&mut self) -> Option<A> {
         Some(self.element.clone())
     }
+
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         (usize::MAX, None)
+    }
+
+    #[inline]
+    fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
+        // Advancing an infinite iterator of a single element is a no-op.
+        let _ = n;
+        Ok(())
+    }
+
+    #[inline]
+    fn nth(&mut self, n: usize) -> Option<A> {
+        let _ = n;
+        Some(self.element.clone())
+    }
+
+    #[track_caller]
+    fn last(self) -> Option<A> {
+        panic!("iterator is infinite");
+    }
+
+    #[track_caller]
+    fn count(self) -> usize {
+        panic!("iterator is infinite");
     }
 }
 
@@ -82,6 +116,19 @@ impl<A: Clone> Iterator for Repeat<A> {
 impl<A: Clone> DoubleEndedIterator for Repeat<A> {
     #[inline]
     fn next_back(&mut self) -> Option<A> {
+        Some(self.element.clone())
+    }
+
+    #[inline]
+    fn advance_back_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
+        // Advancing an infinite iterator of a single element is a no-op.
+        let _ = n;
+        Ok(())
+    }
+
+    #[inline]
+    fn nth_back(&mut self, n: usize) -> Option<A> {
+        let _ = n;
         Some(self.element.clone())
     }
 }

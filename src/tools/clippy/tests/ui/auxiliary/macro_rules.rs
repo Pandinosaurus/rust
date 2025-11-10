@@ -1,22 +1,6 @@
 #![allow(dead_code)]
 
 //! Used to test that certain lints don't trigger in imported external macros
-
-#[macro_export]
-macro_rules! foofoo {
-    () => {
-        loop {}
-    };
-}
-
-#[macro_export]
-macro_rules! must_use_unit {
-    () => {
-        #[must_use]
-        fn foo() {}
-    };
-}
-
 #[macro_export]
 macro_rules! try_err {
     () => {
@@ -37,72 +21,51 @@ macro_rules! string_add {
 }
 
 #[macro_export]
-macro_rules! take_external {
-    ($s:expr) => {
-        std::mem::replace($s, Default::default())
+macro_rules! string_lit_as_bytes {
+    ($s:literal) => {
+        const C: &[u8] = $s.as_bytes();
     };
 }
 
 #[macro_export]
-macro_rules! option_env_unwrap_external {
-    ($env: expr) => {
-        option_env!($env).unwrap()
-    };
-    ($env: expr, $message: expr) => {
-        option_env!($env).expect($message)
-    };
-}
-
-#[macro_export]
-macro_rules! ref_arg_binding {
+macro_rules! mut_mut {
     () => {
-        let ref _y = 42;
+        let mut_mut_ty: &mut &mut u32 = &mut &mut 1u32;
     };
 }
 
 #[macro_export]
-macro_rules! ref_arg_function {
+macro_rules! issue_10421 {
     () => {
-        fn fun_example(ref _x: usize) {}
+        let mut a = 1;
+        let mut b = 2;
+        a = b;
+        b = a;
     };
 }
 
 #[macro_export]
-macro_rules! as_conv_with_arg {
-    (0u32 as u64) => {
-        ()
-    };
-}
-
-#[macro_export]
-macro_rules! as_conv {
+macro_rules! macro_with_panic {
     () => {
-        0u32 as u64
+        panic!()
     };
 }
 
 #[macro_export]
-macro_rules! large_enum_variant {
-    () => {
-        enum LargeEnumInMacro {
-            A(i32),
-            B([i32; 8000]),
-        }
+macro_rules! bad_transmute {
+    ($e:expr) => {
+        std::mem::transmute($e)
     };
 }
 
 #[macro_export]
-macro_rules! field_reassign_with_default {
-    () => {
-        #[derive(Default)]
-        struct A {
-            pub i: i32,
-            pub j: i64,
-        }
-        fn lint() {
-            let mut a: A = Default::default();
-            a.i = 42;
-            a;
-        }
-    };
+#[rustfmt::skip]
+macro_rules! double_parens {
+    ($a:expr, $b:expr, $c:expr, $d:expr) => {{
+        let a = ($a);
+        let a = (());
+        let b = ((5));
+        let c = std::convert::identity((5));
+        InterruptMask((($a.union($b).union($c).union($d)).into_bits()) as u32)
+    }};
 }

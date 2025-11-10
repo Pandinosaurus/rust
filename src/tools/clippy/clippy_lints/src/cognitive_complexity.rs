@@ -1,31 +1,43 @@
-//! calculate cognitive complexity and warn about overly complex functions
-
+use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_help;
-use clippy_utils::source::snippet_opt;
-use clippy_utils::ty::is_type_diagnostic_item;
-use clippy_utils::LimitStack;
-use rustc_ast::ast::Attribute;
-use rustc_hir::intravisit::{walk_expr, FnKind, NestedVisitorMap, Visitor};
-use rustc_hir::{Body, Expr, ExprKind, FnDecl, HirId};
+use clippy_utils::res::MaybeDef;
+use clippy_utils::source::{IntoSpan, SpanRangeExt};
+use clippy_utils::visitors::for_each_expr_without_closures;
+use clippy_utils::{LimitStack, get_async_fn_body, sym};
+use core::ops::ControlFlow;
+use rustc_hir::intravisit::FnKind;
+use rustc_hir::{Attribute, Body, Expr, ExprKind, FnDecl};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_middle::hir::map::Map;
-use rustc_session::{declare_tool_lint, impl_lint_pass};
-use rustc_span::source_map::Span;
-use rustc_span::{sym, BytePos};
+use rustc_session::impl_lint_pass;
+use rustc_span::Span;
+use rustc_span::def_id::LocalDefId;
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for methods with high cognitive complexity.
+    /// ### What it does
+    /// We used to think it measured how hard a method is to understand.
     ///
-    /// **Why is this bad?** Methods of high cognitive complexity tend to be hard to
-    /// both read and maintain. Also LLVM will tend to optimize small methods better.
+    /// ### Why is this bad?
+    /// Ideally, we would like to be able to measure how hard a function is
+    /// to understand given its context (what we call its Cognitive Complexity).
+    /// But that's not what this lint does. See "Known problems"
     ///
-    /// **Known problems:** Sometimes it's hard to find a way to reduce the
-    /// complexity.
+    /// ### Known problems
+    /// The true Cognitive Complexity of a method is not something we can
+    /// calculate using modern technology. This lint has been left in
+    /// `restriction` so as to not mislead users into using this lint as a
+    /// measurement tool.
     ///
-    /// **Example:** No. You'll see it when you get the warning.
+    /// For more detailed information, see [rust-clippy#3793](https://github.com/rust-lang/rust-clippy/issues/3793)
+    ///
+    /// ### Lints to consider instead of this
+    ///
+    /// * [`excessive_nesting`](https://rust-lang.github.io/rust-clippy/master/index.html#excessive_nesting)
+    /// * [`too_many_lines`](https://rust-lang.github.io/rust-clippy/master/index.html#too_many_lines)
+    #[clippy::version = "1.35.0"]
     pub COGNITIVE_COMPLEXITY,
-    nursery,
-    "functions that should be split up into multiple functions"
+    restriction,
+    "functions that should be split up into multiple functions",
+    @eval_always = true
 }
 
 pub struct CognitiveComplexity {
@@ -33,10 +45,9 @@ pub struct CognitiveComplexity {
 }
 
 impl CognitiveComplexity {
-    #[must_use]
-    pub fn new(limit: u64) -> Self {
+    pub fn new(conf: &'static Conf) -> Self {
         Self {
-            limit: LimitStack::new(limit),
+            limit: LimitStack::new(conf.cognitive_complexity_threshold),
         }
     }
 }
@@ -44,54 +55,66 @@ impl CognitiveComplexity {
 impl_lint_pass!(CognitiveComplexity => [COGNITIVE_COMPLEXITY]);
 
 impl CognitiveComplexity {
-    #[allow(clippy::cast_possible_truncation)]
     fn check<'tcx>(
-        &mut self,
+        &self,
         cx: &LateContext<'tcx>,
         kind: FnKind<'tcx>,
         decl: &'tcx FnDecl<'_>,
-        body: &'tcx Body<'_>,
+        expr: &'tcx Expr<'_>,
         body_span: Span,
     ) {
         if body_span.from_expansion() {
             return;
         }
 
-        let expr = &body.value;
+        let mut cc = 1u64;
+        let mut returns = 0u64;
+        let mut prev_expr: Option<&ExprKind<'tcx>> = None;
+        let _: Option<!> = for_each_expr_without_closures(expr, |e| {
+            match e.kind {
+                ExprKind::If(_, _, _) => {
+                    cc += 1;
+                },
+                ExprKind::Match(_, arms, _) => {
+                    if arms.len() > 1 {
+                        cc += 1;
+                    }
+                    cc += arms.iter().filter(|arm| arm.guard.is_some()).count() as u64;
+                },
+                ExprKind::Ret(_) => {
+                    if !matches!(prev_expr, Some(ExprKind::Ret(_))) {
+                        returns += 1;
+                    }
+                },
+                _ => {},
+            }
+            prev_expr = Some(&e.kind);
+            ControlFlow::Continue(())
+        });
 
-        let mut helper = CcHelper { cc: 1, returns: 0 };
-        helper.visit_expr(expr);
-        let CcHelper { cc, returns } = helper;
         let ret_ty = cx.typeck_results().node_type(expr.hir_id);
-        let ret_adjust = if is_type_diagnostic_item(cx, ret_ty, sym::result_type) {
+        let ret_adjust = if ret_ty.is_diag_item(cx, sym::Result) {
             returns
         } else {
-            #[allow(clippy::integer_division)]
+            #[expect(clippy::integer_division)]
             (returns / 2)
         };
 
-        let mut rust_cc = cc;
         // prevent degenerate cases where unreachable code contains `return` statements
-        if rust_cc >= ret_adjust {
-            rust_cc -= ret_adjust;
+        if cc >= ret_adjust {
+            cc -= ret_adjust;
         }
 
-        if rust_cc > self.limit.limit() {
+        if cc > self.limit.limit() {
             let fn_span = match kind {
-                FnKind::ItemFn(ident, _, _, _) | FnKind::Method(ident, _, _) => ident.span,
+                FnKind::ItemFn(ident, _, _) | FnKind::Method(ident, _) => ident.span,
                 FnKind::Closure => {
                     let header_span = body_span.with_hi(decl.output.span().lo());
-                    let pos = snippet_opt(cx, header_span).and_then(|snip| {
-                        let low_offset = snip.find('|')?;
-                        let high_offset = 1 + snip.get(low_offset + 1..)?.find('|')?;
-                        let low = header_span.lo() + BytePos(low_offset as u32);
-                        let high = low + BytePos(high_offset as u32 + 1);
-
-                        Some((low, high))
-                    });
-
-                    if let Some((low, high)) = pos {
-                        Span::new(low, high, header_span.ctxt())
+                    if let Some(range) = header_span.map_range(cx, |_, src, range| {
+                        let mut idxs = src.get(range.clone())?.match_indices('|');
+                        Some(range.start + idxs.next()?.0..range.start + idxs.next()?.0 + 1)
+                    }) {
+                        range.with_ctxt(header_span.ctxt())
                     } else {
                         return;
                     }
@@ -102,9 +125,8 @@ impl CognitiveComplexity {
                 cx,
                 COGNITIVE_COMPLEXITY,
                 fn_span,
-                &format!(
-                    "the function has a cognitive complexity of ({}/{})",
-                    rust_cc,
+                format!(
+                    "the function has a cognitive complexity of ({cc}/{})",
                     self.limit.limit()
                 ),
                 None,
@@ -122,47 +144,28 @@ impl<'tcx> LateLintPass<'tcx> for CognitiveComplexity {
         decl: &'tcx FnDecl<'_>,
         body: &'tcx Body<'_>,
         span: Span,
-        hir_id: HirId,
+        def_id: LocalDefId,
     ) {
-        let def_id = cx.tcx.hir().local_def_id(hir_id);
-        if !cx.tcx.has_attr(def_id.to_def_id(), sym::test) {
-            self.check(cx, kind, decl, body, span);
-        }
-    }
-
-    fn enter_lint_attrs(&mut self, cx: &LateContext<'tcx>, attrs: &'tcx [Attribute]) {
-        self.limit.push_attrs(cx.sess(), attrs, "cognitive_complexity");
-    }
-    fn exit_lint_attrs(&mut self, cx: &LateContext<'tcx>, attrs: &'tcx [Attribute]) {
-        self.limit.pop_attrs(cx.sess(), attrs, "cognitive_complexity");
-    }
-}
-
-struct CcHelper {
-    cc: u64,
-    returns: u64,
-}
-
-impl<'tcx> Visitor<'tcx> for CcHelper {
-    type Map = Map<'tcx>;
-
-    fn visit_expr(&mut self, e: &'tcx Expr<'_>) {
-        walk_expr(self, e);
-        match e.kind {
-            ExprKind::If(_, _, _) => {
-                self.cc += 1;
-            },
-            ExprKind::Match(_, ref arms, _) => {
-                if arms.len() > 1 {
-                    self.cc += 1;
+        if !cx.tcx.has_attr(def_id, sym::test) {
+            let expr = if kind.asyncness().is_async() {
+                match get_async_fn_body(cx.tcx, body) {
+                    Some(b) => b,
+                    None => {
+                        return;
+                    },
                 }
-                self.cc += arms.iter().filter(|arm| arm.guard.is_some()).count() as u64;
-            },
-            ExprKind::Ret(_) => self.returns += 1,
-            _ => {},
+            } else {
+                body.value
+            };
+
+            self.check(cx, kind, decl, expr, span);
         }
     }
-    fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
-        NestedVisitorMap::None
+
+    fn check_attributes(&mut self, cx: &LateContext<'tcx>, attrs: &'tcx [Attribute]) {
+        self.limit.push_attrs(cx.sess(), attrs, sym::cognitive_complexity);
+    }
+    fn check_attributes_post(&mut self, cx: &LateContext<'tcx>, attrs: &'tcx [Attribute]) {
+        self.limit.pop_attrs(cx.sess(), attrs, sym::cognitive_complexity);
     }
 }

@@ -1,12 +1,33 @@
+#[allow(clippy::borrow_as_ptr)]
 fn main() {
     unsafe {
-        let x = &() as *const ();
-        x.offset(0);
-        x.wrapping_add(0);
-        x.sub(0);
-        x.wrapping_sub(0);
+        let m = &mut () as *mut ();
+        m.offset(0);
+        //~^ zst_offset
 
-        let y = &1 as *const u8;
-        y.offset(0);
+        m.wrapping_add(0);
+        //~^ zst_offset
+
+        m.sub(0);
+        //~^ zst_offset
+
+        m.wrapping_sub(0);
+        //~^ zst_offset
+
+        let c = &() as *const ();
+        c.offset(0);
+        //~^ zst_offset
+
+        c.wrapping_add(0);
+        //~^ zst_offset
+
+        c.sub(0);
+        //~^ zst_offset
+
+        c.wrapping_sub(0);
+        //~^ zst_offset
+
+        let sized = &1 as *const i32;
+        sized.offset(0);
     }
 }

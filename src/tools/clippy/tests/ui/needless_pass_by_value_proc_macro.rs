@@ -1,4 +1,5 @@
-#![crate_type = "proc-macro"]
+//@ check-pass
+
 #![warn(clippy::needless_pass_by_value)]
 
 extern crate proc_macro;

@@ -7,6 +7,8 @@ impl PartialEq for Foo {
         true
     }
     fn ne(&self, _: &Foo) -> bool {
+        //~^ partialeq_ne_impl
+
         false
     }
 }

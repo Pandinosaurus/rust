@@ -1,30 +1,23 @@
-use super::super::testing::crash_test::{CrashTestDummy, Panic};
-use super::super::testing::ord_chaos::{Cyclic3, Governed, Governor};
-use super::super::testing::rng::DeterministicRng;
-use super::Entry::{Occupied, Vacant};
+use core::assert_matches::assert_matches;
+use std::iter;
+use std::ops::Bound::{Excluded, Included, Unbounded};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::SeqCst;
+
 use super::*;
 use crate::boxed::Box;
 use crate::fmt::Debug;
 use crate::rc::Rc;
 use crate::string::{String, ToString};
-use crate::vec::Vec;
-use std::cmp::Ordering;
-use std::convert::TryFrom;
-use std::iter::{self, FromIterator};
-use std::mem;
-use std::ops::Bound::{self, Excluded, Included, Unbounded};
-use std::ops::RangeBounds;
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-
-// Capacity of a tree with a single level,
-// i.e., a tree who's root is a leaf node at height 0.
-const NODE_CAPACITY: usize = node::CAPACITY;
+use crate::testing::crash_test::{CrashTestDummy, Panic};
+use crate::testing::ord_chaos::{Cyclic3, Governed, Governor};
+use crate::testing::rng::DeterministicRng;
 
 // Minimum number of elements to insert, to guarantee a tree with 2 levels,
 // i.e., a tree who's root is an internal node at height 1, with edges to leaf nodes.
 // It's not the minimum size: removing an element from such a tree does not always reduce height.
-const MIN_INSERTS_HEIGHT_1: usize = NODE_CAPACITY + 1;
+const MIN_INSERTS_HEIGHT_1: usize = node::CAPACITY + 1;
 
 // Minimum number of elements to insert in ascending order, to guarantee a tree with 3 levels,
 // i.e., a tree who's root is an internal node at height 2, with edges to more internal nodes.
@@ -119,8 +112,9 @@ impl<K, V> BTreeMap<K, V> {
         K: Ord,
     {
         let iter = mem::take(self).into_iter();
-        let root = BTreeMap::ensure_is_owned(&mut self.root);
-        root.bulk_push(iter, &mut self.length);
+        if !iter.is_empty() {
+            self.root.insert(Root::new(*self.alloc)).bulk_push(iter, &mut self.length, *self.alloc);
+        }
     }
 }
 
@@ -180,7 +174,7 @@ fn test_levels() {
 #[should_panic]
 fn test_check_ord_chaos() {
     let gov = Governor::new();
-    let map: BTreeMap<_, _> = (0..2).map(|i| (Governed(i, &gov), ())).collect();
+    let map = BTreeMap::from([(Governed(1, &gov), ()), (Governed(2, &gov), ())]);
     gov.flip();
     map.check();
 }
@@ -189,7 +183,7 @@ fn test_check_ord_chaos() {
 #[test]
 fn test_check_invariants_ord_chaos() {
     let gov = Governor::new();
-    let map: BTreeMap<_, _> = (0..2).map(|i| (Governed(i, &gov), ())).collect();
+    let map = BTreeMap::from([(Governed(1, &gov), ()), (Governed(2, &gov), ())]);
     gov.flip();
     map.check_invariants();
 }
@@ -337,8 +331,7 @@ fn test_basic_small() {
 fn test_iter() {
     // Miri is too slow
     let size = if cfg!(miri) { 200 } else { 10000 };
-
-    let mut map: BTreeMap<_, _> = (0..size).map(|i| (i, i)).collect();
+    let mut map = BTreeMap::from_iter((0..size).map(|i| (i, i)));
 
     fn test<T>(size: usize, mut iter: T)
     where
@@ -360,8 +353,7 @@ fn test_iter() {
 fn test_iter_rev() {
     // Miri is too slow
     let size = if cfg!(miri) { 200 } else { 10000 };
-
-    let mut map: BTreeMap<_, _> = (0..size).map(|i| (i, i)).collect();
+    let mut map = BTreeMap::from_iter((0..size).map(|i| (i, i)));
 
     fn test<T>(size: usize, mut iter: T)
     where
@@ -386,7 +378,7 @@ where
     <T as TryFrom<usize>>::Error: Debug,
 {
     let zero = T::try_from(0).unwrap();
-    let mut map: BTreeMap<T, T> = (0..size).map(|i| (T::try_from(i).unwrap(), zero)).collect();
+    let mut map = BTreeMap::from_iter((0..size).map(|i| (T::try_from(i).unwrap(), zero)));
 
     // Forward and backward iteration sees enough pairs (also tested elsewhere)
     assert_eq!(map.iter_mut().count(), size);
@@ -452,7 +444,7 @@ fn test_iter_mut_mutation() {
 
 #[test]
 fn test_values_mut() {
-    let mut a: BTreeMap<_, _> = (0..MIN_INSERTS_HEIGHT_2).map(|i| (i, i)).collect();
+    let mut a = BTreeMap::from_iter((0..MIN_INSERTS_HEIGHT_2).map(|i| (i, i)));
     test_all_refs(&mut 13, a.values_mut());
     a.check();
 }
@@ -467,14 +459,14 @@ fn test_values_mut_mutation() {
         value.push_str("!");
     }
 
-    let values: Vec<String> = a.values().cloned().collect();
+    let values = Vec::from_iter(a.values().cloned());
     assert_eq!(values, [String::from("hello!"), String::from("goodbye!")]);
     a.check();
 }
 
 #[test]
 fn test_iter_entering_root_twice() {
-    let mut map: BTreeMap<_, _> = (0..2).map(|i| (i, i)).collect();
+    let mut map = BTreeMap::from([(0, 0), (1, 1)]);
     let mut it = map.iter_mut();
     let front = it.next().unwrap();
     let back = it.next_back().unwrap();
@@ -491,7 +483,7 @@ fn test_iter_entering_root_twice() {
 
 #[test]
 fn test_iter_descending_to_same_node_twice() {
-    let mut map: BTreeMap<_, _> = (0..MIN_INSERTS_HEIGHT_1).map(|i| (i, i)).collect();
+    let mut map = BTreeMap::from_iter((0..MIN_INSERTS_HEIGHT_1).map(|i| (i, i)));
     let mut it = map.iter_mut();
     // Descend into first child.
     let front = it.next().unwrap();
@@ -509,7 +501,7 @@ fn test_iter_mixed() {
     // Miri is too slow
     let size = if cfg!(miri) { 200 } else { 10000 };
 
-    let mut map: BTreeMap<_, _> = (0..size).map(|i| (i, i)).collect();
+    let mut map = BTreeMap::from_iter((0..size).map(|i| (i, i)));
 
     fn test<T>(size: usize, mut iter: T)
     where
@@ -569,21 +561,19 @@ fn test_iter_min_max() {
 }
 
 fn range_keys(map: &BTreeMap<i32, i32>, range: impl RangeBounds<i32>) -> Vec<i32> {
-    map.range(range)
-        .map(|(&k, &v)| {
-            assert_eq!(k, v);
-            k
-        })
-        .collect()
+    Vec::from_iter(map.range(range).map(|(&k, &v)| {
+        assert_eq!(k, v);
+        k
+    }))
 }
 
 #[test]
 fn test_range_small() {
     let size = 4;
 
-    let map: BTreeMap<_, _> = (1..=size).map(|i| (i, i)).collect();
-    let all: Vec<_> = (1..=size).collect();
+    let all = Vec::from_iter(1..=size);
     let (first, last) = (vec![all[0]], vec![all[size as usize - 1]]);
+    let map = BTreeMap::from_iter(all.iter().copied().map(|i| (i, i)));
 
     assert_eq!(range_keys(&map, (Excluded(0), Excluded(size + 1))), all);
     assert_eq!(range_keys(&map, (Excluded(0), Included(size + 1))), all);
@@ -638,10 +628,9 @@ fn test_range_small() {
 
 #[test]
 fn test_range_height_1() {
-    // Tests tree with a root and 2 leaves. The single key in the root node is
-    // close to the middle among the keys.
-
-    let map: BTreeMap<_, _> = (0..MIN_INSERTS_HEIGHT_1 as i32).map(|i| (i, i)).collect();
+    // Tests tree with a root and 2 leaves. We test around the middle of the
+    // keys because one of those is the single key in the root node.
+    let map = BTreeMap::from_iter((0..MIN_INSERTS_HEIGHT_1 as i32).map(|i| (i, i)));
     let middle = MIN_INSERTS_HEIGHT_1 as i32 / 2;
     for root in middle - 2..=middle + 2 {
         assert_eq!(range_keys(&map, (Excluded(root), Excluded(root + 1))), vec![]);
@@ -660,9 +649,9 @@ fn test_range_height_1() {
 fn test_range_large() {
     let size = 200;
 
-    let map: BTreeMap<_, _> = (1..=size).map(|i| (i, i)).collect();
-    let all: Vec<_> = (1..=size).collect();
+    let all = Vec::from_iter(1..=size);
     let (first, last) = (vec![all[0]], vec![all[size as usize - 1]]);
+    let map = BTreeMap::from_iter(all.iter().copied().map(|i| (i, i)));
 
     assert_eq!(range_keys(&map, (Excluded(0), Excluded(size + 1))), all);
     assert_eq!(range_keys(&map, (Excluded(0), Included(size + 1))), all);
@@ -715,9 +704,7 @@ fn test_range_large() {
         L: IntoIterator<Item = (&'a i32, &'a i32)>,
         R: IntoIterator<Item = (&'a i32, &'a i32)>,
     {
-        let lhs: Vec<_> = lhs.into_iter().collect();
-        let rhs: Vec<_> = rhs.into_iter().collect();
-        assert_eq!(lhs, rhs);
+        assert_eq!(Vec::from_iter(lhs), Vec::from_iter(rhs));
     }
 
     check(map.range(..=100), map.range(..101));
@@ -728,14 +715,13 @@ fn test_range_large() {
 #[test]
 fn test_range_inclusive_max_value() {
     let max = usize::MAX;
-    let map: BTreeMap<_, _> = vec![(max, 0)].into_iter().collect();
-
-    assert_eq!(map.range(max..=max).collect::<Vec<_>>(), &[(&max, &0)]);
+    let map = BTreeMap::from([(max, 0)]);
+    assert_eq!(Vec::from_iter(map.range(max..=max)), &[(&max, &0)]);
 }
 
 #[test]
 fn test_range_equal_empty_cases() {
-    let map: BTreeMap<_, _> = (0..5).map(|i| (i, i)).collect();
+    let map = BTreeMap::from_iter((0..5).map(|i| (i, i)));
     assert_eq!(map.range((Included(2), Excluded(2))).next(), None);
     assert_eq!(map.range((Excluded(2), Included(2))).next(), None);
 }
@@ -743,40 +729,39 @@ fn test_range_equal_empty_cases() {
 #[test]
 #[should_panic]
 fn test_range_equal_excluded() {
-    let map: BTreeMap<_, _> = (0..5).map(|i| (i, i)).collect();
-    map.range((Excluded(2), Excluded(2)));
+    let map = BTreeMap::from_iter((0..5).map(|i| (i, i)));
+    let _ = map.range((Excluded(2), Excluded(2)));
 }
 
 #[test]
 #[should_panic]
 fn test_range_backwards_1() {
-    let map: BTreeMap<_, _> = (0..5).map(|i| (i, i)).collect();
-    map.range((Included(3), Included(2)));
+    let map = BTreeMap::from_iter((0..5).map(|i| (i, i)));
+    let _ = map.range((Included(3), Included(2)));
 }
 
 #[test]
 #[should_panic]
 fn test_range_backwards_2() {
-    let map: BTreeMap<_, _> = (0..5).map(|i| (i, i)).collect();
-    map.range((Included(3), Excluded(2)));
+    let map = BTreeMap::from_iter((0..5).map(|i| (i, i)));
+    let _ = map.range((Included(3), Excluded(2)));
 }
 
 #[test]
 #[should_panic]
 fn test_range_backwards_3() {
-    let map: BTreeMap<_, _> = (0..5).map(|i| (i, i)).collect();
-    map.range((Excluded(3), Included(2)));
+    let map = BTreeMap::from_iter((0..5).map(|i| (i, i)));
+    let _ = map.range((Excluded(3), Included(2)));
 }
 
 #[test]
 #[should_panic]
 fn test_range_backwards_4() {
-    let map: BTreeMap<_, _> = (0..5).map(|i| (i, i)).collect();
-    map.range((Excluded(3), Excluded(2)));
+    let map = BTreeMap::from_iter((0..5).map(|i| (i, i)));
+    let _ = map.range((Excluded(3), Excluded(2)));
 }
 
 #[test]
-#[should_panic]
 fn test_range_finding_ill_order_in_map() {
     let mut map = BTreeMap::new();
     map.insert(Cyclic3::B, ());
@@ -784,12 +769,11 @@ fn test_range_finding_ill_order_in_map() {
     // we cause a different panic than `test_range_backwards_1` does.
     // A more refined `should_panic` would be welcome.
     if Cyclic3::C < Cyclic3::A {
-        map.range(Cyclic3::C..=Cyclic3::A);
+        let _ = map.range(Cyclic3::C..=Cyclic3::A);
     }
 }
 
 #[test]
-#[should_panic]
 fn test_range_finding_ill_order_in_range_ord() {
     // Has proper order the first time asked, then flips around.
     struct EvilTwin(i32);
@@ -825,15 +809,15 @@ fn test_range_finding_ill_order_in_range_ord() {
         }
     }
 
-    let map = (0..12).map(|i| (CompositeKey(i, EvilTwin(i)), ())).collect::<BTreeMap<_, _>>();
-    map.range(EvilTwin(5)..=EvilTwin(7));
+    let map = BTreeMap::from_iter((0..12).map(|i| (CompositeKey(i, EvilTwin(i)), ())));
+    let _ = map.range(EvilTwin(5)..=EvilTwin(7));
 }
 
 #[test]
 fn test_range_1000() {
     // Miri is too slow
     let size = if cfg!(miri) { MIN_INSERTS_HEIGHT_2 as u32 } else { 1000 };
-    let map: BTreeMap<_, _> = (0..size).map(|i| (i, i)).collect();
+    let map = BTreeMap::from_iter((0..size).map(|i| (i, i)));
 
     fn test(map: &BTreeMap<u32, u32>, size: u32, min: Bound<&u32>, max: Bound<&u32>) {
         let mut kvs = map.range((min, max)).map(|(&k, &v)| (k, v));
@@ -872,7 +856,7 @@ fn test_range() {
     let size = 200;
     // Miri is too slow
     let step = if cfg!(miri) { 66 } else { 1 };
-    let map: BTreeMap<_, _> = (0..size).map(|i| (i, i)).collect();
+    let map = BTreeMap::from_iter((0..size).map(|i| (i, i)));
 
     for i in (0..size).step_by(step) {
         for j in (i..size).step_by(step) {
@@ -893,7 +877,7 @@ fn test_range_mut() {
     let size = 200;
     // Miri is too slow
     let step = if cfg!(miri) { 66 } else { 1 };
-    let mut map: BTreeMap<_, _> = (0..size).map(|i| (i, i)).collect();
+    let mut map = BTreeMap::from_iter((0..size).map(|i| (i, i)));
 
     for i in (0..size).step_by(step) {
         for j in (i..size).step_by(step) {
@@ -910,9 +894,42 @@ fn test_range_mut() {
     map.check();
 }
 
+#[should_panic(expected = "range start is greater than range end in BTreeMap")]
+#[test]
+fn test_range_panic_1() {
+    let mut map = BTreeMap::new();
+    map.insert(3, "a");
+    map.insert(5, "b");
+    map.insert(8, "c");
+
+    let _invalid_range = map.range((Included(&8), Included(&3)));
+}
+
+#[should_panic(expected = "range start and end are equal and excluded in BTreeMap")]
+#[test]
+fn test_range_panic_2() {
+    let mut map = BTreeMap::new();
+    map.insert(3, "a");
+    map.insert(5, "b");
+    map.insert(8, "c");
+
+    let _invalid_range = map.range((Excluded(&5), Excluded(&5)));
+}
+
+#[should_panic(expected = "range start and end are equal and excluded in BTreeMap")]
+#[test]
+fn test_range_panic_3() {
+    let mut map: BTreeMap<i32, ()> = BTreeMap::new();
+    map.insert(3, ());
+    map.insert(5, ());
+    map.insert(8, ());
+
+    let _invalid_range = map.range((Excluded(&5), Excluded(&5)));
+}
+
 #[test]
 fn test_retain() {
-    let mut map: BTreeMap<i32, i32> = (0..100).map(|x| (x, x * 10)).collect();
+    let mut map = BTreeMap::from_iter((0..100).map(|x| (x, x * 10)));
 
     map.retain(|&k, _| k % 2 == 0);
     assert_eq!(map.len(), 50);
@@ -921,14 +938,14 @@ fn test_retain() {
     assert_eq!(map[&6], 60);
 }
 
-mod test_drain_filter {
+mod test_extract_if {
     use super::*;
 
     #[test]
     fn empty() {
         let mut map: BTreeMap<i32, i32> = BTreeMap::new();
-        map.drain_filter(|_, _| unreachable!("there's nothing to decide on"));
-        assert!(map.is_empty());
+        map.extract_if(.., |_, _| unreachable!("there's nothing to decide on")).for_each(drop);
+        assert_eq!(map.height(), None);
         map.check();
     }
 
@@ -936,8 +953,8 @@ mod test_drain_filter {
     #[test]
     fn consumed_keeping_all() {
         let pairs = (0..3).map(|i| (i, i));
-        let mut map: BTreeMap<_, _> = pairs.collect();
-        assert!(map.drain_filter(|_, _| false).eq(iter::empty()));
+        let mut map = BTreeMap::from_iter(pairs);
+        assert!(map.extract_if(.., |_, _| false).eq(iter::empty()));
         map.check();
     }
 
@@ -945,19 +962,43 @@ mod test_drain_filter {
     #[test]
     fn consumed_removing_all() {
         let pairs = (0..3).map(|i| (i, i));
-        let mut map: BTreeMap<_, _> = pairs.clone().collect();
-        assert!(map.drain_filter(|_, _| true).eq(pairs));
+        let mut map = BTreeMap::from_iter(pairs.clone());
+        assert!(map.extract_if(.., |_, _| true).eq(pairs));
         assert!(map.is_empty());
         map.check();
+    }
+
+    #[test]
+    fn consumed_removing_some() {
+        let pairs = (0..3).map(|i| (i, i));
+        let map = BTreeMap::from_iter(pairs);
+        for x in 0..3 {
+            for y in 0..3 {
+                let mut map = map.clone();
+                assert!(map.extract_if(x..y, |_, _| true).eq((x..y).map(|i| (i, i))));
+                for i in 0..3 {
+                    assert_ne!(map.contains_key(&i), (x..y).contains(&i));
+                }
+            }
+        }
+        for x in 0..3 {
+            for y in 0..2 {
+                let mut map = map.clone();
+                assert!(map.extract_if(x..=y, |_, _| true).eq((x..=y).map(|i| (i, i))));
+                for i in 0..3 {
+                    assert_ne!(map.contains_key(&i), (x..=y).contains(&i));
+                }
+            }
+        }
     }
 
     // Explicitly consumes the iterator and modifies values through it.
     #[test]
     fn mutating_and_keeping() {
         let pairs = (0..3).map(|i| (i, i));
-        let mut map: BTreeMap<_, _> = pairs.collect();
+        let mut map = BTreeMap::from_iter(pairs);
         assert!(
-            map.drain_filter(|_, v| {
+            map.extract_if(.., |_, v| {
                 *v += 6;
                 false
             })
@@ -972,9 +1013,9 @@ mod test_drain_filter {
     #[test]
     fn mutating_and_removing() {
         let pairs = (0..3).map(|i| (i, i));
-        let mut map: BTreeMap<_, _> = pairs.collect();
+        let mut map = BTreeMap::from_iter(pairs);
         assert!(
-            map.drain_filter(|_, v| {
+            map.extract_if(.., |_, v| {
                 *v += 6;
                 true
             })
@@ -987,8 +1028,8 @@ mod test_drain_filter {
     #[test]
     fn underfull_keeping_all() {
         let pairs = (0..3).map(|i| (i, i));
-        let mut map: BTreeMap<_, _> = pairs.collect();
-        map.drain_filter(|_, _| false);
+        let mut map = BTreeMap::from_iter(pairs);
+        map.extract_if(.., |_, _| false).for_each(drop);
         assert!(map.keys().copied().eq(0..3));
         map.check();
     }
@@ -997,8 +1038,8 @@ mod test_drain_filter {
     fn underfull_removing_one() {
         let pairs = (0..3).map(|i| (i, i));
         for doomed in 0..3 {
-            let mut map: BTreeMap<_, _> = pairs.clone().collect();
-            map.drain_filter(|i, _| *i == doomed);
+            let mut map = BTreeMap::from_iter(pairs.clone());
+            map.extract_if(.., |i, _| *i == doomed).for_each(drop);
             assert_eq!(map.len(), 2);
             map.check();
         }
@@ -1008,8 +1049,8 @@ mod test_drain_filter {
     fn underfull_keeping_one() {
         let pairs = (0..3).map(|i| (i, i));
         for sacred in 0..3 {
-            let mut map: BTreeMap<_, _> = pairs.clone().collect();
-            map.drain_filter(|i, _| *i != sacred);
+            let mut map = BTreeMap::from_iter(pairs.clone());
+            map.extract_if(.., |i, _| *i != sacred).for_each(drop);
             assert!(map.keys().copied().eq(sacred..=sacred));
             map.check();
         }
@@ -1018,38 +1059,38 @@ mod test_drain_filter {
     #[test]
     fn underfull_removing_all() {
         let pairs = (0..3).map(|i| (i, i));
-        let mut map: BTreeMap<_, _> = pairs.collect();
-        map.drain_filter(|_, _| true);
+        let mut map = BTreeMap::from_iter(pairs);
+        map.extract_if(.., |_, _| true).for_each(drop);
         assert!(map.is_empty());
         map.check();
     }
 
     #[test]
     fn height_0_keeping_all() {
-        let pairs = (0..NODE_CAPACITY).map(|i| (i, i));
-        let mut map: BTreeMap<_, _> = pairs.collect();
-        map.drain_filter(|_, _| false);
-        assert!(map.keys().copied().eq(0..NODE_CAPACITY));
+        let pairs = (0..node::CAPACITY).map(|i| (i, i));
+        let mut map = BTreeMap::from_iter(pairs);
+        map.extract_if(.., |_, _| false).for_each(drop);
+        assert!(map.keys().copied().eq(0..node::CAPACITY));
         map.check();
     }
 
     #[test]
     fn height_0_removing_one() {
-        let pairs = (0..NODE_CAPACITY).map(|i| (i, i));
-        for doomed in 0..NODE_CAPACITY {
-            let mut map: BTreeMap<_, _> = pairs.clone().collect();
-            map.drain_filter(|i, _| *i == doomed);
-            assert_eq!(map.len(), NODE_CAPACITY - 1);
+        let pairs = (0..node::CAPACITY).map(|i| (i, i));
+        for doomed in 0..node::CAPACITY {
+            let mut map = BTreeMap::from_iter(pairs.clone());
+            map.extract_if(.., |i, _| *i == doomed).for_each(drop);
+            assert_eq!(map.len(), node::CAPACITY - 1);
             map.check();
         }
     }
 
     #[test]
     fn height_0_keeping_one() {
-        let pairs = (0..NODE_CAPACITY).map(|i| (i, i));
-        for sacred in 0..NODE_CAPACITY {
-            let mut map: BTreeMap<_, _> = pairs.clone().collect();
-            map.drain_filter(|i, _| *i != sacred);
+        let pairs = (0..node::CAPACITY).map(|i| (i, i));
+        for sacred in 0..node::CAPACITY {
+            let mut map = BTreeMap::from_iter(pairs.clone());
+            map.extract_if(.., |i, _| *i != sacred).for_each(drop);
             assert!(map.keys().copied().eq(sacred..=sacred));
             map.check();
         }
@@ -1057,17 +1098,17 @@ mod test_drain_filter {
 
     #[test]
     fn height_0_removing_all() {
-        let pairs = (0..NODE_CAPACITY).map(|i| (i, i));
-        let mut map: BTreeMap<_, _> = pairs.collect();
-        map.drain_filter(|_, _| true);
+        let pairs = (0..node::CAPACITY).map(|i| (i, i));
+        let mut map = BTreeMap::from_iter(pairs);
+        map.extract_if(.., |_, _| true).for_each(drop);
         assert!(map.is_empty());
         map.check();
     }
 
     #[test]
     fn height_0_keeping_half() {
-        let mut map: BTreeMap<_, _> = (0..16).map(|i| (i, i)).collect();
-        assert_eq!(map.drain_filter(|i, _| *i % 2 == 0).count(), 8);
+        let mut map = BTreeMap::from_iter((0..16).map(|i| (i, i)));
+        assert_eq!(map.extract_if(.., |i, _| *i % 2 == 0).count(), 8);
         assert_eq!(map.len(), 8);
         map.check();
     }
@@ -1075,8 +1116,8 @@ mod test_drain_filter {
     #[test]
     fn height_1_removing_all() {
         let pairs = (0..MIN_INSERTS_HEIGHT_1).map(|i| (i, i));
-        let mut map: BTreeMap<_, _> = pairs.collect();
-        map.drain_filter(|_, _| true);
+        let mut map = BTreeMap::from_iter(pairs);
+        map.extract_if(.., |_, _| true).for_each(drop);
         assert!(map.is_empty());
         map.check();
     }
@@ -1085,8 +1126,8 @@ mod test_drain_filter {
     fn height_1_removing_one() {
         let pairs = (0..MIN_INSERTS_HEIGHT_1).map(|i| (i, i));
         for doomed in 0..MIN_INSERTS_HEIGHT_1 {
-            let mut map: BTreeMap<_, _> = pairs.clone().collect();
-            map.drain_filter(|i, _| *i == doomed);
+            let mut map = BTreeMap::from_iter(pairs.clone());
+            map.extract_if(.., |i, _| *i == doomed).for_each(drop);
             assert_eq!(map.len(), MIN_INSERTS_HEIGHT_1 - 1);
             map.check();
         }
@@ -1096,8 +1137,8 @@ mod test_drain_filter {
     fn height_1_keeping_one() {
         let pairs = (0..MIN_INSERTS_HEIGHT_1).map(|i| (i, i));
         for sacred in 0..MIN_INSERTS_HEIGHT_1 {
-            let mut map: BTreeMap<_, _> = pairs.clone().collect();
-            map.drain_filter(|i, _| *i != sacred);
+            let mut map = BTreeMap::from_iter(pairs.clone());
+            map.extract_if(.., |i, _| *i != sacred).for_each(drop);
             assert!(map.keys().copied().eq(sacred..=sacred));
             map.check();
         }
@@ -1107,8 +1148,8 @@ mod test_drain_filter {
     fn height_2_removing_one() {
         let pairs = (0..MIN_INSERTS_HEIGHT_2).map(|i| (i, i));
         for doomed in (0..MIN_INSERTS_HEIGHT_2).step_by(12) {
-            let mut map: BTreeMap<_, _> = pairs.clone().collect();
-            map.drain_filter(|i, _| *i == doomed);
+            let mut map = BTreeMap::from_iter(pairs.clone());
+            map.extract_if(.., |i, _| *i == doomed).for_each(drop);
             assert_eq!(map.len(), MIN_INSERTS_HEIGHT_2 - 1);
             map.check();
         }
@@ -1118,8 +1159,8 @@ mod test_drain_filter {
     fn height_2_keeping_one() {
         let pairs = (0..MIN_INSERTS_HEIGHT_2).map(|i| (i, i));
         for sacred in (0..MIN_INSERTS_HEIGHT_2).step_by(12) {
-            let mut map: BTreeMap<_, _> = pairs.clone().collect();
-            map.drain_filter(|i, _| *i != sacred);
+            let mut map = BTreeMap::from_iter(pairs.clone());
+            map.extract_if(.., |i, _| *i != sacred).for_each(drop);
             assert!(map.keys().copied().eq(sacred..=sacred));
             map.check();
         }
@@ -1128,13 +1169,14 @@ mod test_drain_filter {
     #[test]
     fn height_2_removing_all() {
         let pairs = (0..MIN_INSERTS_HEIGHT_2).map(|i| (i, i));
-        let mut map: BTreeMap<_, _> = pairs.collect();
-        map.drain_filter(|_, _| true);
+        let mut map = BTreeMap::from_iter(pairs);
+        map.extract_if(.., |_, _| true).for_each(drop);
         assert!(map.is_empty());
         map.check();
     }
 
     #[test]
+    #[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
     fn drop_panic_leak() {
         let a = CrashTestDummy::new(0);
         let b = CrashTestDummy::new(1);
@@ -1144,7 +1186,8 @@ mod test_drain_filter {
         map.insert(b.spawn(Panic::InDrop), ());
         map.insert(c.spawn(Panic::Never), ());
 
-        catch_unwind(move || drop(map.drain_filter(|dummy, _| dummy.query(true)))).unwrap_err();
+        catch_unwind(move || map.extract_if(.., |dummy, _| dummy.query(true)).for_each(drop))
+            .unwrap_err();
 
         assert_eq!(a.queried(), 1);
         assert_eq!(b.queried(), 1);
@@ -1155,6 +1198,7 @@ mod test_drain_filter {
     }
 
     #[test]
+    #[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
     fn pred_panic_leak() {
         let a = CrashTestDummy::new(0);
         let b = CrashTestDummy::new(1);
@@ -1164,8 +1208,10 @@ mod test_drain_filter {
         map.insert(b.spawn(Panic::InQuery), ());
         map.insert(c.spawn(Panic::InQuery), ());
 
-        catch_unwind(AssertUnwindSafe(|| drop(map.drain_filter(|dummy, _| dummy.query(true)))))
-            .unwrap_err();
+        catch_unwind(AssertUnwindSafe(|| {
+            map.extract_if(.., |dummy, _| dummy.query(true)).for_each(drop)
+        }))
+        .unwrap_err();
 
         assert_eq!(a.queried(), 1);
         assert_eq!(b.queried(), 1);
@@ -1181,6 +1227,7 @@ mod test_drain_filter {
 
     // Same as above, but attempt to use the iterator again after the panic in the predicate
     #[test]
+    #[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
     fn pred_panic_reuse() {
         let a = CrashTestDummy::new(0);
         let b = CrashTestDummy::new(1);
@@ -1191,9 +1238,9 @@ mod test_drain_filter {
         map.insert(c.spawn(Panic::InQuery), ());
 
         {
-            let mut it = map.drain_filter(|dummy, _| dummy.query(true));
+            let mut it = map.extract_if(.., |dummy, _| dummy.query(true));
             catch_unwind(AssertUnwindSafe(|| while it.next().is_some() {})).unwrap_err();
-            // Iterator behaviour after a panic is explicitly unspecified,
+            // Iterator behavior after a panic is explicitly unspecified,
             // so this is just the current implementation:
             let result = catch_unwind(AssertUnwindSafe(|| it.next()));
             assert!(matches!(result, Ok(None)));
@@ -1241,32 +1288,32 @@ fn test_borrow() {
 
     #[allow(dead_code)]
     fn get<T: Ord>(v: &BTreeMap<Box<T>, ()>, t: &T) {
-        v.get(t);
+        let _ = v.get(t);
     }
 
     #[allow(dead_code)]
     fn get_mut<T: Ord>(v: &mut BTreeMap<Box<T>, ()>, t: &T) {
-        v.get_mut(t);
+        let _ = v.get_mut(t);
     }
 
     #[allow(dead_code)]
     fn get_key_value<T: Ord>(v: &BTreeMap<Box<T>, ()>, t: &T) {
-        v.get_key_value(t);
+        let _ = v.get_key_value(t);
     }
 
     #[allow(dead_code)]
     fn contains_key<T: Ord>(v: &BTreeMap<Box<T>, ()>, t: &T) {
-        v.contains_key(t);
+        let _ = v.contains_key(t);
     }
 
     #[allow(dead_code)]
     fn range<T: Ord>(v: &BTreeMap<Box<T>, ()>, t: T) {
-        v.range(t..);
+        let _ = v.range(t..);
     }
 
     #[allow(dead_code)]
     fn range_mut<T: Ord>(v: &mut BTreeMap<Box<T>, ()>, t: T) {
-        v.range_mut(t..);
+        let _ = v.range_mut(t..);
     }
 
     #[allow(dead_code)]
@@ -1289,7 +1336,7 @@ fn test_borrow() {
 fn test_entry() {
     let xs = [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)];
 
-    let mut map: BTreeMap<_, _> = xs.iter().cloned().collect();
+    let mut map = BTreeMap::from(xs);
 
     // Existing key (insert)
     match map.entry(1) {
@@ -1417,18 +1464,19 @@ fn test_bad_zst() {
 #[test]
 fn test_clear() {
     let mut map = BTreeMap::new();
-    for &len in &[MIN_INSERTS_HEIGHT_1, MIN_INSERTS_HEIGHT_2, 0, NODE_CAPACITY] {
+    for &len in &[MIN_INSERTS_HEIGHT_1, MIN_INSERTS_HEIGHT_2, 0, node::CAPACITY] {
         for i in 0..len {
             map.insert(i, ());
         }
         assert_eq!(map.len(), len);
         map.clear();
         map.check();
-        assert!(map.is_empty());
+        assert_eq!(map.height(), None);
     }
 }
 
 #[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
 fn test_clear_drop_panic_leak() {
     let a = CrashTestDummy::new(0);
     let b = CrashTestDummy::new(1);
@@ -1487,7 +1535,7 @@ fn test_clone() {
     }
 
     // Test a tree with 2 semi-full levels and a tree with 3 levels.
-    map = (1..MIN_INSERTS_HEIGHT_2).map(|i| (i, i)).collect();
+    map = BTreeMap::from_iter((1..MIN_INSERTS_HEIGHT_2).map(|i| (i, i)));
     assert_eq!(map.len(), MIN_INSERTS_HEIGHT_2 - 1);
     assert_eq!(map, map.clone());
     map.insert(0, 0);
@@ -1496,33 +1544,39 @@ fn test_clone() {
     map.check();
 }
 
+fn test_clone_panic_leak(size: usize) {
+    for i in 0..size {
+        let dummies = Vec::from_iter((0..size).map(|id| CrashTestDummy::new(id)));
+        let map = BTreeMap::from_iter(dummies.iter().map(|dummy| {
+            let panic = if dummy.id == i { Panic::InClone } else { Panic::Never };
+            (dummy.spawn(panic), ())
+        }));
+
+        catch_unwind(|| map.clone()).unwrap_err();
+        for d in &dummies {
+            assert_eq!(d.cloned(), if d.id <= i { 1 } else { 0 }, "id={}/{}", d.id, i);
+            assert_eq!(d.dropped(), if d.id < i { 1 } else { 0 }, "id={}/{}", d.id, i);
+        }
+        assert_eq!(map.len(), size);
+
+        drop(map);
+        for d in &dummies {
+            assert_eq!(d.cloned(), if d.id <= i { 1 } else { 0 }, "id={}/{}", d.id, i);
+            assert_eq!(d.dropped(), if d.id < i { 2 } else { 1 }, "id={}/{}", d.id, i);
+        }
+    }
+}
+
 #[test]
-fn test_clone_panic_leak() {
-    let a = CrashTestDummy::new(0);
-    let b = CrashTestDummy::new(1);
-    let c = CrashTestDummy::new(2);
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
+fn test_clone_panic_leak_height_0() {
+    test_clone_panic_leak(3)
+}
 
-    let mut map = BTreeMap::new();
-    map.insert(a.spawn(Panic::Never), ());
-    map.insert(b.spawn(Panic::InClone), ());
-    map.insert(c.spawn(Panic::Never), ());
-
-    catch_unwind(|| map.clone()).unwrap_err();
-    assert_eq!(a.cloned(), 1);
-    assert_eq!(b.cloned(), 1);
-    assert_eq!(c.cloned(), 0);
-    assert_eq!(a.dropped(), 1);
-    assert_eq!(b.dropped(), 0);
-    assert_eq!(c.dropped(), 0);
-    assert_eq!(map.len(), 3);
-
-    drop(map);
-    assert_eq!(a.cloned(), 1);
-    assert_eq!(b.cloned(), 1);
-    assert_eq!(c.cloned(), 0);
-    assert_eq!(a.dropped(), 2);
-    assert_eq!(b.dropped(), 1);
-    assert_eq!(c.dropped(), 1);
+#[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
+fn test_clone_panic_leak_height_1() {
+    test_clone_panic_leak(MIN_INSERTS_HEIGHT_1)
 }
 
 #[test]
@@ -1551,7 +1605,7 @@ fn test_clone_from() {
 }
 
 #[allow(dead_code)]
-fn test_variance() {
+fn assert_covariance() {
     fn map_key<'new>(v: BTreeMap<&'static str, ()>) -> BTreeMap<&'new str, ()> {
         v
     }
@@ -1610,7 +1664,7 @@ fn test_variance() {
 }
 
 #[allow(dead_code)]
-fn test_sync() {
+fn assert_sync() {
     fn map<T: Sync>(v: &BTreeMap<T, T>) -> impl Sync + '_ {
         v
     }
@@ -1627,8 +1681,8 @@ fn test_sync() {
         v.into_values()
     }
 
-    fn drain_filter<T: Sync + Ord>(v: &mut BTreeMap<T, T>) -> impl Sync + '_ {
-        v.drain_filter(|_, _| false)
+    fn extract_if<T: Sync + Ord>(v: &mut BTreeMap<T, T>) -> impl Sync + '_ {
+        v.extract_if(.., |_, _| false)
     }
 
     fn iter<T: Sync>(v: &BTreeMap<T, T>) -> impl Sync + '_ {
@@ -1679,7 +1733,7 @@ fn test_sync() {
 }
 
 #[allow(dead_code)]
-fn test_send() {
+fn assert_send() {
     fn map<T: Send>(v: BTreeMap<T, T>) -> impl Send {
         v
     }
@@ -1696,8 +1750,8 @@ fn test_send() {
         v.into_values()
     }
 
-    fn drain_filter<T: Send + Ord>(v: &mut BTreeMap<T, T>) -> impl Send + '_ {
-        v.drain_filter(|_, _| false)
+    fn extract_if<T: Send + Ord>(v: &mut BTreeMap<T, T>) -> impl Send + '_ {
+        v.extract_if(.., |_, _| false)
     }
 
     fn iter<T: Send + Sync>(v: &BTreeMap<T, T>) -> impl Send + '_ {
@@ -1747,52 +1801,51 @@ fn test_send() {
     }
 }
 
-#[allow(dead_code)]
+#[test]
 fn test_ord_absence() {
     fn map<K>(mut map: BTreeMap<K, ()>) {
-        map.is_empty();
-        map.len();
+        let _ = map.is_empty();
+        let _ = map.len();
         map.clear();
-        map.iter();
-        map.iter_mut();
-        map.keys();
-        map.values();
-        map.values_mut();
+        let _ = map.iter();
+        let _ = map.iter_mut();
+        let _ = map.keys();
+        let _ = map.values();
+        let _ = map.values_mut();
         if true {
-            map.into_values();
+            let _ = map.into_values();
         } else if true {
-            map.into_iter();
+            let _ = map.into_iter();
         } else {
-            map.into_keys();
+            let _ = map.into_keys();
         }
     }
 
     fn map_debug<K: Debug>(mut map: BTreeMap<K, ()>) {
-        format!("{:?}", map);
-        format!("{:?}", map.iter());
-        format!("{:?}", map.iter_mut());
-        format!("{:?}", map.keys());
-        format!("{:?}", map.values());
-        format!("{:?}", map.values_mut());
+        let _ = format!("{map:?}");
+        let _ = format!("{:?}", map.iter());
+        let _ = format!("{:?}", map.iter_mut());
+        let _ = format!("{:?}", map.keys());
+        let _ = format!("{:?}", map.values());
+        let _ = format!("{:?}", map.values_mut());
         if true {
-            format!("{:?}", map.into_iter());
+            let _ = format!("{:?}", map.into_iter());
         } else if true {
-            format!("{:?}", map.into_keys());
+            let _ = format!("{:?}", map.into_keys());
         } else {
-            format!("{:?}", map.into_values());
+            let _ = format!("{:?}", map.into_values());
         }
     }
 
     fn map_clone<K: Clone>(mut map: BTreeMap<K, ()>) {
         map.clone_from(&map.clone());
     }
-}
 
-#[allow(dead_code)]
-fn test_const() {
-    const MAP: &'static BTreeMap<(), ()> = &BTreeMap::new();
-    const LEN: usize = MAP.len();
-    const IS_EMPTY: bool = MAP.is_empty();
+    #[derive(Debug, Clone)]
+    struct NonOrd;
+    map(BTreeMap::<NonOrd, _>::new());
+    map_debug(BTreeMap::<NonOrd, _>::new());
+    map_clone(BTreeMap::<NonOrd, _>::default());
 }
 
 #[test]
@@ -1800,7 +1853,7 @@ fn test_occupied_entry_key() {
     let mut a = BTreeMap::new();
     let key = "hello there";
     let value = "value goes here";
-    assert!(a.is_empty());
+    assert_eq!(a.height(), None);
     a.insert(key, value);
     assert_eq!(a.len(), 1);
     assert_eq!(a[key], value);
@@ -1820,9 +1873,9 @@ fn test_vacant_entry_key() {
     let key = "hello there";
     let value = "value goes here";
 
-    assert!(a.is_empty());
+    assert_eq!(a.height(), None);
     match a.entry(key) {
-        Occupied(_) => panic!(),
+        Occupied(_) => unreachable!(),
         Vacant(e) => {
             assert_eq!(key, *e.key());
             e.insert(value);
@@ -1830,6 +1883,36 @@ fn test_vacant_entry_key() {
     }
     assert_eq!(a.len(), 1);
     assert_eq!(a[key], value);
+    a.check();
+}
+
+#[test]
+fn test_vacant_entry_no_insert() {
+    let mut a = BTreeMap::<&str, ()>::new();
+    let key = "hello there";
+
+    // Non-allocated
+    assert_eq!(a.height(), None);
+    match a.entry(key) {
+        Occupied(_) => unreachable!(),
+        Vacant(e) => assert_eq!(key, *e.key()),
+    }
+    // Ensures the tree has no root.
+    assert_eq!(a.height(), None);
+    a.check();
+
+    // Allocated but still empty
+    a.insert(key, ());
+    a.remove(&key);
+    assert_eq!(a.height(), Some(0));
+    assert!(a.is_empty());
+    match a.entry(key) {
+        Occupied(_) => unreachable!(),
+        Vacant(e) => assert_eq!(key, *e.key()),
+    }
+    // Ensures the allocated root is not changed.
+    assert_eq!(a.height(), Some(0));
+    assert!(a.is_empty());
     a.check();
 }
 
@@ -1859,10 +1942,100 @@ fn test_first_last_entry() {
 }
 
 #[test]
+fn test_pop_first_last() {
+    let mut map = BTreeMap::new();
+    assert_eq!(map.pop_first(), None);
+    assert_eq!(map.pop_last(), None);
+
+    map.insert(1, 10);
+    map.insert(2, 20);
+    map.insert(3, 30);
+    map.insert(4, 40);
+
+    assert_eq!(map.len(), 4);
+
+    let (key, val) = map.pop_first().unwrap();
+    assert_eq!(key, 1);
+    assert_eq!(val, 10);
+    assert_eq!(map.len(), 3);
+
+    let (key, val) = map.pop_first().unwrap();
+    assert_eq!(key, 2);
+    assert_eq!(val, 20);
+    assert_eq!(map.len(), 2);
+    let (key, val) = map.pop_last().unwrap();
+    assert_eq!(key, 4);
+    assert_eq!(val, 40);
+    assert_eq!(map.len(), 1);
+
+    map.insert(5, 50);
+    map.insert(6, 60);
+    assert_eq!(map.len(), 3);
+
+    let (key, val) = map.pop_first().unwrap();
+    assert_eq!(key, 3);
+    assert_eq!(val, 30);
+    assert_eq!(map.len(), 2);
+
+    let (key, val) = map.pop_last().unwrap();
+    assert_eq!(key, 6);
+    assert_eq!(val, 60);
+    assert_eq!(map.len(), 1);
+
+    let (key, val) = map.pop_last().unwrap();
+    assert_eq!(key, 5);
+    assert_eq!(val, 50);
+    assert_eq!(map.len(), 0);
+
+    assert_eq!(map.pop_first(), None);
+    assert_eq!(map.pop_last(), None);
+
+    map.insert(7, 70);
+    map.insert(8, 80);
+
+    let (key, val) = map.pop_last().unwrap();
+    assert_eq!(key, 8);
+    assert_eq!(val, 80);
+    assert_eq!(map.len(), 1);
+
+    let (key, val) = map.pop_last().unwrap();
+    assert_eq!(key, 7);
+    assert_eq!(val, 70);
+    assert_eq!(map.len(), 0);
+
+    assert_eq!(map.pop_first(), None);
+    assert_eq!(map.pop_last(), None);
+}
+
+#[test]
+fn test_get_key_value() {
+    let mut map = BTreeMap::new();
+
+    assert!(map.is_empty());
+    assert_eq!(map.get_key_value(&1), None);
+    assert_eq!(map.get_key_value(&2), None);
+
+    map.insert(1, 10);
+    map.insert(2, 20);
+    map.insert(3, 30);
+
+    assert_eq!(map.len(), 3);
+    assert_eq!(map.get_key_value(&1), Some((&1, &10)));
+    assert_eq!(map.get_key_value(&3), Some((&3, &30)));
+    assert_eq!(map.get_key_value(&4), None);
+
+    map.remove(&3);
+
+    assert_eq!(map.len(), 2);
+    assert_eq!(map.get_key_value(&3), None);
+    assert_eq!(map.get_key_value(&2), Some((&2, &20)));
+}
+
+#[test]
 fn test_insert_into_full_height_0() {
-    let size = NODE_CAPACITY;
+    let size = node::CAPACITY;
     for pos in 0..=size {
-        let mut map: BTreeMap<_, _> = (0..size).map(|i| (i * 2 + 1, ())).collect();
+        let mut map = BTreeMap::from_iter((0..size).map(|i| (i * 2 + 1, ())));
         assert!(map.insert(pos * 2, ()).is_none());
         map.check();
     }
@@ -1870,18 +2043,33 @@ fn test_insert_into_full_height_0() {
 
 #[test]
 fn test_insert_into_full_height_1() {
-    let size = NODE_CAPACITY + 1 + NODE_CAPACITY;
+    let size = node::CAPACITY + 1 + node::CAPACITY;
     for pos in 0..=size {
-        let mut map: BTreeMap<_, _> = (0..size).map(|i| (i * 2 + 1, ())).collect();
+        let mut map = BTreeMap::from_iter((0..size).map(|i| (i * 2 + 1, ())));
         map.compact();
         let root_node = map.root.as_ref().unwrap().reborrow();
         assert_eq!(root_node.len(), 1);
-        assert_eq!(root_node.first_leaf_edge().into_node().len(), NODE_CAPACITY);
-        assert_eq!(root_node.last_leaf_edge().into_node().len(), NODE_CAPACITY);
+        assert_eq!(root_node.first_leaf_edge().into_node().len(), node::CAPACITY);
+        assert_eq!(root_node.last_leaf_edge().into_node().len(), node::CAPACITY);
 
         assert!(map.insert(pos * 2, ()).is_none());
         map.check();
     }
+}
+
+#[test]
+fn test_try_insert() {
+    let mut map = BTreeMap::new();
+
+    assert!(map.is_empty());
+
+    assert_eq!(map.try_insert(1, 10).unwrap(), &10);
+    assert_eq!(map.try_insert(2, 20).unwrap(), &20);
+
+    let err = map.try_insert(2, 200).unwrap_err();
+    assert_eq!(err.entry.key(), &2);
+    assert_eq!(err.entry.get(), &20);
+    assert_eq!(err.value, 200);
 }
 
 macro_rules! create_append_test {
@@ -1941,6 +2129,7 @@ create_append_test!(test_append_239, 239);
 create_append_test!(test_append_1700, 1700);
 
 #[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
 fn test_append_drop_leak() {
     let a = CrashTestDummy::new(0);
     let b = CrashTestDummy::new(1);
@@ -2018,7 +2207,7 @@ fn test_split_off_empty_left() {
 #[test]
 fn test_split_off_tiny_left_height_2() {
     let pairs = (0..MIN_INSERTS_HEIGHT_2).map(|i| (i, i));
-    let mut left: BTreeMap<_, _> = pairs.clone().collect();
+    let mut left = BTreeMap::from_iter(pairs.clone());
     let right = left.split_off(&1);
     left.check();
     right.check();
@@ -2034,7 +2223,7 @@ fn test_split_off_tiny_left_height_2() {
 fn test_split_off_tiny_right_height_2() {
     let pairs = (0..MIN_INSERTS_HEIGHT_2).map(|i| (i, i));
     let last = MIN_INSERTS_HEIGHT_2 - 1;
-    let mut left: BTreeMap<_, _> = pairs.clone().collect();
+    let mut left = BTreeMap::from_iter(pairs.clone());
     assert_eq!(*left.last_key_value().unwrap().0, last);
     let right = left.split_off(&last);
     left.check();
@@ -2048,7 +2237,7 @@ fn test_split_off_tiny_right_height_2() {
 #[test]
 fn test_split_off_halfway() {
     let mut rng = DeterministicRng::new();
-    for &len in &[NODE_CAPACITY, 25, 50, 75, 100] {
+    for &len in &[node::CAPACITY, 25, 50, 75, 100] {
         let mut data = Vec::from_iter((0..len).map(|_| (rng.next(), ())));
         // Insertion in non-ascending order creates some variation in node length.
         let mut map = BTreeMap::from_iter(data.iter().copied());
@@ -2082,6 +2271,7 @@ fn test_split_off_large_random_sorted() {
 }
 
 #[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
 fn test_into_iter_drop_leak_height_0() {
     let a = CrashTestDummy::new(0);
     let b = CrashTestDummy::new(1);
@@ -2105,16 +2295,63 @@ fn test_into_iter_drop_leak_height_0() {
 }
 
 #[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
+fn test_into_iter_drop_leak_kv_panic_in_key() {
+    let a_k = CrashTestDummy::new(0);
+    let a_v = CrashTestDummy::new(1);
+    let b_k = CrashTestDummy::new(2);
+    let b_v = CrashTestDummy::new(3);
+    let c_k = CrashTestDummy::new(4);
+    let c_v = CrashTestDummy::new(5);
+    let mut map = BTreeMap::new();
+    map.insert(a_k.spawn(Panic::Never), a_v.spawn(Panic::Never));
+    map.insert(b_k.spawn(Panic::InDrop), b_v.spawn(Panic::Never));
+    map.insert(c_k.spawn(Panic::Never), c_v.spawn(Panic::Never));
+
+    catch_unwind(move || drop(map.into_iter())).unwrap_err();
+
+    assert_eq!(a_k.dropped(), 1);
+    assert_eq!(a_v.dropped(), 1);
+    assert_eq!(b_k.dropped(), 1);
+    assert_eq!(b_v.dropped(), 1);
+    assert_eq!(c_k.dropped(), 1);
+    assert_eq!(c_v.dropped(), 1);
+}
+
+#[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
+fn test_into_iter_drop_leak_kv_panic_in_val() {
+    let a_k = CrashTestDummy::new(0);
+    let a_v = CrashTestDummy::new(1);
+    let b_k = CrashTestDummy::new(2);
+    let b_v = CrashTestDummy::new(3);
+    let c_k = CrashTestDummy::new(4);
+    let c_v = CrashTestDummy::new(5);
+    let mut map = BTreeMap::new();
+    map.insert(a_k.spawn(Panic::Never), a_v.spawn(Panic::Never));
+    map.insert(b_k.spawn(Panic::Never), b_v.spawn(Panic::InDrop));
+    map.insert(c_k.spawn(Panic::Never), c_v.spawn(Panic::Never));
+
+    catch_unwind(move || drop(map.into_iter())).unwrap_err();
+
+    assert_eq!(a_k.dropped(), 1);
+    assert_eq!(a_v.dropped(), 1);
+    assert_eq!(b_k.dropped(), 1);
+    assert_eq!(b_v.dropped(), 1);
+    assert_eq!(c_k.dropped(), 1);
+    assert_eq!(c_v.dropped(), 1);
+}
+
+#[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
 fn test_into_iter_drop_leak_height_1() {
     let size = MIN_INSERTS_HEIGHT_1;
     for panic_point in vec![0, 1, size - 2, size - 1] {
-        let dummies: Vec<_> = (0..size).map(|i| CrashTestDummy::new(i)).collect();
-        let map: BTreeMap<_, _> = (0..size)
-            .map(|i| {
-                let panic = if i == panic_point { Panic::InDrop } else { Panic::Never };
-                (dummies[i].spawn(Panic::Never), dummies[i].spawn(panic))
-            })
-            .collect();
+        let dummies = Vec::from_iter((0..size).map(|i| CrashTestDummy::new(i)));
+        let map = BTreeMap::from_iter((0..size).map(|i| {
+            let panic = if i == panic_point { Panic::InDrop } else { Panic::Never };
+            (dummies[i].spawn(Panic::Never), dummies[i].spawn(panic))
+        }));
         catch_unwind(move || drop(map.into_iter())).unwrap_err();
         for i in 0..size {
             assert_eq!(dummies[i].dropped(), 2);
@@ -2124,9 +2361,8 @@ fn test_into_iter_drop_leak_height_1() {
 
 #[test]
 fn test_into_keys() {
-    let vec = vec![(1, 'a'), (2, 'b'), (3, 'c')];
-    let map: BTreeMap<_, _> = vec.into_iter().collect();
-    let keys: Vec<_> = map.into_keys().collect();
+    let map = BTreeMap::from([(1, 'a'), (2, 'b'), (3, 'c')]);
+    let keys = Vec::from_iter(map.into_keys());
 
     assert_eq!(keys.len(), 3);
     assert!(keys.contains(&1));
@@ -2136,9 +2372,8 @@ fn test_into_keys() {
 
 #[test]
 fn test_into_values() {
-    let vec = vec![(1, 'a'), (2, 'b'), (3, 'c')];
-    let map: BTreeMap<_, _> = vec.into_iter().collect();
-    let values: Vec<_> = map.into_values().collect();
+    let map = BTreeMap::from([(1, 'a'), (2, 'b'), (3, 'c')]);
+    let values = Vec::from_iter(map.into_values());
 
     assert_eq!(values.len(), 3);
     assert!(values.contains(&'a'));
@@ -2174,4 +2409,181 @@ fn test_insert_remove_intertwined_ord_chaos() {
         gov.flip();
     }
     map.check_invariants();
+}
+
+#[test]
+fn from_array() {
+    let map = BTreeMap::from([(1, 2), (3, 4)]);
+    let unordered_duplicates = BTreeMap::from([(3, 4), (1, 2), (1, 2)]);
+    assert_eq!(map, unordered_duplicates);
+}
+
+#[test]
+fn test_cursor() {
+    let map = BTreeMap::from([(1, 'a'), (2, 'b'), (3, 'c')]);
+
+    let mut cur = map.lower_bound(Bound::Unbounded);
+    assert_eq!(cur.peek_next(), Some((&1, &'a')));
+    assert_eq!(cur.peek_prev(), None);
+    assert_eq!(cur.prev(), None);
+    assert_eq!(cur.next(), Some((&1, &'a')));
+
+    assert_eq!(cur.next(), Some((&2, &'b')));
+
+    assert_eq!(cur.peek_next(), Some((&3, &'c')));
+    assert_eq!(cur.prev(), Some((&2, &'b')));
+    assert_eq!(cur.peek_prev(), Some((&1, &'a')));
+
+    let mut cur = map.upper_bound(Bound::Excluded(&1));
+    assert_eq!(cur.peek_prev(), None);
+    assert_eq!(cur.next(), Some((&1, &'a')));
+    assert_eq!(cur.prev(), Some((&1, &'a')));
+}
+
+#[test]
+fn test_cursor_mut() {
+    let mut map = BTreeMap::from([(1, 'a'), (3, 'c'), (5, 'e')]);
+    let mut cur = map.lower_bound_mut(Bound::Excluded(&3));
+    assert_eq!(cur.peek_next(), Some((&5, &mut 'e')));
+    assert_eq!(cur.peek_prev(), Some((&3, &mut 'c')));
+
+    cur.insert_before(4, 'd').unwrap();
+    assert_eq!(cur.peek_next(), Some((&5, &mut 'e')));
+    assert_eq!(cur.peek_prev(), Some((&4, &mut 'd')));
+
+    assert_eq!(cur.next(), Some((&5, &mut 'e')));
+    assert_eq!(cur.peek_next(), None);
+    assert_eq!(cur.peek_prev(), Some((&5, &mut 'e')));
+    cur.insert_before(6, 'f').unwrap();
+    assert_eq!(cur.peek_next(), None);
+    assert_eq!(cur.peek_prev(), Some((&6, &mut 'f')));
+    assert_eq!(cur.remove_prev(), Some((6, 'f')));
+    assert_eq!(cur.remove_prev(), Some((5, 'e')));
+    assert_eq!(cur.remove_next(), None);
+    assert_eq!(map, BTreeMap::from([(1, 'a'), (3, 'c'), (4, 'd')]));
+
+    let mut cur = map.upper_bound_mut(Bound::Included(&5));
+    assert_eq!(cur.peek_next(), None);
+    assert_eq!(cur.prev(), Some((&4, &mut 'd')));
+    assert_eq!(cur.peek_next(), Some((&4, &mut 'd')));
+    assert_eq!(cur.peek_prev(), Some((&3, &mut 'c')));
+    assert_eq!(cur.remove_next(), Some((4, 'd')));
+    assert_eq!(map, BTreeMap::from([(1, 'a'), (3, 'c')]));
+}
+
+#[test]
+fn test_cursor_mut_key() {
+    let mut map = BTreeMap::from([(1, 'a'), (3, 'c'), (5, 'e')]);
+    let mut cur = unsafe { map.lower_bound_mut(Bound::Excluded(&3)).with_mutable_key() };
+    assert_eq!(cur.peek_next(), Some((&mut 5, &mut 'e')));
+    assert_eq!(cur.peek_prev(), Some((&mut 3, &mut 'c')));
+
+    cur.insert_before(4, 'd').unwrap();
+    assert_eq!(cur.peek_next(), Some((&mut 5, &mut 'e')));
+    assert_eq!(cur.peek_prev(), Some((&mut 4, &mut 'd')));
+
+    assert_eq!(cur.next(), Some((&mut 5, &mut 'e')));
+    assert_eq!(cur.peek_next(), None);
+    assert_eq!(cur.peek_prev(), Some((&mut 5, &mut 'e')));
+    cur.insert_before(6, 'f').unwrap();
+    assert_eq!(cur.peek_next(), None);
+    assert_eq!(cur.peek_prev(), Some((&mut 6, &mut 'f')));
+    assert_eq!(cur.remove_prev(), Some((6, 'f')));
+    assert_eq!(cur.remove_prev(), Some((5, 'e')));
+    assert_eq!(cur.remove_next(), None);
+    assert_eq!(map, BTreeMap::from([(1, 'a'), (3, 'c'), (4, 'd')]));
+
+    let mut cur = unsafe { map.upper_bound_mut(Bound::Included(&5)).with_mutable_key() };
+    assert_eq!(cur.peek_next(), None);
+    assert_eq!(cur.prev(), Some((&mut 4, &mut 'd')));
+    assert_eq!(cur.peek_next(), Some((&mut 4, &mut 'd')));
+    assert_eq!(cur.peek_prev(), Some((&mut 3, &mut 'c')));
+    assert_eq!(cur.remove_next(), Some((4, 'd')));
+    assert_eq!(map, BTreeMap::from([(1, 'a'), (3, 'c')]));
+}
+
+#[test]
+fn test_cursor_empty() {
+    let mut map = BTreeMap::new();
+    let mut cur = map.lower_bound_mut(Bound::Excluded(&3));
+    assert_eq!(cur.peek_next(), None);
+    assert_eq!(cur.peek_prev(), None);
+    cur.insert_after(0, 0).unwrap();
+    assert_eq!(cur.peek_next(), Some((&0, &mut 0)));
+    assert_eq!(cur.peek_prev(), None);
+    assert_eq!(map, BTreeMap::from([(0, 0)]));
+}
+
+#[test]
+fn test_cursor_mut_insert_before_1() {
+    let mut map = BTreeMap::from([(1, 'a'), (2, 'b'), (3, 'c')]);
+    let mut cur = map.upper_bound_mut(Bound::Included(&2));
+    cur.insert_before(0, 'd').unwrap_err();
+}
+
+#[test]
+fn test_cursor_mut_insert_before_2() {
+    let mut map = BTreeMap::from([(1, 'a'), (2, 'b'), (3, 'c')]);
+    let mut cur = map.upper_bound_mut(Bound::Included(&2));
+    cur.insert_before(1, 'd').unwrap_err();
+}
+
+#[test]
+fn test_cursor_mut_insert_before_3() {
+    let mut map = BTreeMap::from([(1, 'a'), (2, 'b'), (3, 'c')]);
+    let mut cur = map.upper_bound_mut(Bound::Included(&2));
+    cur.insert_before(2, 'd').unwrap_err();
+}
+
+#[test]
+fn test_cursor_mut_insert_before_4() {
+    let mut map = BTreeMap::from([(1, 'a'), (2, 'b'), (3, 'c')]);
+    let mut cur = map.upper_bound_mut(Bound::Included(&2));
+    cur.insert_before(3, 'd').unwrap_err();
+}
+
+#[test]
+fn test_cursor_mut_insert_after_1() {
+    let mut map = BTreeMap::from([(1, 'a'), (2, 'b'), (3, 'c')]);
+    let mut cur = map.upper_bound_mut(Bound::Included(&2));
+    cur.insert_after(1, 'd').unwrap_err();
+}
+
+#[test]
+fn test_cursor_mut_insert_after_2() {
+    let mut map = BTreeMap::from([(1, 'a'), (2, 'b'), (3, 'c')]);
+    let mut cur = map.upper_bound_mut(Bound::Included(&2));
+    cur.insert_after(2, 'd').unwrap_err();
+}
+
+#[test]
+fn test_cursor_mut_insert_after_3() {
+    let mut map = BTreeMap::from([(1, 'a'), (2, 'b'), (3, 'c')]);
+    let mut cur = map.upper_bound_mut(Bound::Included(&2));
+    cur.insert_after(3, 'd').unwrap_err();
+}
+
+#[test]
+fn test_cursor_mut_insert_after_4() {
+    let mut map = BTreeMap::from([(1, 'a'), (2, 'b'), (3, 'c')]);
+    let mut cur = map.upper_bound_mut(Bound::Included(&2));
+    cur.insert_after(4, 'd').unwrap_err();
+}
+
+#[test]
+fn cursor_peek_prev_agrees_with_cursor_mut() {
+    let mut map = BTreeMap::from([(1, 1), (2, 2), (3, 3)]);
+
+    let cursor = map.lower_bound(Bound::Excluded(&3));
+    assert!(cursor.peek_next().is_none());
+
+    let prev = cursor.peek_prev();
+    assert_matches!(prev, Some((&3, _)));
+
+    // Shadow names so the two parts of this test match.
+    let mut cursor = map.lower_bound_mut(Bound::Excluded(&3));
+    assert!(cursor.peek_next().is_none());
+
+    let prev = cursor.peek_prev();
+    assert_matches!(prev, Some((&3, _)));
 }

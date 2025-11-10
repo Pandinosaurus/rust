@@ -1,4 +1,5 @@
-#![deny(clippy::internal)]
+#![deny(clippy::default_lint)]
+#![allow(clippy::missing_clippy_version_attribute)]
 #![feature(rustc_private)]
 
 #[macro_use]
@@ -15,6 +16,7 @@ declare_tool_lint! {
 }
 
 declare_tool_lint! {
+//~^ default_lint
     pub clippy::TEST_LINT_DEFAULT,
     Warn,
     "default lint description",

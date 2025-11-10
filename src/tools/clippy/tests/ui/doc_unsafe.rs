@@ -1,10 +1,13 @@
-// aux-build:doc_unsafe_macros.rs
+//@aux-build:proc_macros.rs
 
-#[macro_use]
-extern crate doc_unsafe_macros;
+#![allow(clippy::let_unit_value, clippy::needless_pass_by_ref_mut)]
+
+extern crate proc_macros;
+use proc_macros::external;
 
 /// This is not sufficiently documented
 pub unsafe fn destroy_the_planet() {
+    //~^ missing_safety_doc
     unimplemented!();
 }
 
@@ -28,22 +31,34 @@ mod private_mod {
     }
 
     pub unsafe fn republished() {
+        //~^ missing_safety_doc
         unimplemented!();
     }
 }
 
 pub use private_mod::republished;
 
-pub trait UnsafeTrait {
+pub trait SafeTraitUnsafeMethods {
     unsafe fn woefully_underdocumented(self);
+    //~^ missing_safety_doc
 
     /// # Safety
     unsafe fn at_least_somewhat_documented(self);
 }
 
+pub unsafe trait UnsafeTrait {
+    //~^ missing_safety_doc
+    fn method();
+}
+
+/// # Safety
+pub unsafe trait DocumentedUnsafeTrait {
+    fn method2();
+}
+
 pub struct Struct;
 
-impl UnsafeTrait for Struct {
+impl SafeTraitUnsafeMethods for Struct {
     unsafe fn woefully_underdocumented(self) {
         // all is well
     }
@@ -53,8 +68,17 @@ impl UnsafeTrait for Struct {
     }
 }
 
+unsafe impl UnsafeTrait for Struct {
+    fn method() {}
+}
+
+unsafe impl DocumentedUnsafeTrait for Struct {
+    fn method2() {}
+}
+
 impl Struct {
     pub unsafe fn more_undocumented_unsafe() -> Self {
+        //~^ missing_safety_doc
         unimplemented!();
     }
 
@@ -71,6 +95,7 @@ impl Struct {
 macro_rules! very_unsafe {
     () => {
         pub unsafe fn whee() {
+            //~^ missing_safety_doc
             unimplemented!()
         }
 
@@ -78,7 +103,7 @@ macro_rules! very_unsafe {
         ///
         /// Please keep the seat belt fastened
         pub unsafe fn drive() {
-            whee()
+            unsafe { whee() }
         }
     };
 }
@@ -86,7 +111,11 @@ macro_rules! very_unsafe {
 very_unsafe!();
 
 // we don't lint code from external macros
-undocd_unsafe!();
+external! {
+    pub unsafe fn oy_vey() {
+        unimplemented!();
+    }
+}
 
 fn main() {
     unsafe {
@@ -97,4 +126,19 @@ fn main() {
         private_mod::only_crate_wide_accessible();
         drive();
     }
+}
+
+// do not lint if any parent has `#[doc(hidden)]` attribute
+// see #7347
+#[doc(hidden)]
+pub mod __macro {
+    pub struct T;
+    impl T {
+        pub unsafe fn f() {}
+    }
+}
+
+/// # Implementation safety
+pub unsafe trait DocumentedUnsafeTraitWithImplementationHeader {
+    fn method();
 }

@@ -1,4 +1,5 @@
 use crate::iter::{FusedIterator, TrustedLen};
+use crate::num::NonZero;
 use crate::ops::Try;
 
 /// A double-ended iterator with the direction inverted.
@@ -19,6 +20,25 @@ impl<T> Rev<T> {
     pub(in crate::iter) fn new(iter: T) -> Rev<T> {
         Rev { iter }
     }
+
+    /// Consumes the `Rev`, returning the inner iterator.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// #![feature(rev_into_inner)]
+    ///
+    /// let s = "foobar";
+    /// let mut rev = s.chars().rev();
+    /// assert_eq!(rev.next(), Some('r'));
+    /// assert_eq!(rev.next(), Some('a'));
+    /// assert_eq!(rev.next(), Some('b'));
+    /// assert_eq!(rev.into_inner().collect::<String>(), "foo");
+    /// ```
+    #[unstable(feature = "rev_into_inner", issue = "144277")]
+    pub fn into_inner(self) -> T {
+        self.iter
+    }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -38,7 +58,7 @@ where
     }
 
     #[inline]
-    fn advance_by(&mut self, n: usize) -> Result<(), usize> {
+    fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
         self.iter.advance_back_by(n)
     }
 
@@ -51,7 +71,7 @@ where
     where
         Self: Sized,
         F: FnMut(B, Self::Item) -> R,
-        R: Try<Ok = B>,
+        R: Try<Output = B>,
     {
         self.iter.try_rfold(init, f)
     }
@@ -83,7 +103,7 @@ where
     }
 
     #[inline]
-    fn advance_back_by(&mut self, n: usize) -> Result<(), usize> {
+    fn advance_back_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
         self.iter.advance_by(n)
     }
 
@@ -96,7 +116,7 @@ where
     where
         Self: Sized,
         F: FnMut(B, Self::Item) -> R,
-        R: Try<Ok = B>,
+        R: Try<Output = B>,
     {
         self.iter.try_fold(init, f)
     }
@@ -135,3 +155,17 @@ impl<I> FusedIterator for Rev<I> where I: FusedIterator + DoubleEndedIterator {}
 
 #[unstable(feature = "trusted_len", issue = "37572")]
 unsafe impl<I> TrustedLen for Rev<I> where I: TrustedLen + DoubleEndedIterator {}
+
+#[stable(feature = "default_iters", since = "1.70.0")]
+impl<I: Default> Default for Rev<I> {
+    /// Creates a `Rev` iterator from the default value of `I`
+    /// ```
+    /// # use core::slice;
+    /// # use core::iter::Rev;
+    /// let iter: Rev<slice::Iter<'_, u8>> = Default::default();
+    /// assert_eq!(iter.len(), 0);
+    /// ```
+    fn default() -> Self {
+        Rev::new(Default::default())
+    }
+}

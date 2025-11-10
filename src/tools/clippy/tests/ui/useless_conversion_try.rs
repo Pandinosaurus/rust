@@ -1,10 +1,16 @@
 #![deny(clippy::useless_conversion)]
-
-use std::convert::{TryFrom, TryInto};
+#![allow(
+    clippy::needless_ifs,
+    clippy::unnecessary_fallible_conversions,
+    clippy::manual_unwrap_or_default
+)]
 
 fn test_generic<T: Copy>(val: T) -> T {
     let _ = T::try_from(val).unwrap();
+    //~^ useless_conversion
+
     val.try_into().unwrap()
+    //~^ useless_conversion
 }
 
 fn test_generic2<T: Copy + Into<i32> + Into<U>, U: From<T>>(val: T) {
@@ -27,14 +33,27 @@ fn main() {
         let _: String = "foo".try_into().unwrap();
     }
     let _: String = "foo".to_string().try_into().unwrap();
+    //~^ useless_conversion
+
     let _: String = TryFrom::try_from("foo".to_string()).unwrap();
+    //~^ useless_conversion
+
     let _ = String::try_from("foo".to_string()).unwrap();
+    //~^ useless_conversion
+
     let _ = String::try_from(format!("A: {:04}", 123)).unwrap();
+    //~^ useless_conversion
+
     let _: String = format!("Hello {}", "world").try_into().unwrap();
-    let _: String = "".to_owned().try_into().unwrap();
+    //~^ useless_conversion
+
+    let _: String = String::new().try_into().unwrap();
+    //~^ useless_conversion
+
     let _: String = match String::from("_").try_into() {
+        //~^ useless_conversion
         Ok(a) => a,
-        Err(_) => "".into(),
+        Err(_) => String::new(),
     };
     // FIXME this is a false negative
     #[allow(clippy::cmp_owned)]

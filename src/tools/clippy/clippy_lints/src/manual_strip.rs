@@ -1,66 +1,62 @@
-use crate::consts::{constant, Constant};
-use clippy_utils::diagnostics::{multispan_sugg, span_lint_and_then};
-use clippy_utils::source::snippet;
+use clippy_config::Conf;
+use clippy_utils::consts::{ConstEvalCtxt, Constant};
+use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::msrvs::{self, Msrv};
+use clippy_utils::source::snippet_with_applicability;
 use clippy_utils::usage::mutated_variables;
-use clippy_utils::{eq_expr_value, higher, match_def_path, meets_msrv, paths};
-use if_chain::if_chain;
+use clippy_utils::{eq_expr_value, higher};
+use rustc_ast::BindingMode;
 use rustc_ast::ast::LitKind;
+use rustc_data_structures::fx::FxHashMap;
+use rustc_errors::Applicability;
 use rustc_hir::def::Res;
-use rustc_hir::intravisit::{walk_expr, NestedVisitorMap, Visitor};
-use rustc_hir::BinOpKind;
-use rustc_hir::{BorrowKind, Expr, ExprKind};
-use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_middle::hir::map::Map;
+use rustc_hir::intravisit::{Visitor, walk_expr, walk_pat};
+use rustc_hir::{BinOpKind, BorrowKind, Expr, ExprKind, Node, PatKind};
+use rustc_lint::{LateContext, LateLintPass, LintContext as _};
 use rustc_middle::ty;
-use rustc_semver::RustcVersion;
-use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_session::impl_lint_pass;
 use rustc_span::source_map::Spanned;
-use rustc_span::Span;
-
-const MANUAL_STRIP_MSRV: RustcVersion = RustcVersion::new(1, 45, 0);
+use rustc_span::{Symbol, SyntaxContext, sym};
+use std::iter;
 
 declare_clippy_lint! {
-    /// **What it does:**
+    /// ### What it does
     /// Suggests using `strip_{prefix,suffix}` over `str::{starts,ends}_with` and slicing using
     /// the pattern's length.
     ///
-    /// **Why is this bad?**
+    /// ### Why is this bad?
     /// Using `str:strip_{prefix,suffix}` is safer and may have better performance as there is no
     /// slicing which may panic and the compiler does not need to insert this panic code. It is
     /// also sometimes more readable as it removes the need for duplicating or storing the pattern
     /// used by `str::{starts,ends}_with` and in the slicing.
     ///
-    /// **Known problems:**
-    /// None.
-    ///
-    /// **Example:**
-    ///
-    /// ```rust
+    /// ### Example
+    /// ```no_run
     /// let s = "hello, world!";
     /// if s.starts_with("hello, ") {
     ///     assert_eq!(s["hello, ".len()..].to_uppercase(), "WORLD!");
     /// }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// let s = "hello, world!";
     /// if let Some(end) = s.strip_prefix("hello, ") {
     ///     assert_eq!(end.to_uppercase(), "WORLD!");
     /// }
     /// ```
+    #[clippy::version = "1.48.0"]
     pub MANUAL_STRIP,
     complexity,
     "suggests using `strip_{prefix,suffix}` over `str::{starts,ends}_with` and slicing"
 }
 
 pub struct ManualStrip {
-    msrv: Option<RustcVersion>,
+    msrv: Msrv,
 }
 
 impl ManualStrip {
-    #[must_use]
-    pub fn new(msrv: Option<RustcVersion>) -> Self {
-        Self { msrv }
+    pub fn new(conf: &'static Conf) -> Self {
+        Self { msrv: conf.msrv }
     }
 }
 
@@ -74,84 +70,104 @@ enum StripKind {
 
 impl<'tcx> LateLintPass<'tcx> for ManualStrip {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
-        if !meets_msrv(self.msrv.as_ref(), &MANUAL_STRIP_MSRV) {
-            return;
-        }
+        if let Some(higher::If { cond, then, .. }) = higher::If::hir(expr)
+            && let ExprKind::MethodCall(_, target_arg, [pattern], _) = cond.kind
+            && let ExprKind::Path(target_path) = &target_arg.kind
+            && let Some(method_def_id) = cx.typeck_results().type_dependent_def_id(cond.hir_id)
+        {
+            let strip_kind = match cx.tcx.get_diagnostic_name(method_def_id) {
+                Some(sym::str_starts_with) => StripKind::Prefix,
+                Some(sym::str_ends_with) => StripKind::Suffix,
+                _ => return,
+            };
+            let target_res = cx.qpath_res(target_path, target_arg.hir_id);
+            if target_res == Res::Err {
+                return;
+            }
 
-        if_chain! {
-            if let ExprKind::If(cond, then, _) = &expr.kind;
-            if let ExprKind::MethodCall(_, _, [target_arg, pattern], _) = cond.kind;
-            if let Some(method_def_id) = cx.typeck_results().type_dependent_def_id(cond.hir_id);
-            if let ExprKind::Path(target_path) = &target_arg.kind;
-            then {
-                let strip_kind = if match_def_path(cx, method_def_id, &paths::STR_STARTS_WITH) {
-                    StripKind::Prefix
-                } else if match_def_path(cx, method_def_id, &paths::STR_ENDS_WITH) {
-                    StripKind::Suffix
+            if let Res::Local(hir_id) = target_res
+                && let Some(used_mutably) = mutated_variables(then, cx)
+                && used_mutably.contains(&hir_id)
+            {
+                return;
+            }
+
+            let (strippings, bindings) = find_stripping(cx, strip_kind, target_res, pattern, then, expr.span.ctxt());
+            if !strippings.is_empty() && self.msrv.meets(cx, msrvs::STR_STRIP_PREFIX) {
+                let kind_word = match strip_kind {
+                    StripKind::Prefix => "prefix",
+                    StripKind::Suffix => "suffix",
+                };
+
+                let test_span = expr.span.until(then.span);
+
+                // If the first use is a simple `let` statement, reuse its identifier in the `if let Some(…)` and
+                // remove the `let` statement as long as the identifier is never bound again within the lexical
+                // scope of interest.
+                let (ident_name, let_stmt_span, skip, mut app) = if let Node::LetStmt(let_stmt) =
+                    cx.tcx.parent_hir_node(strippings[0].hir_id)
+                    && let PatKind::Binding(BindingMode::NONE, _, ident, None) = &let_stmt.pat.kind
+                    && bindings.get(&ident.name) == Some(&1)
+                {
+                    (
+                        ident.name.as_str(),
+                        Some(cx.sess().source_map().span_extend_while_whitespace(let_stmt.span)),
+                        1,
+                        Applicability::MachineApplicable,
+                    )
                 } else {
-                    return;
-                };
-                let target_res = cx.qpath_res(&target_path, target_arg.hir_id);
-                if target_res == Res::Err {
-                    return;
+                    ("<stripped>", None, 0, Applicability::HasPlaceholders)
                 };
 
-                if_chain! {
-                    if let Res::Local(hir_id) = target_res;
-                    if let Some(used_mutably) = mutated_variables(then, cx);
-                    if used_mutably.contains(&hir_id);
-                    then {
-                        return;
-                    }
-                }
-
-                let strippings = find_stripping(cx, strip_kind, target_res, pattern, then);
-                if !strippings.is_empty() {
-
-                    let kind_word = match strip_kind {
-                        StripKind::Prefix => "prefix",
-                        StripKind::Suffix => "suffix",
-                    };
-
-                    let test_span = expr.span.until(then.span);
-                    span_lint_and_then(cx, MANUAL_STRIP, strippings[0], &format!("stripping a {} manually", kind_word), |diag| {
-                        diag.span_note(test_span, &format!("the {} was tested here", kind_word));
-                        multispan_sugg(
-                            diag,
-                            &format!("try using the `strip_{}` method", kind_word),
-                            vec![(test_span,
-                                  format!("if let Some(<stripped>) = {}.strip_{}({}) ",
-                                          snippet(cx, target_arg.span, ".."),
-                                          kind_word,
-                                          snippet(cx, pattern.span, "..")))]
-                            .into_iter().chain(strippings.into_iter().map(|span| (span, "<stripped>".into()))),
-                        )
-                    });
-                }
+                span_lint_and_then(
+                    cx,
+                    MANUAL_STRIP,
+                    strippings[0].span,
+                    format!("stripping a {kind_word} manually"),
+                    |diag| {
+                        diag.span_note(test_span, format!("the {kind_word} was tested here"));
+                        diag.multipart_suggestion(
+                            format!("try using the `strip_{kind_word}` method"),
+                            iter::once((
+                                test_span,
+                                format!(
+                                    "if let Some({ident_name}) = {}.strip_{kind_word}({}) ",
+                                    snippet_with_applicability(cx, target_arg.span, "_", &mut app),
+                                    snippet_with_applicability(cx, pattern.span, "_", &mut app)
+                                ),
+                            ))
+                            .chain(let_stmt_span.map(|span| (span, String::new())))
+                            .chain(
+                                strippings
+                                    .into_iter()
+                                    .skip(skip)
+                                    .map(|expr| (expr.span, ident_name.into())),
+                            )
+                            .collect(),
+                            app,
+                        );
+                    },
+                );
             }
         }
     }
-
-    extract_msrv_attr!(LateContext);
 }
 
 // Returns `Some(arg)` if `expr` matches `arg.len()` and `None` otherwise.
 fn len_arg<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) -> Option<&'tcx Expr<'tcx>> {
-    if_chain! {
-        if let ExprKind::MethodCall(_, _, [arg], _) = expr.kind;
-        if let Some(method_def_id) = cx.typeck_results().type_dependent_def_id(expr.hir_id);
-        if match_def_path(cx, method_def_id, &paths::STR_LEN);
-        then {
-            Some(arg)
-        } else {
-            None
-        }
+    if let ExprKind::MethodCall(_, arg, [], _) = expr.kind
+        && let Some(method_def_id) = cx.typeck_results().type_dependent_def_id(expr.hir_id)
+        && cx.tcx.is_diagnostic_item(sym::str_len, method_def_id)
+    {
+        Some(arg)
+    } else {
+        None
     }
 }
 
 // Returns the length of the `expr` if it's a constant string or char.
-fn constant_length(cx: &LateContext<'_>, expr: &Expr<'_>) -> Option<u128> {
-    let (value, _) = constant(cx, cx.typeck_results(), expr)?;
+fn constant_length(cx: &LateContext<'_>, expr: &Expr<'_>, ctxt: SyntaxContext) -> Option<u128> {
+    let value = ConstEvalCtxt::new(cx).eval_local(expr, ctxt)?;
     match value {
         Constant::Str(value) => Some(value.len() as u128),
         Constant::Char(value) => Some(value.len_utf8() as u128),
@@ -160,21 +176,26 @@ fn constant_length(cx: &LateContext<'_>, expr: &Expr<'_>) -> Option<u128> {
 }
 
 // Tests if `expr` equals the length of the pattern.
-fn eq_pattern_length<'tcx>(cx: &LateContext<'tcx>, pattern: &Expr<'_>, expr: &'tcx Expr<'_>) -> bool {
+fn eq_pattern_length<'tcx>(
+    cx: &LateContext<'tcx>,
+    pattern: &Expr<'_>,
+    expr: &'tcx Expr<'_>,
+    ctxt: SyntaxContext,
+) -> bool {
     if let ExprKind::Lit(Spanned {
         node: LitKind::Int(n, _),
         ..
     }) = expr.kind
     {
-        constant_length(cx, pattern).map_or(false, |length| length == n)
+        constant_length(cx, pattern, ctxt).is_some_and(|length| n == length)
     } else {
-        len_arg(cx, expr).map_or(false, |arg| eq_expr_value(cx, pattern, arg))
+        len_arg(cx, expr).is_some_and(|arg| eq_expr_value(cx, pattern, arg))
     }
 }
 
 // Tests if `expr` is a `&str`.
 fn is_ref_str(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
-    match cx.typeck_results().expr_ty_adjusted(&expr).kind() {
+    match cx.typeck_results().expr_ty_adjusted(expr).kind() {
         ty::Ref(_, ty, _) => ty.is_str(),
         _ => false,
     }
@@ -189,65 +210,73 @@ fn peel_ref<'a>(expr: &'a Expr<'_>) -> &'a Expr<'a> {
     }
 }
 
-// Find expressions where `target` is stripped using the length of `pattern`.
-// We'll suggest replacing these expressions with the result of the `strip_{prefix,suffix}`
-// method.
+/// Find expressions where `target` is stripped using the length of `pattern`.
+/// We'll suggest replacing these expressions with the result of the `strip_{prefix,suffix}`
+/// method.
+/// Also, all bindings found during the visit are counted and returned.
 fn find_stripping<'tcx>(
     cx: &LateContext<'tcx>,
     strip_kind: StripKind,
     target: Res,
     pattern: &'tcx Expr<'_>,
-    expr: &'tcx Expr<'_>,
-) -> Vec<Span> {
+    expr: &'tcx Expr<'tcx>,
+    ctxt: SyntaxContext,
+) -> (Vec<&'tcx Expr<'tcx>>, FxHashMap<Symbol, usize>) {
     struct StrippingFinder<'a, 'tcx> {
         cx: &'a LateContext<'tcx>,
         strip_kind: StripKind,
         target: Res,
         pattern: &'tcx Expr<'tcx>,
-        results: Vec<Span>,
+        results: Vec<&'tcx Expr<'tcx>>,
+        bindings: FxHashMap<Symbol, usize>,
+        ctxt: SyntaxContext,
     }
 
-    impl<'a, 'tcx> Visitor<'tcx> for StrippingFinder<'a, 'tcx> {
-        type Map = Map<'tcx>;
-        fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
-            NestedVisitorMap::None
-        }
-
+    impl<'tcx> Visitor<'tcx> for StrippingFinder<'_, 'tcx> {
         fn visit_expr(&mut self, ex: &'tcx Expr<'_>) {
-            if_chain! {
-                if is_ref_str(self.cx, ex);
-                let unref = peel_ref(ex);
-                if let ExprKind::Index(indexed, index) = &unref.kind;
-                if let Some(higher::Range { start, end, .. }) = higher::range(index);
-                if let ExprKind::Path(path) = &indexed.kind;
-                if self.cx.qpath_res(path, ex.hir_id) == self.target;
-                then {
-                    match (self.strip_kind, start, end) {
-                        (StripKind::Prefix, Some(start), None) => {
-                            if eq_pattern_length(self.cx, self.pattern, start) {
-                                self.results.push(ex.span);
-                                return;
-                            }
-                        },
-                        (StripKind::Suffix, None, Some(end)) => {
-                            if_chain! {
-                                if let ExprKind::Binary(Spanned { node: BinOpKind::Sub, .. }, left, right) = end.kind;
-                                if let Some(left_arg) = len_arg(self.cx, left);
-                                if let ExprKind::Path(left_path) = &left_arg.kind;
-                                if self.cx.qpath_res(left_path, left_arg.hir_id) == self.target;
-                                if eq_pattern_length(self.cx, self.pattern, right);
-                                then {
-                                    self.results.push(ex.span);
-                                    return;
-                                }
-                            }
-                        },
-                        _ => {}
-                    }
+            if is_ref_str(self.cx, ex)
+                && let unref = peel_ref(ex)
+                && let ExprKind::Index(indexed, index, _) = &unref.kind
+                && let Some(higher::Range { start, end, .. }) = higher::Range::hir(self.cx, index)
+                && let ExprKind::Path(path) = &indexed.kind
+                && self.cx.qpath_res(path, ex.hir_id) == self.target
+            {
+                match (self.strip_kind, start, end) {
+                    (StripKind::Prefix, Some(start), None) => {
+                        if eq_pattern_length(self.cx, self.pattern, start, self.ctxt) {
+                            self.results.push(ex);
+                            return;
+                        }
+                    },
+                    (StripKind::Suffix, None, Some(end)) => {
+                        if let ExprKind::Binary(
+                            Spanned {
+                                node: BinOpKind::Sub, ..
+                            },
+                            left,
+                            right,
+                        ) = end.kind
+                            && let Some(left_arg) = len_arg(self.cx, left)
+                            && let ExprKind::Path(left_path) = &left_arg.kind
+                            && self.cx.qpath_res(left_path, left_arg.hir_id) == self.target
+                            && eq_pattern_length(self.cx, self.pattern, right, self.ctxt)
+                        {
+                            self.results.push(ex);
+                            return;
+                        }
+                    },
+                    _ => {},
                 }
             }
 
             walk_expr(self, ex);
+        }
+
+        fn visit_pat(&mut self, pat: &'tcx rustc_hir::Pat<'tcx>) -> Self::Result {
+            if let PatKind::Binding(_, _, ident, _) = pat.kind {
+                *self.bindings.entry(ident.name).or_default() += 1;
+            }
+            walk_pat(self, pat);
         }
     }
 
@@ -257,7 +286,9 @@ fn find_stripping<'tcx>(
         target,
         pattern,
         results: vec![],
+        bindings: FxHashMap::default(),
+        ctxt,
     };
     walk_expr(&mut finder, expr);
-    finder.results
+    (finder.results, finder.bindings)
 }

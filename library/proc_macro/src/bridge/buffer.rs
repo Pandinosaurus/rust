@@ -1,146 +1,155 @@
 //! Buffer management for same-process client<->server communication.
 
 use std::io::{self, Write};
-use std::mem;
+use std::mem::{self, ManuallyDrop};
 use std::ops::{Deref, DerefMut};
 use std::slice;
 
 #[repr(C)]
-struct Slice<'a, T> {
-    data: &'a [T; 0],
-    len: usize,
-}
-
-unsafe impl<'a, T: Sync> Sync for Slice<'a, T> {}
-unsafe impl<'a, T: Sync> Send for Slice<'a, T> {}
-
-impl<T> Copy for Slice<'a, T> {}
-impl<T> Clone for Slice<'a, T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<T> From<&'a [T]> for Slice<'a, T> {
-    fn from(xs: &'a [T]) -> Self {
-        Slice { data: unsafe { &*(xs.as_ptr() as *const [T; 0]) }, len: xs.len() }
-    }
-}
-
-impl<T> Deref for Slice<'a, T> {
-    type Target = [T];
-    fn deref(&self) -> &[T] {
-        unsafe { slice::from_raw_parts(self.data.as_ptr(), self.len) }
-    }
-}
-
-#[repr(C)]
-pub struct Buffer<T: Copy> {
-    data: *mut T,
+pub struct Buffer {
+    data: *mut u8,
     len: usize,
     capacity: usize,
-    extend_from_slice: extern "C" fn(Buffer<T>, Slice<'_, T>) -> Buffer<T>,
-    drop: extern "C" fn(Buffer<T>),
+    reserve: extern "C" fn(Buffer, usize) -> Buffer,
+    drop: extern "C" fn(Buffer),
 }
 
-unsafe impl<T: Copy + Sync> Sync for Buffer<T> {}
-unsafe impl<T: Copy + Send> Send for Buffer<T> {}
+unsafe impl Sync for Buffer {}
+unsafe impl Send for Buffer {}
 
-impl<T: Copy> Default for Buffer<T> {
+impl Default for Buffer {
+    #[inline]
     fn default() -> Self {
         Self::from(vec![])
     }
 }
 
-impl<T: Copy> Deref for Buffer<T> {
-    type Target = [T];
-    fn deref(&self) -> &[T] {
-        unsafe { slice::from_raw_parts(self.data as *const T, self.len) }
+impl Deref for Buffer {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self.data as *const u8, self.len) }
     }
 }
 
-impl<T: Copy> DerefMut for Buffer<T> {
-    fn deref_mut(&mut self) -> &mut [T] {
+impl DerefMut for Buffer {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [u8] {
         unsafe { slice::from_raw_parts_mut(self.data, self.len) }
     }
 }
 
-impl<T: Copy> Buffer<T> {
+impl Buffer {
+    #[inline]
     pub(super) fn new() -> Self {
         Self::default()
     }
 
+    #[inline]
     pub(super) fn clear(&mut self) {
         self.len = 0;
     }
 
+    #[inline]
     pub(super) fn take(&mut self) -> Self {
         mem::take(self)
     }
 
-    pub(super) fn extend_from_slice(&mut self, xs: &[T]) {
-        // Fast path to avoid going through an FFI call.
-        if let Some(final_len) = self.len.checked_add(xs.len()) {
-            if final_len <= self.capacity {
-                let dst = unsafe { slice::from_raw_parts_mut(self.data, self.capacity) };
-                dst[self.len..][..xs.len()].copy_from_slice(xs);
-                self.len = final_len;
-                return;
-            }
+    // We have the array method separate from extending from a slice. This is
+    // because in the case of small arrays, codegen can be more efficient
+    // (avoiding a memmove call). With extend_from_slice, LLVM at least
+    // currently is not able to make that optimization.
+    #[inline]
+    pub(super) fn extend_from_array<const N: usize>(&mut self, xs: &[u8; N]) {
+        if xs.len() > (self.capacity - self.len) {
+            let b = self.take();
+            *self = (b.reserve)(b, xs.len());
         }
-        let b = self.take();
-        *self = (b.extend_from_slice)(b, Slice::from(xs));
+        unsafe {
+            xs.as_ptr().copy_to_nonoverlapping(self.data.add(self.len), xs.len());
+            self.len += xs.len();
+        }
+    }
+
+    #[inline]
+    pub(super) fn extend_from_slice(&mut self, xs: &[u8]) {
+        if xs.len() > (self.capacity - self.len) {
+            let b = self.take();
+            *self = (b.reserve)(b, xs.len());
+        }
+        unsafe {
+            xs.as_ptr().copy_to_nonoverlapping(self.data.add(self.len), xs.len());
+            self.len += xs.len();
+        }
+    }
+
+    #[inline]
+    pub(super) fn push(&mut self, v: u8) {
+        // The code here is taken from Vec::push, and we know that reserve()
+        // will panic if we're exceeding isize::MAX bytes and so there's no need
+        // to check for overflow.
+        if self.len == self.capacity {
+            let b = self.take();
+            *self = (b.reserve)(b, 1);
+        }
+        unsafe {
+            *self.data.add(self.len) = v;
+            self.len += 1;
+        }
     }
 }
 
-impl Write for Buffer<u8> {
+impl Write for Buffer {
+    #[inline]
     fn write(&mut self, xs: &[u8]) -> io::Result<usize> {
         self.extend_from_slice(xs);
         Ok(xs.len())
     }
 
+    #[inline]
     fn write_all(&mut self, xs: &[u8]) -> io::Result<()> {
         self.extend_from_slice(xs);
         Ok(())
     }
 
+    #[inline]
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
 
-impl<T: Copy> Drop for Buffer<T> {
+impl Drop for Buffer {
+    #[inline]
     fn drop(&mut self) {
         let b = self.take();
         (b.drop)(b);
     }
 }
 
-impl<T: Copy> From<Vec<T>> for Buffer<T> {
-    fn from(mut v: Vec<T>) -> Self {
+impl From<Vec<u8>> for Buffer {
+    fn from(v: Vec<u8>) -> Self {
+        let mut v = ManuallyDrop::new(v);
         let (data, len, capacity) = (v.as_mut_ptr(), v.len(), v.capacity());
-        mem::forget(v);
 
         // This utility function is nested in here because it can *only*
         // be safely called on `Buffer`s created by *this* `proc_macro`.
-        fn to_vec<T: Copy>(b: Buffer<T>) -> Vec<T> {
+        fn to_vec(b: Buffer) -> Vec<u8> {
             unsafe {
-                let Buffer { data, len, capacity, .. } = b;
-                mem::forget(b);
-                Vec::from_raw_parts(data, len, capacity)
+                let b = ManuallyDrop::new(b);
+                Vec::from_raw_parts(b.data, b.len, b.capacity)
             }
         }
 
-        extern "C" fn extend_from_slice<T: Copy>(b: Buffer<T>, xs: Slice<'_, T>) -> Buffer<T> {
+        extern "C" fn reserve(b: Buffer, additional: usize) -> Buffer {
             let mut v = to_vec(b);
-            v.extend_from_slice(&xs);
+            v.reserve(additional);
             Buffer::from(v)
         }
 
-        extern "C" fn drop<T: Copy>(b: Buffer<T>) {
+        extern "C" fn drop(b: Buffer) {
             mem::drop(to_vec(b));
         }
 
-        Buffer { data, len, capacity, extend_from_slice, drop }
+        Buffer { data, len, capacity, reserve, drop }
     }
 }

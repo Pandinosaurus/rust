@@ -1,8 +1,33 @@
 use std::env;
+use std::ffi::{OsStr, OsString};
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-use build_helper::{output, tracked_env_var_os};
+const OPTIONAL_COMPONENTS: &[&str] = &[
+    "x86",
+    "arm",
+    "aarch64",
+    "amdgpu",
+    "avr",
+    "loongarch",
+    "m68k",
+    "csky",
+    "mips",
+    "powerpc",
+    "systemz",
+    "webassembly",
+    "msp430",
+    "sparc",
+    "nvptx",
+    "hexagon",
+    "riscv",
+    "xtensa",
+    "bpf",
+];
+
+const REQUIRED_COMPONENTS: &[&str] =
+    &["ipo", "bitreader", "bitwriter", "linker", "asmparser", "lto", "coverage", "instrumentation"];
 
 fn detect_llvm_link() -> (&'static str, &'static str) {
     // Force the link mode we want, preferring static by default, but
@@ -14,36 +39,91 @@ fn detect_llvm_link() -> (&'static str, &'static str) {
     }
 }
 
+// Because Cargo adds the compiler's dylib path to our library search path, llvm-config may
+// break: the dylib path for the compiler, as of this writing, contains a copy of the LLVM
+// shared library, which means that when our freshly built llvm-config goes to load it's
+// associated LLVM, it actually loads the compiler's LLVM. In particular when building the first
+// compiler (i.e., in stage 0) that's a problem, as the compiler's LLVM is likely different from
+// the one we want to use. As such, we restore the environment to what bootstrap saw. This isn't
+// perfect -- we might actually want to see something from Cargo's added library paths -- but
+// for now it works.
+fn restore_library_path() {
+    let key = tracked_env_var_os("REAL_LIBRARY_PATH_VAR").expect("REAL_LIBRARY_PATH_VAR");
+    if let Some(env) = tracked_env_var_os("REAL_LIBRARY_PATH") {
+        unsafe {
+            env::set_var(&key, env);
+        }
+    } else {
+        unsafe {
+            env::remove_var(&key);
+        }
+    }
+}
+
+/// Reads an environment variable and adds it to dependencies.
+/// Supposed to be used for all variables except those set for build scripts by cargo
+/// <https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts>
+fn tracked_env_var_os<K: AsRef<OsStr> + Display>(key: K) -> Option<OsString> {
+    println!("cargo:rerun-if-env-changed={key}");
+    env::var_os(key)
+}
+
+fn rerun_if_changed_anything_in_dir(dir: &Path) {
+    let mut stack = dir
+        .read_dir()
+        .unwrap()
+        .map(|e| e.unwrap())
+        .filter(|e| &*e.file_name() != ".git")
+        .collect::<Vec<_>>();
+    while let Some(entry) = stack.pop() {
+        let path = entry.path();
+        if entry.file_type().unwrap().is_dir() {
+            stack.extend(path.read_dir().unwrap().map(|e| e.unwrap()));
+        } else {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
+#[track_caller]
+fn output(cmd: &mut Command) -> String {
+    let output = match cmd.stderr(Stdio::inherit()).output() {
+        Ok(status) => status,
+        Err(e) => {
+            println!("\n\nfailed to execute command: {cmd:?}\nerror: {e}\n\n");
+            std::process::exit(1);
+        }
+    };
+    if !output.status.success() {
+        panic!(
+            "command did not execute successfully: {:?}\n\
+             expected success, got: {}",
+            cmd, output.status
+        );
+    }
+    String::from_utf8(output.stdout).unwrap()
+}
+
 fn main() {
+    if cfg!(feature = "check_only") {
+        return;
+    }
+
+    for component in REQUIRED_COMPONENTS.iter().chain(OPTIONAL_COMPONENTS.iter()) {
+        println!("cargo:rustc-check-cfg=cfg(llvm_component,values(\"{component}\"))");
+    }
+
     if tracked_env_var_os("RUST_CHECK").is_some() {
         // If we're just running `check`, there's no need for LLVM to be built.
         return;
     }
 
-    build_helper::restore_library_path();
+    restore_library_path();
 
-    let target = env::var("TARGET").expect("TARGET was not set");
     let llvm_config =
-        tracked_env_var_os("LLVM_CONFIG").map(|x| Some(PathBuf::from(x))).unwrap_or_else(|| {
-            if let Some(dir) = tracked_env_var_os("CARGO_TARGET_DIR").map(PathBuf::from) {
-                let to_test = dir
-                    .parent()
-                    .unwrap()
-                    .parent()
-                    .unwrap()
-                    .join(&target)
-                    .join("llvm/bin/llvm-config");
-                if Command::new(&to_test).output().is_ok() {
-                    return Some(to_test);
-                }
-            }
-            None
-        });
+        PathBuf::from(tracked_env_var_os("LLVM_CONFIG").expect("LLVM_CONFIG was not set"));
 
-    if let Some(llvm_config) = &llvm_config {
-        println!("cargo:rerun-if-changed={}", llvm_config.display());
-    }
-    let llvm_config = llvm_config.unwrap_or_else(|| PathBuf::from("llvm-config"));
+    println!("cargo:rerun-if-changed={}", llvm_config.display());
 
     // Test whether we're cross-compiling LLVM. This is a pretty rare case
     // currently where we're producing an LLVM for a different platform than
@@ -70,47 +150,18 @@ fn main() {
     let host = env::var("HOST").expect("HOST was not set");
     let is_crossed = target != host;
 
-    let optional_components = &[
-        "x86",
-        "arm",
-        "aarch64",
-        "amdgpu",
-        "avr",
-        "mips",
-        "powerpc",
-        "systemz",
-        "jsbackend",
-        "webassembly",
-        "msp430",
-        "sparc",
-        "nvptx",
-        "hexagon",
-        "riscv",
-    ];
-
-    let required_components = &[
-        "ipo",
-        "bitreader",
-        "bitwriter",
-        "linker",
-        "asmparser",
-        "lto",
-        "coverage",
-        "instrumentation",
-    ];
-
     let components = output(Command::new(&llvm_config).arg("--components"));
     let mut components = components.split_whitespace().collect::<Vec<_>>();
-    components.retain(|c| optional_components.contains(c) || required_components.contains(c));
+    components.retain(|c| OPTIONAL_COMPONENTS.contains(c) || REQUIRED_COMPONENTS.contains(c));
 
-    for component in required_components {
+    for component in REQUIRED_COMPONENTS {
         if !components.contains(component) {
-            panic!("require llvm component {} but wasn't found", component);
+            panic!("require llvm component {component} but wasn't found");
         }
     }
 
     for component in components.iter() {
-        println!("cargo:rustc-cfg=llvm_component=\"{}\"", component);
+        println!("cargo:rustc-cfg=llvm_component=\"{component}\"");
     }
 
     // Link in our own LLVM shims, compiled with the same flags as LLVM
@@ -119,6 +170,16 @@ fn main() {
     let cxxflags = output(&mut cmd);
     let mut cfg = cc::Build::new();
     cfg.warnings(false);
+
+    // Prevent critical warnings when we're compiling from rust-lang/rust CI,
+    // except on MSVC, as the compiler throws warnings that are only reported
+    // for this platform. See https://github.com/rust-lang/rust/pull/145031#issuecomment-3162677202.
+    // Moreover, LLVM generally guarantees warning-freedom only when building with Clang, as other
+    // compilers have too many false positives. This is typically the case for MSVC, which throws
+    // many false-positive warnings. We keep it excluded, for these reasons.
+    if std::env::var_os("CI").is_some() && !target.contains("msvc") {
+        cfg.warnings_into_errors(true);
+    }
     for flag in cxxflags.split_whitespace() {
         // Ignore flags like `-m64` when we're doing a cross build
         if is_crossed && flag.starts_with("-m") {
@@ -136,7 +197,7 @@ fn main() {
 
         // Include path contains host directory, replace it with target
         if is_crossed && flag.starts_with("-I") {
-            cfg.flag(&flag.replace(&host, &target));
+            cfg.flag(flag.replace(&host, &target));
             continue;
         }
 
@@ -149,20 +210,23 @@ fn main() {
         cfg.define(&flag, None);
     }
 
+    if tracked_env_var_os("LLVM_ENZYME").is_some() {
+        cfg.define("ENZYME", None);
+    }
+
     if tracked_env_var_os("LLVM_RUSTLLVM").is_some() {
         cfg.define("LLVM_RUSTLLVM", None);
     }
 
-    if tracked_env_var_os("LLVM_NDEBUG").is_some() {
+    if tracked_env_var_os("LLVM_ASSERTIONS").is_none() {
         cfg.define("NDEBUG", None);
-        cfg.debug(false);
     }
 
-    build_helper::rerun_if_changed_anything_in_dir(Path::new("llvm-wrapper"));
+    rerun_if_changed_anything_in_dir(Path::new("llvm-wrapper"));
     cfg.file("llvm-wrapper/PassWrapper.cpp")
         .file("llvm-wrapper/RustWrapper.cpp")
-        .file("llvm-wrapper/ArchiveWrapper.cpp")
         .file("llvm-wrapper/CoverageMappingWrapper.cpp")
+        .file("llvm-wrapper/SymbolWrapper.cpp")
         .file("llvm-wrapper/Linker.cpp")
         .cpp(true)
         .cpp_link_stdlib(None) // we handle this below
@@ -176,17 +240,53 @@ fn main() {
     let mut cmd = Command::new(&llvm_config);
     cmd.arg(llvm_link_arg).arg("--libs");
 
-    if !is_crossed {
+    // Don't link system libs if cross-compiling unless targeting Windows from Windows host.
+    // On Windows system DLLs aren't linked directly, instead import libraries are used.
+    // These import libraries are independent of the host.
+    if !is_crossed || target.contains("windows") && host.contains("windows") {
         cmd.arg("--system-libs");
+    }
+
+    // We need libkstat for getHostCPUName on SPARC builds.
+    // See also: https://github.com/llvm/llvm-project/issues/64186
+    if target.starts_with("sparcv9") && target.contains("solaris") {
+        println!("cargo:rustc-link-lib=kstat");
+    }
+
+    if (target.starts_with("arm")
+        && !target.starts_with("arm64")
+        && !target.contains("freebsd")
+        && !target.contains("ohos"))
+        || target.starts_with("mips-")
+        || target.starts_with("mipsel-")
+        || target.starts_with("powerpc-")
+        || target.starts_with("sparc-")
+    {
+        // 32-bit targets need to link libatomic.
+        println!("cargo:rustc-link-lib=atomic");
     } else if target.contains("windows-gnu") {
         println!("cargo:rustc-link-lib=shell32");
         println!("cargo:rustc-link-lib=uuid");
-    } else if target.contains("netbsd") || target.contains("haiku") {
+    } else if target.contains("haiku")
+        || target.contains("darwin")
+        || (is_crossed && (target.contains("dragonfly") || target.contains("solaris")))
+        || target.contains("cygwin")
+    {
         println!("cargo:rustc-link-lib=z");
+    } else if target.contains("netbsd") {
+        // On NetBSD/i386, gcc and g++ is built for i486 (to maximize backward compat)
+        // However, LLVM insists on using 64-bit atomics.
+        // This gives rise to a need to link rust itself with -latomic for these targets
+        if target.starts_with("i586") || target.starts_with("i686") {
+            println!("cargo:rustc-link-lib=atomic");
+        }
+        println!("cargo:rustc-link-lib=z");
+        println!("cargo:rustc-link-lib=execinfo");
     }
     cmd.args(&components);
 
     for lib in output(&mut cmd).split_whitespace() {
+        let mut is_static = false;
         let name = if let Some(stripped) = lib.strip_prefix("-l") {
             stripped
         } else if let Some(stripped) = lib.strip_prefix('-') {
@@ -194,8 +294,24 @@ fn main() {
         } else if Path::new(lib).exists() {
             // On MSVC llvm-config will print the full name to libraries, but
             // we're only interested in the name part
-            let name = Path::new(lib).file_name().unwrap().to_str().unwrap();
-            name.trim_end_matches(".lib")
+            // On Unix when we get a static library llvm-config will print the
+            // full name and we *are* interested in the path, but we need to
+            // handle it separately. For example, when statically linking to
+            // libzstd llvm-config will output something like
+            //   -lrt -ldl -lm -lz /usr/local/lib/libzstd.a -lxml2
+            // and we transform the zstd part into
+            //   cargo:rustc-link-search-native=/usr/local/lib
+            //   cargo:rustc-link-lib=static=zstd
+            let path = Path::new(lib);
+            if lib.ends_with(".a") {
+                is_static = true;
+                println!("cargo:rustc-link-search=native={}", path.parent().unwrap().display());
+                let name = path.file_stem().unwrap().to_str().unwrap();
+                name.trim_start_matches("lib")
+            } else {
+                let name = path.file_name().unwrap().to_str().unwrap();
+                name.trim_end_matches(".lib")
+            }
         } else if lib.ends_with(".lib") {
             // Some MSVC libraries just come up with `.lib` tacked on, so chop
             // that off
@@ -213,8 +329,14 @@ fn main() {
             continue;
         }
 
-        let kind = if name.starts_with("LLVM") { llvm_kind } else { "dylib" };
-        println!("cargo:rustc-link-lib={}={}", kind, name);
+        let kind = if name.starts_with("LLVM") {
+            llvm_kind
+        } else if is_static {
+            "static"
+        } else {
+            "dylib"
+        };
+        println!("cargo:rustc-link-lib={kind}={name}");
     }
 
     // LLVM ldflags
@@ -233,11 +355,11 @@ fn main() {
                 println!("cargo:rustc-link-search=native={}", stripped.replace(&host, &target));
             }
         } else if let Some(stripped) = lib.strip_prefix("-LIBPATH:") {
-            println!("cargo:rustc-link-search=native={}", stripped);
+            println!("cargo:rustc-link-search=native={stripped}");
         } else if let Some(stripped) = lib.strip_prefix("-l") {
-            println!("cargo:rustc-link-lib={}", stripped);
+            println!("cargo:rustc-link-lib={stripped}");
         } else if let Some(stripped) = lib.strip_prefix("-L") {
-            println!("cargo:rustc-link-search=native={}", stripped);
+            println!("cargo:rustc-link-search=native={stripped}");
         }
     }
 
@@ -249,9 +371,9 @@ fn main() {
     if let Some(s) = llvm_linker_flags {
         for lib in s.into_string().unwrap().split_whitespace() {
             if let Some(stripped) = lib.strip_prefix("-l") {
-                println!("cargo:rustc-link-lib={}", stripped);
+                println!("cargo:rustc-link-lib={stripped}");
             } else if let Some(stripped) = lib.strip_prefix("-L") {
-                println!("cargo:rustc-link-search=native={}", stripped);
+                println!("cargo:rustc-link-search=native={stripped}");
             }
         }
     }
@@ -261,21 +383,27 @@ fn main() {
 
     let stdcppname = if target.contains("openbsd") {
         if target.contains("sparc64") { "estdc++" } else { "c++" }
-    } else if target.contains("freebsd") {
-        "c++"
-    } else if target.contains("darwin") {
+    } else if target.contains("darwin")
+        || target.contains("freebsd")
+        || target.contains("windows-gnullvm")
+        || target.contains("aix")
+        || target.contains("ohos")
+    {
         "c++"
     } else if target.contains("netbsd") && llvm_static_stdcpp.is_some() {
         // NetBSD uses a separate library when relocation is required
-        "stdc++_pic"
+        "stdc++_p"
     } else if llvm_use_libcxx.is_some() {
         "c++"
     } else {
         "stdc++"
     };
 
-    // RISC-V requires libatomic for sub-word atomic operations
-    if target.starts_with("riscv") {
+    // RISC-V GCC erroneously requires libatomic for sub-word
+    // atomic operations. Some BSD uses Clang as its system
+    // compiler and provides no libatomic in its base system so
+    // does not want this.
+    if target.starts_with("riscv") && !target.contains("freebsd") && !target.contains("openbsd") {
         println!("cargo:rustc-link-lib=atomic");
     }
 
@@ -286,20 +414,26 @@ fn main() {
             let path = PathBuf::from(s);
             println!("cargo:rustc-link-search=native={}", path.parent().unwrap().display());
             if target.contains("windows") {
-                println!("cargo:rustc-link-lib=static-nobundle={}", stdcppname);
+                println!("cargo:rustc-link-lib=static:-bundle={stdcppname}");
             } else {
-                println!("cargo:rustc-link-lib=static={}", stdcppname);
+                println!("cargo:rustc-link-lib=static={stdcppname}");
             }
         } else if cxxflags.contains("stdlib=libc++") {
             println!("cargo:rustc-link-lib=c++");
         } else {
-            println!("cargo:rustc-link-lib={}", stdcppname);
+            println!("cargo:rustc-link-lib={stdcppname}");
         }
+    }
+
+    // libc++abi and libunwind have to be specified explicitly on AIX.
+    if target.contains("aix") {
+        println!("cargo:rustc-link-lib=c++abi");
+        println!("cargo:rustc-link-lib=unwind");
     }
 
     // Libstdc++ depends on pthread which Rust doesn't link on MinGW
     // since nothing else requires it.
-    if target.contains("windows-gnu") {
-        println!("cargo:rustc-link-lib=static-nobundle=pthread");
+    if target.ends_with("windows-gnu") {
+        println!("cargo:rustc-link-lib=static:-bundle=pthread");
     }
 }

@@ -1,5 +1,4 @@
-#![feature(non_ascii_idents)]
-#![warn(clippy::enum_variant_names, clippy::pub_enum_variant_names)]
+#![warn(clippy::enum_variant_names)]
 #![allow(non_camel_case_types, clippy::upper_case_acronyms)]
 
 enum FakeCallType {
@@ -13,7 +12,9 @@ enum FakeCallType2 {
 }
 
 enum Foo {
+    //~^ enum_variant_names
     cFoo,
+    //~^ enum_variant_names
     cBar,
     cBaz,
 }
@@ -24,9 +25,13 @@ enum Fooo {
 }
 
 enum Food {
+    //~^ enum_variant_names
     FoodGood,
+    //~^ enum_variant_names
     FoodMiddle,
+    //~^ enum_variant_names
     FoodBad,
+    //~^ enum_variant_names
 }
 
 enum Stuff {
@@ -34,6 +39,7 @@ enum Stuff {
 }
 
 enum BadCallType {
+    //~^ enum_variant_names
     CallTypeCall,
     CallTypeCreate,
     CallTypeDestroy,
@@ -46,6 +52,7 @@ enum TwoCallType {
 }
 
 enum Consts {
+    //~^ enum_variant_names
     ConstantInt,
     ConstantCake,
     ConstantLie,
@@ -58,6 +65,7 @@ enum Two {
 }
 
 enum Something {
+    //~^ enum_variant_names
     CCall,
     CCreate,
     CCryogenize,
@@ -80,6 +88,7 @@ enum Sealll {
 }
 
 enum Seallll {
+    //~^ enum_variant_names
     WithOutCake,
     WithOutTea,
     WithOut,
@@ -97,8 +106,8 @@ pub enum PubSeall {
     WithOut,
 }
 
-#[allow(clippy::pub_enum_variant_names)]
-mod allowed {
+#[allow(clippy::enum_variant_names)]
+pub mod allowed {
     pub enum PubAllowed {
         SomeThis,
         SomeThat,
@@ -135,15 +144,95 @@ pub enum NetworkLayer {
 
 // should lint suggesting `IData`, not only `Data` (see #4639)
 enum IDataRequest {
+    //~^ enum_variant_names
     PutIData(String),
     GetIData(String),
     DeleteUnpubIData(String),
 }
 
 enum HIDataRequest {
+    //~^ enum_variant_names
     PutHIData(String),
     GetHIData(String),
     DeleteUnpubHIData(String),
+}
+
+enum North {
+    Normal,
+    NoLeft,
+    NoRight,
+}
+
+// #8324
+enum Phase {
+    PreLookup,
+    Lookup,
+    PostLookup,
+}
+
+mod issue9018 {
+    enum DoLint {
+        //~^ enum_variant_names
+        _TypeCreate,
+        _TypeRead,
+        _TypeUpdate,
+        _TypeDestroy,
+    }
+
+    enum DoLintToo {
+        //~^ enum_variant_names
+        _CreateType,
+        _UpdateType,
+        _DeleteType,
+    }
+
+    enum DoNotLint {
+        _Foo,
+        _Bar,
+        _Baz,
+    }
+}
+
+mod allow_attributes_on_variants {
+    enum Enum {
+        #[allow(clippy::enum_variant_names)]
+        EnumStartsWith,
+        #[allow(clippy::enum_variant_names)]
+        EndsWithEnum,
+        Foo,
+    }
+}
+
+mod issue11494 {
+    // variant order should not affect lint
+    enum Data {
+        Valid,
+        Invalid,
+        DataDependent,
+        //~^ enum_variant_names
+    }
+
+    enum Datas {
+        DatasDependent,
+        //~^ enum_variant_names
+        Valid,
+        Invalid,
+    }
+}
+
+mod encapsulated {
+    mod types {
+        pub struct FooError;
+        pub struct BarError;
+        pub struct BazError;
+    }
+
+    enum Error {
+        FooError(types::FooError),
+        BarError(types::BarError),
+        BazError(types::BazError),
+        Other,
+    }
 }
 
 fn main() {}

@@ -1,232 +1,143 @@
+use rustc_ast::attr;
 use rustc_ast::entry::EntryPointType;
-use rustc_errors::struct_span_err;
-use rustc_hir::def_id::{CrateNum, LocalDefId, CRATE_DEF_INDEX, LOCAL_CRATE};
-use rustc_hir::itemlikevisit::ItemLikeVisitor;
-use rustc_hir::{ForeignItem, HirId, ImplItem, Item, ItemKind, TraitItem, CRATE_HIR_ID};
-use rustc_middle::hir::map::Map;
-use rustc_middle::ty::query::Providers;
+use rustc_errors::codes::*;
+use rustc_hir::attrs::AttributeKind;
+use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId};
+use rustc_hir::{CRATE_HIR_ID, ItemId, Node, find_attr};
+use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
-use rustc_session::config::{CrateType, EntryFnType};
-use rustc_session::Session;
-use rustc_span::symbol::sym;
-use rustc_span::{Span, DUMMY_SP};
+use rustc_session::RemapFileNameExt;
+use rustc_session::config::{CrateType, EntryFnType, RemapPathScopeComponents, sigpipe};
+use rustc_span::{Span, sym};
 
-struct EntryContext<'a, 'tcx> {
-    session: &'a Session,
+use crate::errors::{ExternMain, MultipleRustcMain, NoMainErr};
 
-    map: Map<'tcx>,
+struct EntryContext<'tcx> {
+    tcx: TyCtxt<'tcx>,
 
-    /// The top-level function called `main`.
-    main_fn: Option<(HirId, Span)>,
-
-    /// The function that has attribute named `main`.
-    attr_main_fn: Option<(HirId, Span)>,
-
-    /// The function that has the attribute 'start' on it.
-    start_fn: Option<(HirId, Span)>,
+    /// The function has the `#[rustc_main]` attribute.
+    rustc_main_fn: Option<(LocalDefId, Span)>,
 
     /// The functions that one might think are `main` but aren't, e.g.
     /// main functions not defined at the top level. For diagnostics.
-    non_main_fns: Vec<(HirId, Span)>,
+    non_main_fns: Vec<Span>,
 }
 
-impl<'a, 'tcx> ItemLikeVisitor<'tcx> for EntryContext<'a, 'tcx> {
-    fn visit_item(&mut self, item: &'tcx Item<'tcx>) {
-        let def_key = self.map.def_key(item.def_id);
-        let at_root = def_key.parent == Some(CRATE_DEF_INDEX);
-        find_item(item, self, at_root);
-    }
-
-    fn visit_trait_item(&mut self, _trait_item: &'tcx TraitItem<'tcx>) {
-        // Entry fn is never a trait item.
-    }
-
-    fn visit_impl_item(&mut self, _impl_item: &'tcx ImplItem<'tcx>) {
-        // Entry fn is never a trait item.
-    }
-
-    fn visit_foreign_item(&mut self, _: &'tcx ForeignItem<'tcx>) {
-        // Entry fn is never a foreign item.
-    }
-}
-
-fn entry_fn(tcx: TyCtxt<'_>, cnum: CrateNum) -> Option<(LocalDefId, EntryFnType)> {
-    assert_eq!(cnum, LOCAL_CRATE);
-
-    let any_exe = tcx.sess.crate_types().iter().any(|ty| *ty == CrateType::Executable);
+fn entry_fn(tcx: TyCtxt<'_>, (): ()) -> Option<(DefId, EntryFnType)> {
+    let any_exe = tcx.crate_types().contains(&CrateType::Executable);
     if !any_exe {
         // No need to find a main function.
         return None;
     }
 
     // If the user wants no main function at all, then stop here.
-    if tcx.sess.contains_name(&tcx.hir().attrs(CRATE_HIR_ID), sym::no_main) {
+    if attr::contains_name(tcx.hir_attrs(CRATE_HIR_ID), sym::no_main) {
         return None;
     }
 
-    let mut ctxt = EntryContext {
-        session: tcx.sess,
-        map: tcx.hir(),
-        main_fn: None,
-        attr_main_fn: None,
-        start_fn: None,
-        non_main_fns: Vec::new(),
-    };
+    let mut ctxt = EntryContext { tcx, rustc_main_fn: None, non_main_fns: Vec::new() };
 
-    tcx.hir().krate().visit_all_item_likes(&mut ctxt);
+    for id in tcx.hir_free_items() {
+        check_and_search_item(id, &mut ctxt);
+    }
 
     configure_main(tcx, &ctxt)
 }
 
-// Beware, this is duplicated in `librustc_builtin_macros/test_harness.rs`
-// (with `ast::Item`), so make sure to keep them in sync.
-fn entry_point_type(ctxt: &EntryContext<'_, '_>, item: &Item<'_>, at_root: bool) -> EntryPointType {
-    let attrs = ctxt.map.attrs(item.hir_id());
-    if ctxt.session.contains_name(attrs, sym::start) {
-        EntryPointType::Start
-    } else if ctxt.session.contains_name(attrs, sym::main) {
-        EntryPointType::MainAttr
-    } else if item.ident.name == sym::main {
-        if at_root {
-            // This is a top-level function so can be `main`.
-            EntryPointType::MainNamed
-        } else {
-            EntryPointType::OtherMain
-        }
-    } else {
-        EntryPointType::None
-    }
-}
+fn check_and_search_item(id: ItemId, ctxt: &mut EntryContext<'_>) {
+    let at_root = ctxt.tcx.opt_local_parent(id.owner_id.def_id) == Some(CRATE_DEF_ID);
 
-fn throw_attr_err(sess: &Session, span: Span, attr: &str) {
-    sess.struct_span_err(span, &format!("`{}` attribute can only be used on functions", attr))
-        .emit();
-}
+    let attrs = ctxt.tcx.hir_attrs(id.hir_id());
+    let entry_point_type = rustc_ast::entry::entry_point_type(
+        find_attr!(attrs, AttributeKind::RustcMain),
+        at_root,
+        ctxt.tcx.opt_item_name(id.owner_id.to_def_id()),
+    );
 
-fn find_item(item: &Item<'_>, ctxt: &mut EntryContext<'_, '_>, at_root: bool) {
-    match entry_point_type(ctxt, item, at_root) {
-        EntryPointType::None => (),
-        _ if !matches!(item.kind, ItemKind::Fn(..)) => {
-            let attrs = ctxt.map.attrs(item.hir_id());
-            if let Some(attr) = ctxt.session.find_by_name(attrs, sym::start) {
-                throw_attr_err(&ctxt.session, attr.span, "start");
-            }
-            if let Some(attr) = ctxt.session.find_by_name(attrs, sym::main) {
-                throw_attr_err(&ctxt.session, attr.span, "main");
-            }
-        }
-        EntryPointType::MainNamed => {
-            if ctxt.main_fn.is_none() {
-                ctxt.main_fn = Some((item.hir_id(), item.span));
-            } else {
-                struct_span_err!(ctxt.session, item.span, E0136, "multiple `main` functions")
-                    .emit();
-            }
-        }
+    match entry_point_type {
+        EntryPointType::None => {}
+        EntryPointType::MainNamed => {}
         EntryPointType::OtherMain => {
-            ctxt.non_main_fns.push((item.hir_id(), item.span));
+            ctxt.non_main_fns.push(ctxt.tcx.def_span(id.owner_id));
         }
-        EntryPointType::MainAttr => {
-            if ctxt.attr_main_fn.is_none() {
-                ctxt.attr_main_fn = Some((item.hir_id(), item.span));
+        EntryPointType::RustcMainAttr => {
+            if ctxt.rustc_main_fn.is_none() {
+                ctxt.rustc_main_fn = Some((id.owner_id.def_id, ctxt.tcx.def_span(id.owner_id)));
             } else {
-                struct_span_err!(
-                    ctxt.session,
-                    item.span,
-                    E0137,
-                    "multiple functions with a `#[main]` attribute"
-                )
-                .span_label(item.span, "additional `#[main]` function")
-                .span_label(ctxt.attr_main_fn.unwrap().1, "first `#[main]` function")
-                .emit();
-            }
-        }
-        EntryPointType::Start => {
-            if ctxt.start_fn.is_none() {
-                ctxt.start_fn = Some((item.hir_id(), item.span));
-            } else {
-                struct_span_err!(ctxt.session, item.span, E0138, "multiple `start` functions")
-                    .span_label(ctxt.start_fn.unwrap().1, "previous `#[start]` function here")
-                    .span_label(item.span, "multiple `start` functions")
-                    .emit();
+                ctxt.tcx.dcx().emit_err(MultipleRustcMain {
+                    span: ctxt.tcx.def_span(id.owner_id.to_def_id()),
+                    first: ctxt.rustc_main_fn.unwrap().1,
+                    additional: ctxt.tcx.def_span(id.owner_id.to_def_id()),
+                });
             }
         }
     }
 }
 
-fn configure_main(
-    tcx: TyCtxt<'_>,
-    visitor: &EntryContext<'_, '_>,
-) -> Option<(LocalDefId, EntryFnType)> {
-    if let Some((hir_id, _)) = visitor.start_fn {
-        Some((tcx.hir().local_def_id(hir_id), EntryFnType::Start))
-    } else if let Some((hir_id, _)) = visitor.attr_main_fn {
-        Some((tcx.hir().local_def_id(hir_id), EntryFnType::Main))
-    } else if let Some((hir_id, _)) = visitor.main_fn {
-        Some((tcx.hir().local_def_id(hir_id), EntryFnType::Main))
+fn configure_main(tcx: TyCtxt<'_>, visitor: &EntryContext<'_>) -> Option<(DefId, EntryFnType)> {
+    if let Some((local_def_id, _)) = visitor.rustc_main_fn {
+        let def_id = local_def_id.to_def_id();
+        Some((def_id, EntryFnType::Main { sigpipe: sigpipe(tcx) }))
     } else {
+        // The actual resolution of main happens in the resolver, this here
+        if let Some(main_def) = tcx.resolutions(()).main_def
+            && let Some(def_id) = main_def.opt_fn_def_id()
+        {
+            // non-local main imports are handled below
+            if let Some(def_id) = def_id.as_local()
+                && matches!(tcx.hir_node_by_def_id(def_id), Node::ForeignItem(_))
+            {
+                tcx.dcx().emit_err(ExternMain { span: tcx.def_span(def_id) });
+                return None;
+            }
+
+            return Some((def_id, EntryFnType::Main { sigpipe: sigpipe(tcx) }));
+        }
         no_main_err(tcx, visitor);
         None
     }
 }
 
-fn no_main_err(tcx: TyCtxt<'_>, visitor: &EntryContext<'_, '_>) {
-    let sp = tcx.hir().krate().item.span;
-    if *tcx.sess.parse_sess.reached_eof.borrow() {
-        // There's an unclosed brace that made the parser reach `Eof`, we shouldn't complain about
-        // the missing `fn main()` then as it might have been hidden inside an unclosed block.
-        tcx.sess.delay_span_bug(sp, "`main` not found, but expected unclosed brace error");
-        return;
+fn sigpipe(tcx: TyCtxt<'_>) -> u8 {
+    match tcx.sess.opts.unstable_opts.on_broken_pipe {
+        rustc_target::spec::OnBrokenPipe::Default => sigpipe::DEFAULT,
+        rustc_target::spec::OnBrokenPipe::Kill => sigpipe::SIG_DFL,
+        rustc_target::spec::OnBrokenPipe::Error => sigpipe::SIG_IGN,
+        rustc_target::spec::OnBrokenPipe::Inherit => sigpipe::INHERIT,
     }
+}
+
+fn no_main_err(tcx: TyCtxt<'_>, visitor: &EntryContext<'_>) {
+    let sp = tcx.def_span(CRATE_DEF_ID);
 
     // There is no main function.
-    let mut err = struct_span_err!(
-        tcx.sess,
-        DUMMY_SP,
-        E0601,
-        "`main` function not found in crate `{}`",
-        tcx.crate_name(LOCAL_CRATE)
-    );
-    let filename = &tcx.sess.local_crate_source_file;
-    let note = if !visitor.non_main_fns.is_empty() {
-        for &(_, span) in &visitor.non_main_fns {
-            err.span_note(span, "here is a function named `main`");
-        }
-        err.note("you have one or more functions named `main` not defined at the crate level");
-        err.help(
-            "either move the `main` function definitions or attach the `#[main]` attribute \
-                  to one of them",
-        );
-        // There were some functions named `main` though. Try to give the user a hint.
-        format!(
-            "the main function must be defined at the crate level{}",
-            filename.as_ref().map(|f| format!(" (in `{}`)", f.display())).unwrap_or_default()
-        )
-    } else if let Some(filename) = filename {
-        format!("consider adding a `main` function to `{}`", filename.display())
-    } else {
-        String::from("consider adding a `main` function at the crate level")
-    };
+    let mut has_filename = true;
+    let filename = tcx
+        .sess
+        .local_crate_source_file()
+        .map(|src| src.for_scope(&tcx.sess, RemapPathScopeComponents::DIAGNOSTICS).to_path_buf())
+        .unwrap_or_else(|| {
+            has_filename = false;
+            Default::default()
+        });
+    let main_def_opt = tcx.resolutions(()).main_def;
+    let code = E0601;
+    let add_teach_note = tcx.sess.teach(code);
     // The file may be empty, which leads to the diagnostic machinery not emitting this
     // note. This is a relatively simple way to detect that case and emit a span-less
     // note instead.
-    if tcx.sess.source_map().lookup_line(sp.lo()).is_ok() {
-        err.set_span(sp);
-        err.span_label(sp, &note);
-    } else {
-        err.note(&note);
-    }
-    if tcx.sess.teach(&err.get_code().unwrap()) {
-        err.note(
-            "If you don't know the basics of Rust, you can go look to the Rust Book \
-                  to get started: https://doc.rust-lang.org/book/",
-        );
-    }
-    err.emit();
-}
+    let file_empty = tcx.sess.source_map().lookup_line(sp.hi()).is_err();
 
-pub fn find_entry_point(tcx: TyCtxt<'_>) -> Option<(LocalDefId, EntryFnType)> {
-    tcx.entry_fn(LOCAL_CRATE)
+    tcx.dcx().emit_err(NoMainErr {
+        sp,
+        crate_name: tcx.crate_name(LOCAL_CRATE),
+        has_filename,
+        filename,
+        file_empty,
+        non_main_fns: visitor.non_main_fns.clone(),
+        main_def_opt,
+        add_teach_note,
+    });
 }
 
 pub fn provide(providers: &mut Providers) {

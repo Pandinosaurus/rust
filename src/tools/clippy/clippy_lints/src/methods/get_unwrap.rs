@@ -1,9 +1,7 @@
 use super::utils::derefs_to_slice;
-use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::get_parent_expr;
 use clippy_utils::source::snippet_with_applicability;
-use clippy_utils::ty::{is_type_diagnostic_item, match_type};
-use clippy_utils::{get_parent_expr, paths};
-use if_chain::if_chain;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_lint::LateContext;
@@ -11,75 +9,80 @@ use rustc_span::sym;
 
 use super::GET_UNWRAP;
 
-pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, expr: &hir::Expr<'_>, get_args: &'tcx [hir::Expr<'_>], is_mut: bool) {
+pub(super) fn check<'tcx>(
+    cx: &LateContext<'tcx>,
+    expr: &hir::Expr<'_>,
+    recv: &'tcx hir::Expr<'tcx>,
+    get_arg: &'tcx hir::Expr<'_>,
+    is_mut: bool,
+) {
     // Note: we don't want to lint `get_mut().unwrap` for `HashMap` or `BTreeMap`,
     // because they do not implement `IndexMut`
-    let mut applicability = Applicability::MachineApplicable;
-    let expr_ty = cx.typeck_results().expr_ty(&get_args[0]);
-    let get_args_str = if get_args.len() > 1 {
-        snippet_with_applicability(cx, get_args[1].span, "..", &mut applicability)
-    } else {
-        return; // not linting on a .get().unwrap() chain or variant
-    };
-    let mut needs_ref;
-    let caller_type = if derefs_to_slice(cx, &get_args[0], expr_ty).is_some() {
-        needs_ref = get_args_str.parse::<usize>().is_ok();
+    let expr_ty = cx.typeck_results().expr_ty(recv);
+    let caller_type = if derefs_to_slice(cx, recv, expr_ty).is_some() {
         "slice"
-    } else if is_type_diagnostic_item(cx, expr_ty, sym::vec_type) {
-        needs_ref = get_args_str.parse::<usize>().is_ok();
-        "Vec"
-    } else if is_type_diagnostic_item(cx, expr_ty, sym::vecdeque_type) {
-        needs_ref = get_args_str.parse::<usize>().is_ok();
-        "VecDeque"
-    } else if !is_mut && is_type_diagnostic_item(cx, expr_ty, sym::hashmap_type) {
-        needs_ref = true;
-        "HashMap"
-    } else if !is_mut && match_type(cx, expr_ty, &paths::BTREEMAP) {
-        needs_ref = true;
-        "BTreeMap"
     } else {
-        return; // caller is not a type that we want to lint
+        match expr_ty
+            .ty_adt_def()
+            .and_then(|def| cx.tcx.get_diagnostic_name(def.did()))
+        {
+            Some(sym::Vec) => "Vec",
+            Some(sym::VecDeque) => "VecDeque",
+            Some(sym::HashMap) if !is_mut => "HashMap",
+            Some(sym::BTreeMap) if !is_mut => "BTreeMap",
+            _ => return, // caller is not a type that we want to lint
+        }
     };
 
     let mut span = expr.span;
 
-    // Handle the case where the result is immediately dereferenced
-    // by not requiring ref and pulling the dereference into the
-    // suggestion.
-    if_chain! {
-        if needs_ref;
-        if let Some(parent) = get_parent_expr(cx, expr);
-        if let hir::ExprKind::Unary(hir::UnOp::Deref, _) = parent.kind;
-        then {
-            needs_ref = false;
+    // Handle the case where the result is immediately dereferenced,
+    // either directly be the user, or as a result of a method call or the like
+    // by not requiring an explicit reference
+    let needs_ref = if let Some(parent) = get_parent_expr(cx, expr)
+        && let hir::ExprKind::Unary(hir::UnOp::Deref, _)
+        | hir::ExprKind::MethodCall(..)
+        | hir::ExprKind::Field(..)
+        | hir::ExprKind::Index(..) = parent.kind
+    {
+        if let hir::ExprKind::Unary(hir::UnOp::Deref, _) = parent.kind {
+            // if the user explicitly dereferences the result, we can adjust
+            // the span to also include the deref part
             span = parent.span;
         }
-    }
-
-    let mut_str = if is_mut { "_mut" } else { "" };
-    let borrow_str = if !needs_ref {
-        ""
-    } else if is_mut {
-        "&mut "
+        false
     } else {
-        "&"
+        true
     };
 
-    span_lint_and_sugg(
+    let mut_str = if is_mut { "_mut" } else { "" };
+
+    span_lint_and_then(
         cx,
         GET_UNWRAP,
         span,
-        &format!(
-            "called `.get{0}().unwrap()` on a {1}. Using `[]` is more clear and more concise",
-            mut_str, caller_type
-        ),
-        "try this",
-        format!(
-            "{}{}[{}]",
-            borrow_str,
-            snippet_with_applicability(cx, get_args[0].span, "..", &mut applicability),
-            get_args_str
-        ),
-        applicability,
+        format!("called `.get{mut_str}().unwrap()` on a {caller_type}"),
+        |diag| {
+            let mut applicability = Applicability::MachineApplicable;
+            let get_args_str = snippet_with_applicability(cx, get_arg.span, "..", &mut applicability);
+
+            let borrow_str = if !needs_ref {
+                ""
+            } else if is_mut {
+                "&mut "
+            } else {
+                "&"
+            };
+
+            diag.span_suggestion_verbose(
+                span,
+                "using `[]` is clearer and more concise",
+                format!(
+                    "{borrow_str}{}[{get_args_str}]",
+                    snippet_with_applicability(cx, recv.span, "..", &mut applicability)
+                ),
+                applicability,
+            );
+        },
     );
 }

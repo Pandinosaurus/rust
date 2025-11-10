@@ -8,8 +8,8 @@ pub use self::poll::Poll;
 
 mod wake;
 #[stable(feature = "futures_api", since = "1.36.0")]
-pub use self::wake::{Context, RawWaker, RawWakerVTable, Waker};
+pub use self::wake::{Context, ContextBuilder, LocalWaker, RawWaker, RawWakerVTable, Waker};
 
 mod ready;
-#[unstable(feature = "ready_macro", issue = "70922")]
+#[stable(feature = "ready_macro", since = "1.64.0")]
 pub use ready::ready;

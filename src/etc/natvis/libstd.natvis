@@ -18,8 +18,8 @@
     look/feel at the std type level *anyways*...
 
     References:
-      https://github.com/rust-lang/rust/blob/master/src/libstd/collections/hash/map.rs
-      https://github.com/rust-lang/rust/blob/master/src/libstd/collections/hash/set.rs
+      https://github.com/rust-lang/rust/blob/HEAD/src/libstd/collections/hash/map.rs
+      https://github.com/rust-lang/rust/blob/HEAD/src/libstd/collections/hash/set.rs
       https://github.com/rust-lang/hashbrown/blob/master/src/map.rs
       https://github.com/rust-lang/hashbrown/blob/master/src/set.rs
       https://github.com/rust-lang/hashbrown/blob/master/src/raw/mod.rs
@@ -41,7 +41,7 @@
           <If Condition="(base.table.table.ctrl.pointer[i] &amp; 0x80) == 0">
             <!-- Bucket is populated -->
             <Exec>n--</Exec>
-            <Item Name="{((tuple&lt;$T1, $T2&gt;*)base.table.table.ctrl.pointer)[-(i + 1)].__0}">((tuple&lt;$T1, $T2&gt;*)base.table.table.ctrl.pointer)[-(i + 1)].__1</Item>
+            <Item Name="{((tuple$&lt;$T1,$T2&gt;*)base.table.table.ctrl.pointer)[-(i + 1)].__0}">((tuple$&lt;$T1,$T2&gt;*)base.table.table.ctrl.pointer)[-(i + 1)].__1</Item>
           </If>
           <Exec>i++</Exec>
         </Loop>
@@ -74,9 +74,10 @@
   </Type>
 
   <Type Name="std::ffi::c_str::CString">
-    <DisplayString>{inner.data_ptr,s}</DisplayString>
+    <DisplayString>{(char*)inner.data_ptr}</DisplayString>
     <Expand>
       <Synthetic Name="[chars]">
+        <DisplayString>{(char*)inner.data_ptr}</DisplayString>
         <Expand>
           <ArrayItems>
             <Size>inner.length</Size>
@@ -96,6 +97,21 @@
           <ArrayItems>
             <Size>strlen((char *) inner) + 1</Size>
             <ValuePointer>(char*)inner</ValuePointer>
+          </ArrayItems>
+        </Expand>
+      </Synthetic>
+    </Expand>
+  </Type>
+
+  <Type Name="std::ffi::os_str::OsString">
+    <DisplayString>{(char*)inner.inner.bytes.buf.inner.ptr.pointer.pointer,[inner.inner.bytes.len]}</DisplayString>
+    <Expand>
+      <Synthetic Name="[chars]">
+        <DisplayString>{(char*)inner.inner.bytes.buf.inner.ptr.pointer.pointer,[inner.inner.bytes.len]}</DisplayString>
+        <Expand>
+          <ArrayItems>
+            <Size>inner.inner.bytes.len</Size>
+            <ValuePointer>(char*)inner.inner.bytes.buf.inner.ptr.pointer.pointer</ValuePointer>
           </ArrayItems>
         </Expand>
       </Synthetic>

@@ -2,21 +2,22 @@ use clippy_utils::diagnostics::span_lint;
 use clippy_utils::is_adjusted;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for construction of a structure or tuple just to
+    /// ### What it does
+    /// Checks for construction of a structure or tuple just to
     /// assign a value in it.
     ///
-    /// **Why is this bad?** Readability. If the structure is only created to be
+    /// ### Why is this bad?
+    /// Readability. If the structure is only created to be
     /// updated, why not write the structure you want in the first place?
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
-    /// ```rust
+    /// ### Example
+    /// ```no_run
     /// (0, 0).0 = 1
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub TEMPORARY_ASSIGNMENT,
     complexity,
     "assignments to temporaries"
@@ -32,7 +33,7 @@ impl<'tcx> LateLintPass<'tcx> for TemporaryAssignment {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
         if let ExprKind::Assign(target, ..) = &expr.kind {
             let mut base = target;
-            while let ExprKind::Field(f, _) | ExprKind::Index(f, _) = &base.kind {
+            while let ExprKind::Field(f, _) | ExprKind::Index(f, _, _) = &base.kind {
                 base = f;
             }
             if is_temporary(base) && !is_adjusted(cx, base) {

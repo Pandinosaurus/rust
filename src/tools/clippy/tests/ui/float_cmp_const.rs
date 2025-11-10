@@ -1,5 +1,4 @@
-// does not test any rustfixable lints
-
+//@no-rustfix: suggestions have an error margin placeholder
 #![warn(clippy::float_cmp_const)]
 #![allow(clippy::float_cmp)]
 #![allow(unused, clippy::no_effect, clippy::unnecessary_operation)]
@@ -14,15 +13,27 @@ fn eq_one(x: f32) -> bool {
 fn main() {
     // has errors
     1f32 == ONE;
+    //~^ float_cmp_const
+
     TWO == ONE;
+    //~^ float_cmp_const
+
     TWO != ONE;
+    //~^ float_cmp_const
+
     ONE + ONE == TWO;
+    //~^ float_cmp_const
+
     let x = 1;
     x as f32 == ONE;
+    //~^ float_cmp_const
 
     let v = 0.9;
     v == ONE;
+    //~^ float_cmp_const
+
     v != ONE;
+    //~^ float_cmp_const
 
     // no errors, lower than or greater than comparisons
     v < ONE;
@@ -55,4 +66,5 @@ fn main() {
 
     // has errors
     NON_ZERO_ARRAY == NON_ZERO_ARRAY2;
+    //~^ float_cmp_const
 }

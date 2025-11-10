@@ -1,28 +1,25 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::source::snippet;
-use clippy_utils::ty::is_type_diagnostic_item;
+use clippy_utils::res::MaybeDef;
+use clippy_utils::source::{snippet, snippet_with_applicability, snippet_with_context};
 use clippy_utils::{iter_input_pats, method_chain_args};
-use if_chain::if_chain;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::{self, Ty};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
-use rustc_span::source_map::Span;
-use rustc_span::sym;
+use rustc_session::declare_lint_pass;
+use rustc_span::{Span, sym};
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for usage of `option.map(f)` where f is a function
+    /// ### What it does
+    /// Checks for usage of `option.map(f)` where f is a function
     /// or closure that returns the unit type `()`.
     ///
-    /// **Why is this bad?** Readability, this can be written more clearly with
+    /// ### Why is this bad?
+    /// Readability, this can be written more clearly with
     /// an if let statement
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
-    ///
-    /// ```rust
+    /// ### Example
+    /// ```no_run
     /// # fn do_stuff() -> Option<String> { Some(String::new()) }
     /// # fn log_err_msg(foo: String) -> Option<String> { Some(foo) }
     /// # fn format_msg(foo: String) -> String { String::new() }
@@ -34,7 +31,7 @@ declare_clippy_lint! {
     ///
     /// The correct use would be:
     ///
-    /// ```rust
+    /// ```no_run
     /// # fn do_stuff() -> Option<String> { Some(String::new()) }
     /// # fn log_err_msg(foo: String) -> Option<String> { Some(foo) }
     /// # fn format_msg(foo: String) -> String { String::new() }
@@ -48,23 +45,23 @@ declare_clippy_lint! {
     ///     log_err_msg(format_msg(msg));
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub OPTION_MAP_UNIT_FN,
     complexity,
     "using `option.map(f)`, where `f` is a function or closure that returns `()`"
 }
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for usage of `result.map(f)` where f is a function
+    /// ### What it does
+    /// Checks for usage of `result.map(f)` where f is a function
     /// or closure that returns the unit type `()`.
     ///
-    /// **Why is this bad?** Readability, this can be written more clearly with
+    /// ### Why is this bad?
+    /// Readability, this can be written more clearly with
     /// an if let statement
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
-    ///
-    /// ```rust
+    /// ### Example
+    /// ```no_run
     /// # fn do_stuff() -> Result<String, String> { Ok(String::new()) }
     /// # fn log_err_msg(foo: String) -> Result<String, String> { Ok(foo) }
     /// # fn format_msg(foo: String) -> String { String::new() }
@@ -76,7 +73,7 @@ declare_clippy_lint! {
     ///
     /// The correct use would be:
     ///
-    /// ```rust
+    /// ```no_run
     /// # fn do_stuff() -> Result<String, String> { Ok(String::new()) }
     /// # fn log_err_msg(foo: String) -> Result<String, String> { Ok(foo) }
     /// # fn format_msg(foo: String) -> String { String::new() }
@@ -89,6 +86,7 @@ declare_clippy_lint! {
     ///     log_err_msg(format_msg(msg));
     /// };
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub RESULT_MAP_UNIT_FN,
     complexity,
     "using `result.map(f)`, where `f` is a function or closure that returns `()`"
@@ -97,20 +95,16 @@ declare_clippy_lint! {
 declare_lint_pass!(MapUnit => [OPTION_MAP_UNIT_FN, RESULT_MAP_UNIT_FN]);
 
 fn is_unit_type(ty: Ty<'_>) -> bool {
-    match ty.kind() {
-        ty::Tuple(slice) => slice.is_empty(),
-        ty::Never => true,
-        _ => false,
-    }
+    ty.is_unit() || ty.is_never()
 }
 
 fn is_unit_function(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> bool {
     let ty = cx.typeck_results().expr_ty(expr);
 
-    if let ty::FnDef(id, _) = *ty.kind() {
-        if let Some(fn_type) = cx.tcx.fn_sig(id).no_bound_vars() {
-            return is_unit_type(fn_type.output());
-        }
+    if let ty::FnDef(id, _) = *ty.kind()
+        && let Some(fn_type) = cx.tcx.fn_sig(id).instantiate_identity().no_bound_vars()
+    {
+        return is_unit_type(fn_type.output());
     }
     false
 }
@@ -122,31 +116,35 @@ fn is_unit_expression(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> bool {
 /// The expression inside a closure may or may not have surrounding braces and
 /// semicolons, which causes problems when generating a suggestion. Given an
 /// expression that evaluates to '()' or '!', recursively remove useless braces
-/// and semi-colons until is suitable for including in the suggestion template
-fn reduce_unit_expression<'a>(cx: &LateContext<'_>, expr: &'a hir::Expr<'_>) -> Option<Span> {
+/// and semi-colons until is suitable for including in the suggestion template.
+/// The `bool` is `true` when the resulting `span` needs to be enclosed in an
+/// `unsafe` block.
+fn reduce_unit_expression(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<(Span, bool)> {
     if !is_unit_expression(cx, expr) {
         return None;
     }
 
     match expr.kind {
-        hir::ExprKind::Call(_, _) | hir::ExprKind::MethodCall(_, _, _, _) => {
+        hir::ExprKind::Call(_, _) | hir::ExprKind::MethodCall(..) => {
             // Calls can't be reduced any more
-            Some(expr.span)
+            Some((expr.span, false))
         },
-        hir::ExprKind::Block(ref block, _) => {
+        hir::ExprKind::Block(block, _) => {
+            let is_unsafe = matches!(block.rules, hir::BlockCheckMode::UnsafeBlock(_));
             match (block.stmts, block.expr.as_ref()) {
-                (&[], Some(inner_expr)) => {
+                ([], Some(inner_expr)) => {
                     // If block only contains an expression,
                     // reduce `{ X }` to `X`
                     reduce_unit_expression(cx, inner_expr)
+                        .map(|(span, inner_is_unsafe)| (span, inner_is_unsafe || is_unsafe))
                 },
-                (&[ref inner_stmt], None) => {
+                ([inner_stmt], None) => {
                     // If block only contains statements,
                     // reduce `{ X; }` to `X` or `X;`
                     match inner_stmt.kind {
-                        hir::StmtKind::Local(ref local) => Some(local.span),
-                        hir::StmtKind::Expr(ref e) => Some(e.span),
-                        hir::StmtKind::Semi(..) => Some(inner_stmt.span),
+                        hir::StmtKind::Let(local) => Some((local.span, is_unsafe)),
+                        hir::StmtKind::Expr(e) => Some((e.span, is_unsafe)),
+                        hir::StmtKind::Semi(..) => Some((inner_stmt.span, is_unsafe)),
                         hir::StmtKind::Item(..) => None,
                     }
                 },
@@ -168,18 +166,14 @@ fn unit_closure<'tcx>(
     cx: &LateContext<'tcx>,
     expr: &hir::Expr<'_>,
 ) -> Option<(&'tcx hir::Param<'tcx>, &'tcx hir::Expr<'tcx>)> {
-    if let hir::ExprKind::Closure(_, ref decl, inner_expr_id, _, _) = expr.kind {
-        let body = cx.tcx.hir().body(inner_expr_id);
-        let body_expr = &body.value;
-
-        if_chain! {
-            if decl.inputs.len() == 1;
-            if is_unit_expression(cx, body_expr);
-            if let Some(binding) = iter_input_pats(&decl, body).next();
-            then {
-                return Some((binding, body_expr));
-            }
-        }
+    if let hir::ExprKind::Closure(&hir::Closure { fn_decl, body, .. }) = expr.kind
+        && let body = cx.tcx.hir_body(body)
+        && let body_expr = &body.value
+        && fn_decl.inputs.len() == 1
+        && is_unit_expression(cx, body_expr)
+        && let Some(binding) = iter_input_pats(fn_decl, body).next()
+    {
+        return Some((binding, body_expr));
     }
     None
 }
@@ -192,7 +186,7 @@ fn unit_closure<'tcx>(
 /// Anything else will return `a`.
 fn let_binding_name(cx: &LateContext<'_>, var_arg: &hir::Expr<'_>) -> String {
     match &var_arg.kind {
-        hir::ExprKind::Field(_, _) => snippet(cx, var_arg.span, "_").replace(".", "_"),
+        hir::ExprKind::Field(_, _) => snippet(cx, var_arg.span, "_").replace('.', "_"),
         hir::ExprKind::Path(_) => format!("_{}", snippet(cx, var_arg.span, "")),
         _ => "a".to_string(),
     }
@@ -200,56 +194,58 @@ fn let_binding_name(cx: &LateContext<'_>, var_arg: &hir::Expr<'_>) -> String {
 
 #[must_use]
 fn suggestion_msg(function_type: &str, map_type: &str) -> String {
-    format!(
-        "called `map(f)` on an `{0}` value where `f` is a {1} that returns the unit type `()`",
-        map_type, function_type
-    )
+    format!("called `map(f)` on an `{map_type}` value where `f` is a {function_type} that returns the unit type `()`")
 }
 
-fn lint_map_unit_fn(cx: &LateContext<'_>, stmt: &hir::Stmt<'_>, expr: &hir::Expr<'_>, map_args: &[hir::Expr<'_>]) {
-    let var_arg = &map_args[0];
+fn lint_map_unit_fn(
+    cx: &LateContext<'_>,
+    stmt: &hir::Stmt<'_>,
+    expr: &hir::Expr<'_>,
+    map_args: (&hir::Expr<'_>, &[hir::Expr<'_>]),
+) {
+    let var_arg = &map_args.0;
 
-    let (map_type, variant, lint) =
-        if is_type_diagnostic_item(cx, cx.typeck_results().expr_ty(var_arg), sym::option_type) {
-            ("Option", "Some", OPTION_MAP_UNIT_FN)
-        } else if is_type_diagnostic_item(cx, cx.typeck_results().expr_ty(var_arg), sym::result_type) {
-            ("Result", "Ok", RESULT_MAP_UNIT_FN)
-        } else {
-            return;
-        };
-    let fn_arg = &map_args[1];
+    let (map_type, variant, lint) = if cx.typeck_results().expr_ty(var_arg).is_diag_item(cx, sym::Option) {
+        ("Option", "Some", OPTION_MAP_UNIT_FN)
+    } else if cx.typeck_results().expr_ty(var_arg).is_diag_item(cx, sym::Result) {
+        ("Result", "Ok", RESULT_MAP_UNIT_FN)
+    } else {
+        return;
+    };
+    let fn_arg = &map_args.1[0];
+
+    #[expect(clippy::items_after_statements, reason = "the const is only used below")]
+    const SUGG_MSG: &str = "use `if let` instead";
 
     if is_unit_function(cx, fn_arg) {
+        let mut applicability = Applicability::MachineApplicable;
         let msg = suggestion_msg("function", map_type);
         let suggestion = format!(
             "if let {0}({binding}) = {1} {{ {2}({binding}) }}",
             variant,
-            snippet(cx, var_arg.span, "_"),
-            snippet(cx, fn_arg.span, "_"),
+            snippet_with_applicability(cx, var_arg.span, "_", &mut applicability),
+            snippet_with_applicability(cx, fn_arg.span, "_", &mut applicability),
             binding = let_binding_name(cx, var_arg)
         );
 
-        span_lint_and_then(cx, lint, expr.span, &msg, |diag| {
-            diag.span_suggestion(stmt.span, "try this", suggestion, Applicability::MachineApplicable);
+        span_lint_and_then(cx, lint, expr.span, msg, |diag| {
+            diag.span_suggestion_verbose(stmt.span, SUGG_MSG, suggestion, applicability);
         });
     } else if let Some((binding, closure_expr)) = unit_closure(cx, fn_arg) {
         let msg = suggestion_msg("closure", map_type);
 
-        span_lint_and_then(cx, lint, expr.span, &msg, |diag| {
-            if let Some(reduced_expr_span) = reduce_unit_expression(cx, closure_expr) {
+        span_lint_and_then(cx, lint, expr.span, msg, |diag| {
+            if let Some((reduced_expr_span, is_unsafe)) = reduce_unit_expression(cx, closure_expr) {
+                let mut applicability = Applicability::MachineApplicable;
+                let (prefix_is_unsafe, suffix_is_unsafe) = if is_unsafe { ("unsafe { ", " }") } else { ("", "") };
                 let suggestion = format!(
-                    "if let {0}({1}) = {2} {{ {3} }}",
+                    "if let {0}({1}) = {2} {{ {prefix_is_unsafe}{3}{suffix_is_unsafe} }}",
                     variant,
-                    snippet(cx, binding.pat.span, "_"),
-                    snippet(cx, var_arg.span, "_"),
-                    snippet(cx, reduced_expr_span, "_")
+                    snippet_with_applicability(cx, binding.pat.span, "_", &mut applicability),
+                    snippet_with_applicability(cx, var_arg.span, "_", &mut applicability),
+                    snippet_with_context(cx, reduced_expr_span, var_arg.span.ctxt(), "_", &mut applicability).0,
                 );
-                diag.span_suggestion(
-                    stmt.span,
-                    "try this",
-                    suggestion,
-                    Applicability::MachineApplicable, // snippet
-                );
+                diag.span_suggestion_verbose(stmt.span, SUGG_MSG, suggestion, applicability);
             } else {
                 let suggestion = format!(
                     "if let {0}({1}) = {2} {{ ... }}",
@@ -257,22 +253,19 @@ fn lint_map_unit_fn(cx: &LateContext<'_>, stmt: &hir::Stmt<'_>, expr: &hir::Expr
                     snippet(cx, binding.pat.span, "_"),
                     snippet(cx, var_arg.span, "_"),
                 );
-                diag.span_suggestion(stmt.span, "try this", suggestion, Applicability::HasPlaceholders);
+                diag.span_suggestion_verbose(stmt.span, SUGG_MSG, suggestion, Applicability::HasPlaceholders);
             }
         });
     }
 }
 
-impl<'tcx> LateLintPass<'tcx> for MapUnit {
+impl LateLintPass<'_> for MapUnit {
     fn check_stmt(&mut self, cx: &LateContext<'_>, stmt: &hir::Stmt<'_>) {
-        if stmt.span.from_expansion() {
-            return;
-        }
-
-        if let hir::StmtKind::Semi(ref expr) = stmt.kind {
-            if let Some(arglists) = method_chain_args(expr, &["map"]) {
-                lint_map_unit_fn(cx, stmt, expr, arglists[0]);
-            }
+        if let hir::StmtKind::Semi(expr) = stmt.kind
+            && !stmt.span.from_expansion()
+            && let Some(arglists) = method_chain_args(expr, &[sym::map])
+        {
+            lint_map_unit_fn(cx, stmt, expr, arglists[0]);
         }
     }
 }

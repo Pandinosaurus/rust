@@ -1,6 +1,14 @@
-#![feature(const_fn_transmute)]
-#![allow(dead_code)]
-
+#![feature(f128)]
+#![feature(f16)]
+#![allow(
+    dead_code,
+    clippy::borrow_as_ptr,
+    unnecessary_transmutes,
+    integer_to_ptr_transmutes,
+    clippy::needless_lifetimes,
+    clippy::missing_transmute_annotations
+)]
+//@no-rustfix
 extern crate core;
 
 use std::mem::transmute as my_transmute;
@@ -17,37 +25,64 @@ fn my_vec() -> MyVec<i32> {
 #[allow(clippy::needless_lifetimes, clippy::transmute_ptr_to_ptr)]
 #[warn(clippy::useless_transmute)]
 unsafe fn _generic<'a, T, U: 'a>(t: &'a T) {
-    let _: &'a T = core::intrinsics::transmute(t);
+    unsafe {
+        // FIXME: should lint
+        // let _: &'a T = core::mem::transmute(t);
 
-    let _: &'a U = core::intrinsics::transmute(t);
+        let _: &'a U = core::mem::transmute(t);
 
-    let _: *const T = core::intrinsics::transmute(t);
+        let _: *const T = core::mem::transmute(t);
+        //~^ useless_transmute
 
-    let _: *mut T = core::intrinsics::transmute(t);
+        let _: *mut T = core::mem::transmute(t);
+        //~^ useless_transmute
 
-    let _: *const U = core::intrinsics::transmute(t);
+        let _: *const U = core::mem::transmute(t);
+        //~^ useless_transmute
+    }
 }
 
 #[warn(clippy::useless_transmute)]
 fn useless() {
     unsafe {
-        let _: Vec<i32> = core::intrinsics::transmute(my_vec());
+        let _: Vec<i32> = core::mem::transmute(my_vec());
+        //~^ useless_transmute
 
         let _: Vec<i32> = core::mem::transmute(my_vec());
-
-        let _: Vec<i32> = std::intrinsics::transmute(my_vec());
+        //~^ useless_transmute
 
         let _: Vec<i32> = std::mem::transmute(my_vec());
+        //~^ useless_transmute
+
+        let _: Vec<i32> = std::mem::transmute(my_vec());
+        //~^ useless_transmute
 
         let _: Vec<i32> = my_transmute(my_vec());
+        //~^ useless_transmute
 
         let _: *const usize = std::mem::transmute(5_isize);
 
-        let _ = 5_isize as *const usize;
+        let _ = std::ptr::dangling::<usize>();
 
         let _: *const usize = std::mem::transmute(1 + 1usize);
 
         let _ = (1 + 1_usize) as *const usize;
+    }
+
+    unsafe fn _f<'a, 'b>(x: &'a u32) -> &'b u32 {
+        unsafe { std::mem::transmute(x) }
+    }
+
+    unsafe fn _f2<'a, 'b>(x: *const (dyn Iterator<Item = u32> + 'a)) -> *const (dyn Iterator<Item = u32> + 'b) {
+        unsafe { std::mem::transmute(x) }
+    }
+
+    unsafe fn _f3<'a, 'b>(x: fn(&'a u32)) -> fn(&'b u32) {
+        unsafe { std::mem::transmute(x) }
+    }
+
+    unsafe fn _f4<'a, 'b>(x: std::borrow::Cow<'a, str>) -> std::borrow::Cow<'b, str> {
+        unsafe { std::mem::transmute(x) }
     }
 }
 
@@ -60,53 +95,37 @@ fn crosspointer() {
     let int_mut_ptr: *mut Usize = &mut int as *mut Usize;
 
     unsafe {
-        let _: Usize = core::intrinsics::transmute(int_const_ptr);
+        let _: Usize = core::mem::transmute(int_const_ptr);
+        //~^ crosspointer_transmute
 
-        let _: Usize = core::intrinsics::transmute(int_mut_ptr);
+        let _: Usize = core::mem::transmute(int_mut_ptr);
+        //~^ crosspointer_transmute
 
-        let _: *const Usize = core::intrinsics::transmute(my_int());
+        let _: *const Usize = core::mem::transmute(my_int());
+        //~^ crosspointer_transmute
 
-        let _: *mut Usize = core::intrinsics::transmute(my_int());
+        let _: *mut Usize = core::mem::transmute(my_int());
+        //~^ crosspointer_transmute
     }
-}
-
-#[warn(clippy::transmute_int_to_char)]
-fn int_to_char() {
-    let _: char = unsafe { std::mem::transmute(0_u32) };
-    let _: char = unsafe { std::mem::transmute(0_i32) };
 }
 
 #[warn(clippy::transmute_int_to_bool)]
 fn int_to_bool() {
     let _: bool = unsafe { std::mem::transmute(0_u8) };
+    //~^ transmute_int_to_bool
 }
 
-#[warn(clippy::transmute_int_to_float)]
-mod int_to_float {
-    fn test() {
-        let _: f32 = unsafe { std::mem::transmute(0_u32) };
-        let _: f32 = unsafe { std::mem::transmute(0_i32) };
-        let _: f64 = unsafe { std::mem::transmute(0_u64) };
-        let _: f64 = unsafe { std::mem::transmute(0_i64) };
-    }
+fn bytes_to_str(mb: &mut [u8]) {
+    const B: &[u8] = b"";
 
-    mod issue_5747 {
-        const VALUE32: f32 = unsafe { std::mem::transmute(0_u32) };
-        const VALUE64: f64 = unsafe { std::mem::transmute(0_i64) };
+    let _: &str = unsafe { std::mem::transmute(B) };
+    //~^ transmute_bytes_to_str
 
-        const fn from_bits_32(v: i32) -> f32 {
-            unsafe { std::mem::transmute(v) }
-        }
-
-        const fn from_bits_64(v: u64) -> f64 {
-            unsafe { std::mem::transmute(v) }
-        }
-    }
-}
-
-fn bytes_to_str(b: &[u8], mb: &mut [u8]) {
-    let _: &str = unsafe { std::mem::transmute(b) };
     let _: &mut str = unsafe { std::mem::transmute(mb) };
+    //~^ transmute_bytes_to_str
+
+    const _: &str = unsafe { std::mem::transmute(B) };
+    //~^ transmute_bytes_to_str
 }
 
 fn main() {}

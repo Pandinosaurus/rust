@@ -1,35 +1,35 @@
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![feature(core_intrinsics)]
-#![feature(crate_visibility_modifier)]
-#![feature(drain_filter)]
-#![feature(in_band_lifetimes)]
-#![feature(nll)]
-#![feature(once_cell)]
-#![cfg_attr(bootstrap, feature(or_patterns))]
-#![feature(proc_macro_internals)]
+// tidy-alphabetical-start
+#![allow(internal_features)]
+#![feature(decl_macro)]
+#![feature(error_iter)]
+#![feature(file_buffered)]
+#![feature(gen_blocks)]
+#![feature(if_let_guard)]
+#![feature(macro_metavar_expr)]
 #![feature(min_specialization)]
-#![feature(stmt_expr_attributes)]
-#![feature(try_blocks)]
 #![feature(never_type)]
-#![recursion_limit = "256"]
+#![feature(proc_macro_internals)]
+#![feature(trusted_len)]
+// tidy-alphabetical-end
 
-extern crate proc_macro;
-
-#[macro_use]
-extern crate rustc_macros;
-#[macro_use]
-extern crate rustc_middle;
-#[macro_use]
-extern crate rustc_data_structures;
-
-pub use rmeta::{provide, provide_extern};
+pub use rmeta::provide;
 
 mod dependency_format;
 mod foreign_modules;
-mod link_args;
 mod native_libs;
 mod rmeta;
 
 pub mod creader;
-pub mod dynamic_lib;
+pub mod errors;
+pub mod fs;
 pub mod locator;
+
+pub use creader::{DylibError, load_symbol_from_dylib};
+pub use fs::{METADATA_FILENAME, emit_wrapper_file};
+pub use native_libs::{
+    NativeLibSearchFallback, find_native_static_library, try_find_native_dynamic_library,
+    try_find_native_static_library, walk_native_lib_search_dirs,
+};
+pub use rmeta::{EncodedMetadata, METADATA_HEADER, encode_metadata, rendered_const};
+
+rustc_fluent_macro::fluent_messages! { "../messages.ftl" }

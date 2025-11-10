@@ -1,37 +1,34 @@
-use clippy_utils::diagnostics::span_lint;
+use clippy_config::Conf;
+use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::qualify_min_const_fn::is_min_const_fn;
-use clippy_utils::ty::has_drop;
-use clippy_utils::{fn_has_unsatisfiable_preds, is_entrypoint_fn, meets_msrv, trait_ref_of_method};
-use rustc_hir as hir;
+use clippy_utils::{fn_has_unsatisfiable_preds, is_entrypoint_fn, is_from_proc_macro, is_in_test, trait_ref_of_method};
+use rustc_abi::ExternAbi;
+use rustc_errors::Applicability;
+use rustc_hir::def_id::CRATE_DEF_ID;
 use rustc_hir::intravisit::FnKind;
-use rustc_hir::{Body, Constness, FnDecl, GenericParamKind, HirId};
-use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_middle::lint::in_external_macro;
-use rustc_semver::RustcVersion;
-use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_hir::{self as hir, Body, Constness, FnDecl, GenericParamKind, OwnerId};
+use rustc_lint::{LateContext, LateLintPass};
+use rustc_middle::ty;
+use rustc_session::impl_lint_pass;
 use rustc_span::Span;
-use rustc_typeck::hir_ty_to_ty;
-
-const MISSING_CONST_FOR_FN_MSRV: RustcVersion = RustcVersion::new(1, 37, 0);
+use rustc_span::def_id::LocalDefId;
 
 declare_clippy_lint! {
-    /// **What it does:**
-    ///
+    /// ### What it does
     /// Suggests the use of `const` in functions and methods where possible.
     ///
-    /// **Why is this bad?**
-    ///
+    /// ### Why is this bad?
     /// Not having the function const prevents callers of the function from being const as well.
     ///
-    /// **Known problems:**
-    ///
+    /// ### Known problems
     /// Const functions are currently still being worked on, with some features only being available
     /// on nightly. This lint does not consider all edge cases currently and the suggestions may be
     /// incorrect if you are using this lint on stable.
     ///
     /// Also, the lint only runs one pass over the code. Consider these two non-const functions:
     ///
-    /// ```rust
+    /// ```no_run
     /// fn a() -> i32 {
     ///     0
     /// }
@@ -44,9 +41,9 @@ declare_clippy_lint! {
     /// can't be const as it calls a non-const function. Making `a` const and running Clippy again,
     /// will suggest to make `b` const, too.
     ///
-    /// **Example:**
-    ///
-    /// ```rust
+    /// If you are marking a public function with `const`, removing it again will break API compatibility.
+    /// ### Example
+    /// ```no_run
     /// # struct Foo {
     /// #     random_number: usize,
     /// # }
@@ -59,7 +56,7 @@ declare_clippy_lint! {
     ///
     /// Could be a const fn:
     ///
-    /// ```rust
+    /// ```no_run
     /// # struct Foo {
     /// #     random_number: usize,
     /// # }
@@ -69,6 +66,7 @@ declare_clippy_lint! {
     /// }
     /// # }
     /// ```
+    #[clippy::version = "1.34.0"]
     pub MISSING_CONST_FOR_FN,
     nursery,
     "Lint functions definitions that could be made `const fn`"
@@ -77,33 +75,31 @@ declare_clippy_lint! {
 impl_lint_pass!(MissingConstForFn => [MISSING_CONST_FOR_FN]);
 
 pub struct MissingConstForFn {
-    msrv: Option<RustcVersion>,
+    msrv: Msrv,
 }
 
 impl MissingConstForFn {
-    #[must_use]
-    pub fn new(msrv: Option<RustcVersion>) -> Self {
-        Self { msrv }
+    pub fn new(conf: &'static Conf) -> Self {
+        Self { msrv: conf.msrv }
     }
 }
 
 impl<'tcx> LateLintPass<'tcx> for MissingConstForFn {
     fn check_fn(
         &mut self,
-        cx: &LateContext<'_>,
-        kind: FnKind<'_>,
+        cx: &LateContext<'tcx>,
+        kind: FnKind<'tcx>,
         _: &FnDecl<'_>,
-        _: &Body<'_>,
+        body: &Body<'tcx>,
         span: Span,
-        hir_id: HirId,
+        def_id: LocalDefId,
     ) {
-        if !meets_msrv(self.msrv.as_ref(), &MISSING_CONST_FOR_FN_MSRV) {
+        let hir_id = cx.tcx.local_def_id_to_hir_id(def_id);
+        if is_in_test(cx.tcx, hir_id) {
             return;
         }
 
-        let def_id = cx.tcx.hir().local_def_id(hir_id);
-
-        if in_external_macro(cx.tcx.sess, span) || is_entrypoint_fn(cx, def_id.to_def_id()) {
+        if span.in_external_macro(cx.tcx.sess.source_map()) || is_entrypoint_fn(cx, def_id.to_def_id()) {
             return;
         }
 
@@ -121,46 +117,97 @@ impl<'tcx> LateLintPass<'tcx> for MissingConstForFn {
                     .iter()
                     .any(|param| matches!(param.kind, GenericParamKind::Const { .. }));
 
-                if already_const(header) || has_const_generic_params {
+                if already_const(header)
+                    || has_const_generic_params
+                    || !could_be_const_with_abi(cx, self.msrv, header.abi)
+                {
                     return;
                 }
             },
             FnKind::Method(_, sig, ..) => {
-                if trait_ref_of_method(cx, hir_id).is_some()
-                    || already_const(sig.header)
-                    || method_accepts_dropable(cx, sig.decl.inputs)
-                {
+                if already_const(sig.header) || trait_ref_of_method(cx, OwnerId { def_id }).is_some() {
                     return;
                 }
             },
             FnKind::Closure => return,
         }
 
+        if fn_inputs_has_impl_trait_ty(cx, def_id) {
+            return;
+        }
+
+        // Const fns are not allowed as methods in a trait.
+        {
+            let parent = cx.tcx.hir_get_parent_item(hir_id).def_id;
+            if parent != CRATE_DEF_ID
+                && let hir::Node::Item(item) = cx.tcx.hir_node_by_def_id(parent)
+                && let hir::ItemKind::Trait(..) = &item.kind
+            {
+                return;
+            }
+        }
+
+        if !self.msrv.meets(cx, msrvs::CONST_IF_MATCH) {
+            return;
+        }
+
+        if is_from_proc_macro(cx, &(&kind, body, hir_id, span)) {
+            return;
+        }
+
         let mir = cx.tcx.optimized_mir(def_id);
 
-        if let Err((span, err)) = is_min_const_fn(cx.tcx, &mir) {
-            if rustc_mir::const_eval::is_min_const_fn(cx.tcx, def_id.to_def_id()) {
-                cx.tcx.sess.span_err(span, &err);
+        if let Ok(()) = is_min_const_fn(cx, mir, self.msrv)
+            && let node = cx.tcx.hir_node_by_def_id(def_id)
+            && let Some((item_span, vis_span_opt)) = match node {
+                hir::Node::Item(item) => Some((item.span, Some(item.vis_span))),
+                hir::Node::ImplItem(impl_item) => Some((impl_item.span, impl_item.vis_span())),
+                _ => None,
             }
-        } else {
-            span_lint(cx, MISSING_CONST_FOR_FN, span, "this could be a `const fn`");
+        {
+            let (sugg_span, suggestion) = if let Some(vis_span) = vis_span_opt
+                && !vis_span.is_empty()
+            {
+                (vis_span.shrink_to_hi(), " const")
+            } else {
+                (item_span.shrink_to_lo(), "const ")
+            };
+            span_lint_and_then(cx, MISSING_CONST_FOR_FN, span, "this could be a `const fn`", |diag| {
+                diag.span_suggestion_verbose(
+                    sugg_span,
+                    "make the function `const`",
+                    suggestion,
+                    Applicability::MachineApplicable,
+                );
+            });
         }
     }
-    extract_msrv_attr!(LateContext);
-}
-
-/// Returns true if any of the method parameters is a type that implements `Drop`. The method
-/// can't be made const then, because `drop` can't be const-evaluated.
-fn method_accepts_dropable(cx: &LateContext<'_>, param_tys: &[hir::Ty<'_>]) -> bool {
-    // If any of the params are droppable, return true
-    param_tys.iter().any(|hir_ty| {
-        let ty_ty = hir_ty_to_ty(cx.tcx, hir_ty);
-        has_drop(cx, ty_ty)
-    })
 }
 
 // We don't have to lint on something that's already `const`
 #[must_use]
 fn already_const(header: hir::FnHeader) -> bool {
     header.constness == Constness::Const
+}
+
+fn could_be_const_with_abi(cx: &LateContext<'_>, msrv: Msrv, abi: ExternAbi) -> bool {
+    match abi {
+        ExternAbi::Rust => true,
+        // `const extern "C"` was stabilized after 1.62.0
+        ExternAbi::C { unwind: false } => msrv.meets(cx, msrvs::CONST_EXTERN_C_FN),
+        // Rest ABIs are still unstable and need the `const_extern_fn` feature enabled.
+        _ => msrv.meets(cx, msrvs::CONST_EXTERN_FN),
+    }
+}
+
+/// Return `true` when the given `def_id` is a function that has `impl Trait` ty as one of
+/// its parameter types.
+fn fn_inputs_has_impl_trait_ty(cx: &LateContext<'_>, def_id: LocalDefId) -> bool {
+    let inputs = cx.tcx.fn_sig(def_id).instantiate_identity().inputs().skip_binder();
+    inputs.iter().any(|input| {
+        matches!(
+            input.kind(),
+            ty::Alias(ty::AliasTyKind::Free, alias_ty) if cx.tcx.type_of(alias_ty.def_id).skip_binder().is_impl_trait()
+        )
+    })
 }

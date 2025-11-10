@@ -25,12 +25,22 @@ fn doit() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let mut src_path = None;
     let mut out_path = None;
+    let mut build_rustc_stage = None;
     let mut rustc_path = None;
     let mut rustc_target = None;
+    let mut rustc_linker = None;
     let mut verbose = false;
     let mut validate = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--build-rustc-stage" => {
+                build_rustc_stage = match args.next() {
+                    Some(s) => {
+                        Some(s.parse::<u32>().expect("build rustc stage has to be an integer"))
+                    }
+                    None => return Err("--build-rustc-stage requires a value".into()),
+                };
+            }
             "--src" => {
                 src_path = match args.next() {
                     Some(s) => Some(PathBuf::from(s)),
@@ -55,10 +65,19 @@ fn doit() -> Result<(), Box<dyn Error>> {
                     None => return Err("--rustc-target requires a value".into()),
                 };
             }
+            "--rustc-linker" => {
+                rustc_linker = match args.next() {
+                    Some(s) => Some(s),
+                    None => return Err("--rustc-linker requires a value".into()),
+                };
+            }
             "-v" | "--verbose" => verbose = true,
             "--validate" => validate = true,
             s => return Err(format!("unexpected argument `{}`", s).into()),
         }
+    }
+    if build_rustc_stage.is_none() {
+        return Err("--build-rustc-stage must be specified to the stage of the compiler that generates the docs".into());
     }
     if src_path.is_none() {
         return Err("--src must be specified to the directory with the compiler source".into());
@@ -77,6 +96,8 @@ fn doit() -> Result<(), Box<dyn Error>> {
         out_path: &out_path.unwrap(),
         rustc_path: &rustc_path.unwrap(),
         rustc_target: &rustc_target.unwrap(),
+        rustc_linker: rustc_linker.as_deref(),
+        build_rustc_stage: build_rustc_stage.unwrap(),
         verbose,
         validate,
     };

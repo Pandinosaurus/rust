@@ -49,7 +49,7 @@ the supplied buffer and let the algorithm to return.
 # Implementation overview
 
 It is easy to get the floating point printing correct but slow (Russ Cox has
-[demonstrated](http://research.swtch.com/ftoa) how it's easy), or incorrect but
+[demonstrated](https://research.swtch.com/ftoa) how it's easy), or incorrect but
 fast (naïve division and modulo). But it is surprisingly hard to print
 floating point numbers correctly *and* efficiently.
 
@@ -122,8 +122,8 @@ functions.
     issue = "none"
 )]
 
-pub use self::decoder::{decode, DecodableFloat, Decoded, FullDecoded};
-
+pub use self::decoder::{DecodableFloat, Decoded, FullDecoded, decode};
+use super::fmt::{Formatted, Part};
 use crate::mem::MaybeUninit;
 
 pub mod decoder;
@@ -150,124 +150,19 @@ pub fn round_up(d: &mut [u8]) -> Option<u8> {
         Some(i) => {
             // d[i+1..n] is all nines
             d[i] += 1;
-            for j in i + 1..d.len() {
-                d[j] = b'0';
-            }
+            d[i + 1..].fill(b'0');
             None
         }
-        None if d.len() > 0 => {
-            // 999..999 rounds to 1000..000 with an increased exponent
-            d[0] = b'1';
-            for j in 1..d.len() {
-                d[j] = b'0';
-            }
-            Some(b'0')
-        }
-        None => {
+        None if d.is_empty() => {
             // an empty buffer rounds up (a bit strange but reasonable)
             Some(b'1')
         }
-    }
-}
-
-/// Formatted parts.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum Part<'a> {
-    /// Given number of zero digits.
-    Zero(usize),
-    /// A literal number up to 5 digits.
-    Num(u16),
-    /// A verbatim copy of given bytes.
-    Copy(&'a [u8]),
-}
-
-impl<'a> Part<'a> {
-    /// Returns the exact byte length of given part.
-    pub fn len(&self) -> usize {
-        match *self {
-            Part::Zero(nzeroes) => nzeroes,
-            Part::Num(v) => {
-                if v < 1_000 {
-                    if v < 10 {
-                        1
-                    } else if v < 100 {
-                        2
-                    } else {
-                        3
-                    }
-                } else {
-                    if v < 10_000 { 4 } else { 5 }
-                }
-            }
-            Part::Copy(buf) => buf.len(),
+        None => {
+            // 999..999 rounds to 1000..000 with an increased exponent
+            d[0] = b'1';
+            d[1..].fill(b'0');
+            Some(b'0')
         }
-    }
-
-    /// Writes a part into the supplied buffer.
-    /// Returns the number of written bytes, or `None` if the buffer is not enough.
-    /// (It may still leave partially written bytes in the buffer; do not rely on that.)
-    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
-        let len = self.len();
-        if out.len() >= len {
-            match *self {
-                Part::Zero(nzeroes) => {
-                    for c in &mut out[..nzeroes] {
-                        *c = b'0';
-                    }
-                }
-                Part::Num(mut v) => {
-                    for c in out[..len].iter_mut().rev() {
-                        *c = b'0' + (v % 10) as u8;
-                        v /= 10;
-                    }
-                }
-                Part::Copy(buf) => {
-                    out[..buf.len()].copy_from_slice(buf);
-                }
-            }
-            Some(len)
-        } else {
-            None
-        }
-    }
-}
-
-/// Formatted result containing one or more parts.
-/// This can be written to the byte buffer or converted to the allocated string.
-#[allow(missing_debug_implementations)]
-#[derive(Clone)]
-pub struct Formatted<'a> {
-    /// A byte slice representing a sign, either `""`, `"-"` or `"+"`.
-    pub sign: &'static str,
-    /// Formatted parts to be rendered after a sign and optional zero padding.
-    pub parts: &'a [Part<'a>],
-}
-
-impl<'a> Formatted<'a> {
-    /// Returns the exact byte length of combined formatted result.
-    pub fn len(&self) -> usize {
-        let mut len = self.sign.len();
-        for part in self.parts {
-            len += part.len();
-        }
-        len
-    }
-
-    /// Writes all formatted parts into the supplied buffer.
-    /// Returns the number of written bytes, or `None` if the buffer is not enough.
-    /// (It may still leave partially written bytes in the buffer; do not rely on that.)
-    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
-        if out.len() < self.sign.len() {
-            return None;
-        }
-        out[..self.sign.len()].copy_from_slice(self.sign.as_bytes());
-
-        let mut written = self.sign.len();
-        for part in self.parts {
-            let len = part.write(&mut out[written..])?;
-            written += len;
-        }
-        Some(written)
     }
 }
 
@@ -311,10 +206,10 @@ fn digits_to_dec_str<'a>(
         if frac_digits > buf.len() && frac_digits - buf.len() > minus_exp {
             parts[3] = MaybeUninit::new(Part::Zero((frac_digits - buf.len()) - minus_exp));
             // SAFETY: we just initialized the elements `..4`.
-            unsafe { MaybeUninit::slice_assume_init_ref(&parts[..4]) }
+            unsafe { parts[..4].assume_init_ref() }
         } else {
             // SAFETY: we just initialized the elements `..3`.
-            unsafe { MaybeUninit::slice_assume_init_ref(&parts[..3]) }
+            unsafe { parts[..3].assume_init_ref() }
         }
     } else {
         let exp = exp as usize;
@@ -326,10 +221,10 @@ fn digits_to_dec_str<'a>(
             if frac_digits > buf.len() - exp {
                 parts[3] = MaybeUninit::new(Part::Zero(frac_digits - (buf.len() - exp)));
                 // SAFETY: we just initialized the elements `..4`.
-                unsafe { MaybeUninit::slice_assume_init_ref(&parts[..4]) }
+                unsafe { parts[..4].assume_init_ref() }
             } else {
                 // SAFETY: we just initialized the elements `..3`.
-                unsafe { MaybeUninit::slice_assume_init_ref(&parts[..3]) }
+                unsafe { parts[..3].assume_init_ref() }
             }
         } else {
             // the decimal point is after rendered digits: [1234][____0000] or [1234][__][.][__].
@@ -339,10 +234,10 @@ fn digits_to_dec_str<'a>(
                 parts[2] = MaybeUninit::new(Part::Copy(b"."));
                 parts[3] = MaybeUninit::new(Part::Zero(frac_digits));
                 // SAFETY: we just initialized the elements `..4`.
-                unsafe { MaybeUninit::slice_assume_init_ref(&parts[..4]) }
+                unsafe { parts[..4].assume_init_ref() }
             } else {
                 // SAFETY: we just initialized the elements `..2`.
-                unsafe { MaybeUninit::slice_assume_init_ref(&parts[..2]) }
+                unsafe { parts[..2].assume_init_ref() }
             }
         }
     }
@@ -393,20 +288,16 @@ fn digits_to_exp_str<'a>(
         parts[n + 1] = MaybeUninit::new(Part::Num(exp as u16));
     }
     // SAFETY: we just initialized the elements `..n + 2`.
-    unsafe { MaybeUninit::slice_assume_init_ref(&parts[..n + 2]) }
+    unsafe { parts[..n + 2].assume_init_ref() }
 }
 
 /// Sign formatting options.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Sign {
-    /// Prints `-` only for the negative non-zero values.
-    Minus, // -inf -1  0  0  1  inf nan
-    /// Prints `-` only for any negative values (including the negative zero).
-    MinusRaw, // -inf -1 -0  0  1  inf nan
-    /// Prints `-` for the negative non-zero values, or `+` otherwise.
-    MinusPlus, // -inf -1 +0 +0 +1 +inf nan
-    /// Prints `-` for any negative values (including the negative zero), or `+` otherwise.
-    MinusPlusRaw, // -inf -1 -0 +0 +1 +inf nan
+    /// Prints `-` for any negative value.
+    Minus, // -inf -1 -0  0  1  inf nan
+    /// Prints `-` for any negative value, or `+` otherwise.
+    MinusPlus, // -inf -1 -0 +0 +1 +inf nan
 }
 
 /// Returns the static byte string corresponding to the sign to be formatted.
@@ -414,30 +305,14 @@ pub enum Sign {
 fn determine_sign(sign: Sign, decoded: &FullDecoded, negative: bool) -> &'static str {
     match (*decoded, sign) {
         (FullDecoded::Nan, _) => "",
-        (FullDecoded::Zero, Sign::Minus) => "",
-        (FullDecoded::Zero, Sign::MinusRaw) => {
+        (_, Sign::Minus) => {
             if negative {
                 "-"
             } else {
                 ""
             }
         }
-        (FullDecoded::Zero, Sign::MinusPlus) => "+",
-        (FullDecoded::Zero, Sign::MinusPlusRaw) => {
-            if negative {
-                "-"
-            } else {
-                "+"
-            }
-        }
-        (_, Sign::Minus | Sign::MinusRaw) => {
-            if negative {
-                "-"
-            } else {
-                ""
-            }
-        }
-        (_, Sign::MinusPlus | Sign::MinusPlusRaw) => {
+        (_, Sign::MinusPlus) => {
             if negative {
                 "-"
             } else {
@@ -487,12 +362,12 @@ where
         FullDecoded::Nan => {
             parts[0] = MaybeUninit::new(Part::Copy(b"NaN"));
             // SAFETY: we just initialized the elements `..1`.
-            Formatted { sign, parts: unsafe { MaybeUninit::slice_assume_init_ref(&parts[..1]) } }
+            Formatted { sign, parts: unsafe { parts[..1].assume_init_ref() } }
         }
         FullDecoded::Infinite => {
             parts[0] = MaybeUninit::new(Part::Copy(b"inf"));
             // SAFETY: we just initialized the elements `..1`.
-            Formatted { sign, parts: unsafe { MaybeUninit::slice_assume_init_ref(&parts[..1]) } }
+            Formatted { sign, parts: unsafe { parts[..1].assume_init_ref() } }
         }
         FullDecoded::Zero => {
             if frac_digits > 0 {
@@ -502,14 +377,14 @@ where
                 Formatted {
                     sign,
                     // SAFETY: we just initialized the elements `..2`.
-                    parts: unsafe { MaybeUninit::slice_assume_init_ref(&parts[..2]) },
+                    parts: unsafe { parts[..2].assume_init_ref() },
                 }
             } else {
                 parts[0] = MaybeUninit::new(Part::Copy(b"0"));
                 Formatted {
                     sign,
                     // SAFETY: we just initialized the elements `..1`.
-                    parts: unsafe { MaybeUninit::slice_assume_init_ref(&parts[..1]) },
+                    parts: unsafe { parts[..1].assume_init_ref() },
                 }
             }
         }
@@ -563,12 +438,12 @@ where
         FullDecoded::Nan => {
             parts[0] = MaybeUninit::new(Part::Copy(b"NaN"));
             // SAFETY: we just initialized the elements `..1`.
-            Formatted { sign, parts: unsafe { MaybeUninit::slice_assume_init_ref(&parts[..1]) } }
+            Formatted { sign, parts: unsafe { parts[..1].assume_init_ref() } }
         }
         FullDecoded::Infinite => {
             parts[0] = MaybeUninit::new(Part::Copy(b"inf"));
             // SAFETY: we just initialized the elements `..1`.
-            Formatted { sign, parts: unsafe { MaybeUninit::slice_assume_init_ref(&parts[..1]) } }
+            Formatted { sign, parts: unsafe { parts[..1].assume_init_ref() } }
         }
         FullDecoded::Zero => {
             parts[0] = if dec_bounds.0 <= 0 && 0 < dec_bounds.1 {
@@ -577,7 +452,7 @@ where
                 MaybeUninit::new(Part::Copy(if upper { b"0E0" } else { b"0e0" }))
             };
             // SAFETY: we just initialized the elements `..1`.
-            Formatted { sign, parts: unsafe { MaybeUninit::slice_assume_init_ref(&parts[..1]) } }
+            Formatted { sign, parts: unsafe { parts[..1].assume_init_ref() } }
         }
         FullDecoded::Finite(ref decoded) => {
             let (buf, exp) = format_shortest(decoded, buf);
@@ -654,12 +529,12 @@ where
         FullDecoded::Nan => {
             parts[0] = MaybeUninit::new(Part::Copy(b"NaN"));
             // SAFETY: we just initialized the elements `..1`.
-            Formatted { sign, parts: unsafe { MaybeUninit::slice_assume_init_ref(&parts[..1]) } }
+            Formatted { sign, parts: unsafe { parts[..1].assume_init_ref() } }
         }
         FullDecoded::Infinite => {
             parts[0] = MaybeUninit::new(Part::Copy(b"inf"));
             // SAFETY: we just initialized the elements `..1`.
-            Formatted { sign, parts: unsafe { MaybeUninit::slice_assume_init_ref(&parts[..1]) } }
+            Formatted { sign, parts: unsafe { parts[..1].assume_init_ref() } }
         }
         FullDecoded::Zero => {
             if ndigits > 1 {
@@ -670,14 +545,14 @@ where
                 Formatted {
                     sign,
                     // SAFETY: we just initialized the elements `..3`.
-                    parts: unsafe { MaybeUninit::slice_assume_init_ref(&parts[..3]) },
+                    parts: unsafe { parts[..3].assume_init_ref() },
                 }
             } else {
                 parts[0] = MaybeUninit::new(Part::Copy(if upper { b"0E0" } else { b"0e0" }));
                 Formatted {
                     sign,
                     // SAFETY: we just initialized the elements `..1`.
-                    parts: unsafe { MaybeUninit::slice_assume_init_ref(&parts[..1]) },
+                    parts: unsafe { parts[..1].assume_init_ref() },
                 }
             }
         }
@@ -728,12 +603,12 @@ where
         FullDecoded::Nan => {
             parts[0] = MaybeUninit::new(Part::Copy(b"NaN"));
             // SAFETY: we just initialized the elements `..1`.
-            Formatted { sign, parts: unsafe { MaybeUninit::slice_assume_init_ref(&parts[..1]) } }
+            Formatted { sign, parts: unsafe { parts[..1].assume_init_ref() } }
         }
         FullDecoded::Infinite => {
             parts[0] = MaybeUninit::new(Part::Copy(b"inf"));
             // SAFETY: we just initialized the elements `..1`.
-            Formatted { sign, parts: unsafe { MaybeUninit::slice_assume_init_ref(&parts[..1]) } }
+            Formatted { sign, parts: unsafe { parts[..1].assume_init_ref() } }
         }
         FullDecoded::Zero => {
             if frac_digits > 0 {
@@ -743,14 +618,14 @@ where
                 Formatted {
                     sign,
                     // SAFETY: we just initialized the elements `..2`.
-                    parts: unsafe { MaybeUninit::slice_assume_init_ref(&parts[..2]) },
+                    parts: unsafe { parts[..2].assume_init_ref() },
                 }
             } else {
                 parts[0] = MaybeUninit::new(Part::Copy(b"0"));
                 Formatted {
                     sign,
                     // SAFETY: we just initialized the elements `..1`.
-                    parts: unsafe { MaybeUninit::slice_assume_init_ref(&parts[..1]) },
+                    parts: unsafe { parts[..1].assume_init_ref() },
                 }
             }
         }
@@ -775,14 +650,14 @@ where
                     Formatted {
                         sign,
                         // SAFETY: we just initialized the elements `..2`.
-                        parts: unsafe { MaybeUninit::slice_assume_init_ref(&parts[..2]) },
+                        parts: unsafe { parts[..2].assume_init_ref() },
                     }
                 } else {
                     parts[0] = MaybeUninit::new(Part::Copy(b"0"));
                     Formatted {
                         sign,
                         // SAFETY: we just initialized the elements `..1`.
-                        parts: unsafe { MaybeUninit::slice_assume_init_ref(&parts[..1]) },
+                        parts: unsafe { parts[..1].assume_init_ref() },
                     }
                 }
             } else {

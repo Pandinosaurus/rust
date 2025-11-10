@@ -1,10 +1,14 @@
-macro_rules! m {
-    ($($x:tt),*) => { &[$(($x, stringify!(x)),)*] };
-}
+//@ check-pass
+//@aux-build:proc_macros.rs
 
-#[warn(clippy::deref_addrof)]
-fn f() -> [(i32, &'static str); 3] {
-    *m![1, 2, 3] // should be fine
+#![warn(clippy::deref_addrof)]
+
+extern crate proc_macros;
+
+#[proc_macros::inline_macros]
+fn f() -> i32 {
+    // should be fine
+    *inline!(&$1)
 }
 
 fn main() {}

@@ -1,5 +1,3 @@
-use crate::iter::FromIterator;
-
 /// Collapses all unit items from an iterator into one.
 ///
 /// This is more useful when combined with higher-level abstractions, like
@@ -9,7 +7,7 @@ use crate::iter::FromIterator;
 /// use std::io::*;
 /// let data = vec![1, 2, 3, 4, 5];
 /// let res: Result<()> = data.iter()
-///     .map(|x| writeln!(stdout(), "{}", x))
+///     .map(|x| writeln!(stdout(), "{x}"))
 ///     .collect();
 /// assert!(res.is_ok());
 /// ```
@@ -17,5 +15,21 @@ use crate::iter::FromIterator;
 impl FromIterator<()> for () {
     fn from_iter<I: IntoIterator<Item = ()>>(iter: I) -> Self {
         iter.into_iter().for_each(|()| {})
+    }
+}
+
+pub(crate) trait IsUnit {
+    fn is_unit() -> bool;
+}
+
+impl<T: ?Sized> IsUnit for T {
+    default fn is_unit() -> bool {
+        false
+    }
+}
+
+impl IsUnit for () {
+    fn is_unit() -> bool {
+        true
     }
 }

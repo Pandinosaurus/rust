@@ -1,9 +1,8 @@
-use crate::alloc::Allocator;
 use core::iter::TrustedLen;
-use core::ptr::{self};
 use core::slice::{self};
 
-use super::{IntoIter, SetLenOnDrop, Vec};
+use super::{IntoIter, Vec};
+use crate::alloc::Allocator;
 
 // Specialization trait used for Vec::extend
 pub(super) trait SpecExtend<T, I> {
@@ -24,31 +23,7 @@ where
     I: TrustedLen<Item = T>,
 {
     default fn spec_extend(&mut self, iterator: I) {
-        // This is the case for a TrustedLen iterator.
-        let (low, high) = iterator.size_hint();
-        if let Some(high_value) = high {
-            debug_assert_eq!(
-                low,
-                high_value,
-                "TrustedLen iterator's size hint is not exact: {:?}",
-                (low, high)
-            );
-        }
-        if let Some(additional) = high {
-            self.reserve(additional);
-            unsafe {
-                let mut ptr = self.as_mut_ptr().add(self.len());
-                let mut local_len = SetLenOnDrop::new(&mut self.len);
-                iterator.for_each(move |element| {
-                    ptr::write(ptr, element);
-                    ptr = ptr.offset(1);
-                    // NB can't overflow since we would have had to alloc the address space
-                    local_len.increment_len(1);
-                });
-            }
-        } else {
-            self.extend_desugared(iterator)
-        }
+        self.extend_trusted(iterator)
     }
 }
 
@@ -57,11 +32,11 @@ impl<T, A: Allocator> SpecExtend<T, IntoIter<T>> for Vec<T, A> {
         unsafe {
             self.append_elements(iterator.as_slice() as _);
         }
-        iterator.ptr = iterator.end;
+        iterator.forget_remaining_elements();
     }
 }
 
-impl<'a, T: 'a, I, A: Allocator + 'a> SpecExtend<&'a T, I> for Vec<T, A>
+impl<'a, T: 'a, I, A: Allocator> SpecExtend<&'a T, I> for Vec<T, A>
 where
     I: Iterator<Item = &'a T>,
     T: Clone,
@@ -71,7 +46,7 @@ where
     }
 }
 
-impl<'a, T: 'a, A: Allocator + 'a> SpecExtend<&'a T, slice::Iter<'a, T>> for Vec<T, A>
+impl<'a, T: 'a, A: Allocator> SpecExtend<&'a T, slice::Iter<'a, T>> for Vec<T, A>
 where
     T: Copy,
 {

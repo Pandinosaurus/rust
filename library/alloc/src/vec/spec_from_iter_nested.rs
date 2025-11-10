@@ -1,7 +1,8 @@
 use core::iter::TrustedLen;
-use core::ptr::{self};
+use core::{cmp, ptr};
 
 use super::{SpecExtend, Vec};
+use crate::raw_vec::RawVec;
 
 /// Another specialization trait for Vec::from_iter
 /// necessary to manually prioritize overlapping specializations
@@ -24,8 +25,11 @@ where
             None => return Vec::new(),
             Some(element) => {
                 let (lower, _) = iterator.size_hint();
-                let mut vector = Vec::with_capacity(lower.saturating_add(1));
+                let initial_capacity =
+                    cmp::max(RawVec::<T>::MIN_NON_ZERO_CAP, lower.saturating_add(1));
+                let mut vector = Vec::with_capacity(initial_capacity);
                 unsafe {
+                    // SAFETY: We requested capacity at least 1
                     ptr::write(vector.as_mut_ptr(), element);
                     vector.set_len(1);
                 }
@@ -46,10 +50,13 @@ where
     fn from_iter(iterator: I) -> Self {
         let mut vector = match iterator.size_hint() {
             (_, Some(upper)) => Vec::with_capacity(upper),
-            _ => Vec::new(),
+            // TrustedLen contract guarantees that `size_hint() == (_, None)` means that there
+            // are more than `usize::MAX` elements.
+            // Since the previous branch would eagerly panic if the capacity is too large
+            // (via `with_capacity`) we do the same here.
+            _ => panic!("capacity overflow"),
         };
-        // must delegate to spec_extend() since extend() itself delegates
-        // to spec_from for empty Vecs
+        // reuse extend specialization for TrustedLen
         vector.spec_extend(iterator);
         vector
     }

@@ -1,6 +1,5 @@
-use crate::fmt;
 use crate::iter::{FusedIterator, TrustedLen};
-use crate::marker;
+use crate::{fmt, marker};
 
 /// Creates an iterator that yields nothing.
 ///
@@ -25,18 +24,15 @@ pub const fn empty<T>() -> Empty<T> {
 /// An iterator that yields nothing.
 ///
 /// This `struct` is created by the [`empty()`] function. See its documentation for more.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 #[stable(feature = "iter_empty", since = "1.2.0")]
-pub struct Empty<T>(marker::PhantomData<T>);
-
-#[stable(feature = "iter_empty_send_sync", since = "1.42.0")]
-unsafe impl<T> Send for Empty<T> {}
-#[stable(feature = "iter_empty_send_sync", since = "1.42.0")]
-unsafe impl<T> Sync for Empty<T> {}
+#[rustc_diagnostic_item = "IterEmpty"]
+pub struct Empty<T>(marker::PhantomData<fn() -> T>);
 
 #[stable(feature = "core_impl_debug", since = "1.9.0")]
 impl<T> fmt::Debug for Empty<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("Empty")
+        f.debug_struct("Empty").finish()
     }
 }
 
@@ -85,7 +81,8 @@ impl<T> Clone for Empty<T> {
 // not #[derive] because that adds a Default bound on T,
 // which isn't necessary.
 #[stable(feature = "iter_empty", since = "1.2.0")]
-impl<T> Default for Empty<T> {
+#[rustc_const_unstable(feature = "const_default", issue = "143894")]
+impl<T> const Default for Empty<T> {
     fn default() -> Empty<T> {
         Empty(marker::PhantomData)
     }

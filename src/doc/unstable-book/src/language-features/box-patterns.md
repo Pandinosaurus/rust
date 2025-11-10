@@ -4,9 +4,9 @@ The tracking issue for this feature is: [#29641]
 
 [#29641]: https://github.com/rust-lang/rust/issues/29641
 
-See also [`box_syntax`](box-syntax.md)
-
 ------------------------
+
+> **Note**: This feature will be superseded by [`deref_patterns`] in the future.
 
 Box patterns let you match on `Box<T>`s:
 
@@ -18,10 +18,10 @@ fn main() {
     let b = Some(Box::new(5));
     match b {
         Some(box n) if n < 0 => {
-            println!("Box contains negative number {}", n);
+            println!("Box contains negative number {n}");
         },
         Some(box n) if n >= 0 => {
-            println!("Box contains non-negative number {}", n);
+            println!("Box contains non-negative number {n}");
         },
         None => {
             println!("No box");
@@ -30,3 +30,5 @@ fn main() {
     }
 }
 ```
+
+[`deref_patterns`]: ./deref-patterns.md

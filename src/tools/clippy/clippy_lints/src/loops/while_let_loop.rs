@@ -1,88 +1,142 @@
 use super::WHILE_LET_LOOP;
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::source::snippet_with_applicability;
+use clippy_utils::source::{snippet, snippet_indent, snippet_opt};
+use clippy_utils::ty::needs_ordered_drop;
+use clippy_utils::visitors::any_temporaries_need_ordered_drop;
+use clippy_utils::{higher, peel_blocks};
+use rustc_ast::BindingMode;
 use rustc_errors::Applicability;
-use rustc_hir::{Block, Expr, ExprKind, MatchSource, StmtKind};
-use rustc_lint::{LateContext, LintContext};
-use rustc_middle::lint::in_external_macro;
+use rustc_hir::{Block, Expr, ExprKind, LetStmt, MatchSource, Pat, PatKind, Path, QPath, StmtKind, Ty};
+use rustc_lint::LateContext;
 
-pub(super) fn check(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, loop_block: &'tcx Block<'_>) {
-    // extract the expression from the first statement (if any) in a block
-    let inner_stmt_expr = extract_expr_from_first_stmt(loop_block);
-    // or extract the first expression (if any) from the block
-    if let Some(inner) = inner_stmt_expr.or_else(|| extract_first_expr(loop_block)) {
-        if let ExprKind::Match(ref matchexpr, ref arms, ref source) = inner.kind {
-            // ensure "if let" compatible match structure
-            match *source {
-                MatchSource::Normal | MatchSource::IfLetDesugar { .. } => {
-                    if arms.len() == 2
-                        && arms[0].guard.is_none()
-                        && arms[1].guard.is_none()
-                        && is_simple_break_expr(&arms[1].body)
-                    {
-                        if in_external_macro(cx.sess(), expr.span) {
-                            return;
-                        }
-
-                        // NOTE: we used to build a body here instead of using
-                        // ellipsis, this was removed because:
-                        // 1) it was ugly with big bodies;
-                        // 2) it was not indented properly;
-                        // 3) it wasn’t very smart (see #675).
-                        let mut applicability = Applicability::HasPlaceholders;
-                        span_lint_and_sugg(
-                            cx,
-                            WHILE_LET_LOOP,
-                            expr.span,
-                            "this loop could be written as a `while let` loop",
-                            "try",
-                            format!(
-                                "while let {} = {} {{ .. }}",
-                                snippet_with_applicability(cx, arms[0].pat.span, "..", &mut applicability),
-                                snippet_with_applicability(cx, matchexpr.span, "..", &mut applicability),
-                            ),
-                            applicability,
-                        );
-                    }
-                },
-                _ => (),
-            }
-        }
-    }
-}
-
-/// If a block begins with a statement (possibly a `let` binding) and has an
-/// expression, return it.
-fn extract_expr_from_first_stmt<'tcx>(block: &Block<'tcx>) -> Option<&'tcx Expr<'tcx>> {
-    if block.stmts.is_empty() {
-        return None;
-    }
-    if let StmtKind::Local(ref local) = block.stmts[0].kind {
-        local.init //.map(|expr| expr)
-    } else {
-        None
-    }
-}
-
-/// If a block begins with an expression (with or without semicolon), return it.
-fn extract_first_expr<'tcx>(block: &Block<'tcx>) -> Option<&'tcx Expr<'tcx>> {
-    match block.expr {
-        Some(ref expr) if block.stmts.is_empty() => Some(expr),
-        None if !block.stmts.is_empty() => match block.stmts[0].kind {
-            StmtKind::Expr(ref expr) | StmtKind::Semi(ref expr) => Some(expr),
-            StmtKind::Local(..) | StmtKind::Item(..) => None,
+pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, loop_block: &'tcx Block<'_>) {
+    let (init, let_info, els) = match (loop_block.stmts, loop_block.expr) {
+        ([stmt, ..], _) => match stmt.kind {
+            StmtKind::Let(LetStmt {
+                init: Some(e),
+                els,
+                pat,
+                ty,
+                ..
+            }) => (*e, Some((*pat, *ty)), *els),
+            StmtKind::Semi(e) | StmtKind::Expr(e) => (e, None, None),
+            _ => return,
         },
-        _ => None,
+        ([], Some(e)) => (e, None, None),
+        _ => return,
+    };
+    let has_trailing_exprs = loop_block.stmts.len() + usize::from(loop_block.expr.is_some()) > 1;
+
+    if let Some(if_let) = higher::IfLet::hir(cx, init)
+        && let Some(else_expr) = if_let.if_else
+        && is_simple_break_expr(else_expr)
+    {
+        could_be_while_let(
+            cx,
+            expr,
+            if_let.let_pat,
+            if_let.let_expr,
+            has_trailing_exprs,
+            let_info,
+            Some(if_let.if_then),
+        );
+    } else if els.and_then(|x| x.expr).is_some_and(is_simple_break_expr)
+        && let Some((pat, _)) = let_info
+    {
+        could_be_while_let(cx, expr, pat, init, has_trailing_exprs, let_info, None);
+    } else if let ExprKind::Match(scrutinee, [arm1, arm2], MatchSource::Normal) = init.kind
+        && arm1.guard.is_none()
+        && arm2.guard.is_none()
+        && is_simple_break_expr(arm2.body)
+    {
+        could_be_while_let(
+            cx,
+            expr,
+            arm1.pat,
+            scrutinee,
+            has_trailing_exprs,
+            let_info,
+            Some(arm1.body),
+        );
     }
 }
 
-/// Returns `true` if expr contains a single break expr without destination label
-/// and
-/// passed expression. The expression may be within a block.
-fn is_simple_break_expr(expr: &Expr<'_>) -> bool {
-    match expr.kind {
-        ExprKind::Break(dest, ref passed_expr) if dest.label.is_none() && passed_expr.is_none() => true,
-        ExprKind::Block(ref b, _) => extract_first_expr(b).map_or(false, |subexpr| is_simple_break_expr(subexpr)),
+/// Returns `true` if expr contains a single break expression without a label or sub-expression,
+/// possibly embedded in blocks.
+fn is_simple_break_expr(e: &Expr<'_>) -> bool {
+    if let ExprKind::Block(b, _) = e.kind {
+        match (b.stmts, b.expr) {
+            ([s], None) => matches!(s.kind, StmtKind::Expr(e) | StmtKind::Semi(e) if is_simple_break_expr(e)),
+            ([], Some(e)) => is_simple_break_expr(e),
+            _ => false,
+        }
+    } else {
+        matches!(e.kind, ExprKind::Break(dest, None) if dest.label.is_none())
+    }
+}
+
+fn could_be_while_let<'tcx>(
+    cx: &LateContext<'tcx>,
+    expr: &'tcx Expr<'_>,
+    let_pat: &'tcx Pat<'_>,
+    let_expr: &'tcx Expr<'_>,
+    has_trailing_exprs: bool,
+    let_info: Option<(&Pat<'_>, Option<&Ty<'_>>)>,
+    inner_expr: Option<&Expr<'_>>,
+) {
+    if has_trailing_exprs
+        && (needs_ordered_drop(cx, cx.typeck_results().expr_ty(let_expr))
+            || any_temporaries_need_ordered_drop(cx, let_expr))
+    {
+        // Switching to a `while let` loop will extend the lifetime of some values.
+        return;
+    }
+
+    // NOTE: we used to build a body here instead of using
+    // ellipsis, this was removed because:
+    // 1) it was ugly with big bodies;
+    // 2) it was not indented properly;
+    // 3) it wasn’t very smart (see #675).
+    let inner_content = if let Some(((pat, ty), inner_expr)) = let_info.zip(inner_expr)
+        // Prevent trivial reassignments such as `let x = x;` or `let _ = …;`, but
+        // keep them if the type has been explicitly specified.
+        && (!is_trivial_assignment(pat, peel_blocks(inner_expr)) || ty.is_some())
+        && let Some(pat_str) = snippet_opt(cx, pat.span)
+        && let Some(init_str) = snippet_opt(cx, peel_blocks(inner_expr).span)
+    {
+        let ty_str = ty
+            .map(|ty| format!(": {}", snippet(cx, ty.span, "_")))
+            .unwrap_or_default();
+        format!(
+            "\n{indent}    let {pat_str}{ty_str} = {init_str};\n{indent}    ..\n{indent}",
+            indent = snippet_indent(cx, expr.span).unwrap_or_default(),
+        )
+    } else {
+        " .. ".into()
+    };
+
+    span_lint_and_sugg(
+        cx,
+        WHILE_LET_LOOP,
+        expr.span,
+        "this loop could be written as a `while let` loop",
+        "try",
+        format!(
+            "while let {} = {} {{{inner_content}}}",
+            snippet(cx, let_pat.span, ".."),
+            snippet(cx, let_expr.span, ".."),
+        ),
+        Applicability::HasPlaceholders,
+    );
+}
+
+fn is_trivial_assignment(pat: &Pat<'_>, init: &Expr<'_>) -> bool {
+    match (pat.kind, init.kind) {
+        (PatKind::Wild, _) => true,
+        (
+            PatKind::Binding(BindingMode::NONE, _, pat_ident, None),
+            ExprKind::Path(QPath::Resolved(None, Path { segments: [init], .. })),
+        ) => pat_ident.name == init.ident.name,
         _ => false,
     }
 }

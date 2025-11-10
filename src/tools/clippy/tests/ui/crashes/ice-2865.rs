@@ -1,6 +1,8 @@
-#[allow(dead_code)]
+//@ check-pass
 
-/// Test for https://github.com/rust-lang/rust-clippy/issues/2865
+#![allow(dead_code, clippy::extra_unused_lifetimes)]
+
+// Test for https://github.com/rust-lang/rust-clippy/issues/2865
 
 struct Ice {
     size: String,

@@ -1,6 +1,5 @@
-// run-rustfix
 #![warn(clippy::repeat_once)]
-#[allow(unused, clippy::many_single_char_names, clippy::redundant_clone)]
+#[allow(unused, clippy::redundant_clone)]
 fn main() {
     const N: usize = 1;
     let s = "str";
@@ -8,9 +7,14 @@ fn main() {
     let slice = [1; 5];
 
     let a = [1; 5].to_vec();
+    //~^ repeat_once
     let b = slice.to_vec();
-    let c = "hello".to_string();
+    //~^ repeat_once
+    let c = "hello".repeat(N);
     let d = "hi".to_string();
+    //~^ repeat_once
     let e = s.to_string();
+    //~^ repeat_once
     let f = string.clone();
+    //~^ repeat_once
 }

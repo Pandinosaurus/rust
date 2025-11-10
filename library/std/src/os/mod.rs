@@ -2,56 +2,137 @@
 
 #![stable(feature = "os", since = "1.0.0")]
 #![allow(missing_docs, nonstandard_style, missing_debug_implementations)]
+#![allow(unsafe_op_in_unsafe_fn)]
 
-// When documenting libstd we want to show unix/windows/linux/wasi modules as these are the "main
-// modules" that are used across platforms, so all modules are enabled when `cfg(doc)` is set.
-// This should help show platform-specific functionality in a hopefully cross-platform way in the
-// documentation.
-// Note that we deliberately avoid `cfg_if!` here to work around a rust-analyzer bug that would make
-// `std::os` submodules unusable: https://github.com/rust-analyzer/rust-analyzer/issues/6038
+pub mod raw;
 
-#[cfg(doc)]
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use crate::sys::unix_ext as unix;
+// The code below could be written clearer using `cfg_if!`. However, the items below are
+// publicly exported by `std` and external tools can have trouble analysing them because of the use
+// of a macro that is not vendored by Rust and included in the toolchain.
+// See https://github.com/rust-analyzer/rust-analyzer/issues/6038.
 
-#[cfg(doc)]
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use crate::sys::windows_ext as windows;
+// On certain platforms right now the "main modules" modules that are
+// documented don't compile (missing things in `libc` which is empty),
+// so just omit them with an empty module and add the "unstable" attribute.
 
-#[cfg(doc)]
-#[doc(cfg(target_os = "linux"))]
+// darwin, unix, linux, wasi and windows are handled a bit differently.
+#[cfg(all(
+    doc,
+    any(
+        all(target_arch = "wasm32", not(target_os = "wasi")),
+        all(target_vendor = "fortanix", target_env = "sgx")
+    )
+))]
+#[unstable(issue = "none", feature = "std_internals")]
+pub mod darwin {}
+#[cfg(all(
+    doc,
+    any(
+        all(target_arch = "wasm32", not(target_os = "wasi")),
+        all(target_vendor = "fortanix", target_env = "sgx")
+    )
+))]
+#[unstable(issue = "none", feature = "std_internals")]
+pub mod unix {}
+#[cfg(all(
+    doc,
+    any(
+        all(target_arch = "wasm32", not(target_os = "wasi")),
+        all(target_vendor = "fortanix", target_env = "sgx")
+    )
+))]
+#[unstable(issue = "none", feature = "std_internals")]
+pub mod linux {}
+#[cfg(all(
+    doc,
+    any(
+        all(target_arch = "wasm32", not(target_os = "wasi")),
+        all(target_vendor = "fortanix", target_env = "sgx")
+    )
+))]
+#[unstable(issue = "none", feature = "std_internals")]
+pub mod wasi {}
+#[cfg(all(
+    doc,
+    any(
+        all(target_arch = "wasm32", not(target_os = "wasi")),
+        all(target_vendor = "fortanix", target_env = "sgx")
+    )
+))]
+#[unstable(issue = "none", feature = "std_internals")]
+pub mod windows {}
+
+// darwin
+#[cfg(not(all(
+    doc,
+    any(
+        all(target_arch = "wasm32", not(target_os = "wasi")),
+        all(target_vendor = "fortanix", target_env = "sgx")
+    )
+)))]
+#[cfg(any(target_vendor = "apple", doc))]
+pub mod darwin;
+
+// unix
+#[cfg(not(all(
+    doc,
+    any(
+        all(target_arch = "wasm32", not(target_os = "wasi")),
+        all(target_vendor = "fortanix", target_env = "sgx")
+    )
+)))]
+#[cfg(all(not(target_os = "hermit"), any(unix, doc)))]
+pub mod unix;
+
+// linux
+#[cfg(not(all(
+    doc,
+    any(
+        all(target_arch = "wasm32", not(target_os = "wasi")),
+        all(target_vendor = "fortanix", target_env = "sgx")
+    )
+)))]
+#[cfg(any(target_os = "linux", doc))]
 pub mod linux;
 
-#[cfg(doc)]
-#[stable(feature = "wasi_ext_doc", since = "1.35.0")]
-pub use crate::sys::wasi_ext as wasi;
-
-// If we're not documenting libstd then we just expose the main modules as we otherwise would.
-
-#[cfg(not(doc))]
-#[cfg(any(unix, target_os = "hermit"))]
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use crate::sys::ext as unix;
-
-#[cfg(not(doc))]
-#[cfg(windows)]
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use crate::sys::ext as windows;
-
-#[cfg(not(doc))]
-#[cfg(any(target_os = "linux", target_os = "l4re"))]
-pub mod linux;
-
-#[cfg(not(doc))]
-#[cfg(target_os = "wasi")]
+// wasi
+#[cfg(not(all(
+    doc,
+    any(
+        all(target_arch = "wasm32", not(target_os = "wasi")),
+        all(target_vendor = "fortanix", target_env = "sgx")
+    )
+)))]
+#[cfg(any(target_os = "wasi", any(target_env = "p1", target_env = "p2"), doc))]
 pub mod wasi;
 
+#[cfg(any(all(target_os = "wasi", target_env = "p2"), doc))]
+pub mod wasip2;
+
+// windows
+#[cfg(not(all(
+    doc,
+    any(
+        all(target_arch = "wasm32", not(target_os = "wasi")),
+        all(target_vendor = "fortanix", target_env = "sgx")
+    )
+)))]
+#[cfg(any(windows, doc))]
+pub mod windows;
+
+// Others.
+#[cfg(target_os = "aix")]
+pub mod aix;
 #[cfg(target_os = "android")]
 pub mod android;
+#[cfg(target_os = "cygwin")]
+pub mod cygwin;
 #[cfg(target_os = "dragonfly")]
 pub mod dragonfly;
 #[cfg(target_os = "emscripten")]
 pub mod emscripten;
+#[cfg(target_os = "espidf")]
+pub mod espidf;
 #[cfg(all(target_vendor = "fortanix", target_env = "sgx"))]
 pub mod fortanix_sgx;
 #[cfg(target_os = "freebsd")]
@@ -60,21 +141,58 @@ pub mod freebsd;
 pub mod fuchsia;
 #[cfg(target_os = "haiku")]
 pub mod haiku;
+#[cfg(target_os = "hermit")]
+pub mod hermit;
+#[cfg(target_os = "horizon")]
+pub mod horizon;
+#[cfg(target_os = "hurd")]
+pub mod hurd;
 #[cfg(target_os = "illumos")]
 pub mod illumos;
 #[cfg(target_os = "ios")]
 pub mod ios;
+#[cfg(target_os = "l4re")]
+pub mod l4re;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "motor")]
+pub mod motor;
 #[cfg(target_os = "netbsd")]
 pub mod netbsd;
+#[cfg(target_os = "nto")]
+pub mod nto;
+#[cfg(target_os = "nuttx")]
+pub mod nuttx;
 #[cfg(target_os = "openbsd")]
 pub mod openbsd;
 #[cfg(target_os = "redox")]
 pub mod redox;
+#[cfg(target_os = "rtems")]
+pub mod rtems;
 #[cfg(target_os = "solaris")]
 pub mod solaris;
+#[cfg(target_os = "solid_asp3")]
+pub mod solid;
+#[cfg(target_os = "trusty")]
+pub mod trusty;
+#[cfg(target_os = "uefi")]
+pub mod uefi;
+#[cfg(target_os = "vita")]
+pub mod vita;
 #[cfg(target_os = "vxworks")]
 pub mod vxworks;
+#[cfg(target_os = "xous")]
+pub mod xous;
 
-pub mod raw;
+#[cfg(any(
+    unix,
+    target_os = "hermit",
+    target_os = "trusty",
+    target_os = "wasi",
+    target_os = "motor",
+    doc
+))]
+pub mod fd;
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "cygwin", doc))]
+mod net;

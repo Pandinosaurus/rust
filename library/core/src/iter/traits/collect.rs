@@ -1,12 +1,16 @@
+use super::TrustedLen;
+
 /// Conversion from an [`Iterator`].
 ///
 /// By implementing `FromIterator` for a type, you define how it will be
 /// created from an iterator. This is common for types which describe a
 /// collection of some kind.
 ///
-/// [`FromIterator::from_iter()`] is rarely called explicitly, and is instead
-/// used through [`Iterator::collect()`] method. See [`Iterator::collect()`]'s
-/// documentation for more examples.
+/// If you want to create a collection from the contents of an iterator, the
+/// [`Iterator::collect()`] method is preferred. However, when you need to
+/// specify the container type, [`FromIterator::from_iter()`] can be more
+/// readable than using a turbofish (e.g. `::<Vec<_>>()`). See the
+/// [`Iterator::collect()`] documentation for more examples of its use.
 ///
 /// See also: [`IntoIterator`].
 ///
@@ -15,8 +19,6 @@
 /// Basic usage:
 ///
 /// ```
-/// use std::iter::FromIterator;
-///
 /// let five_fives = std::iter::repeat(5).take(5);
 ///
 /// let v = Vec::from_iter(five_fives);
@@ -34,11 +36,20 @@
 /// assert_eq!(v, vec![5, 5, 5, 5, 5]);
 /// ```
 ///
+/// Using [`FromIterator::from_iter()`] as a more readable alternative to
+/// [`Iterator::collect()`]:
+///
+/// ```
+/// use std::collections::VecDeque;
+/// let first = (0..10).collect::<VecDeque<i32>>();
+/// let second = VecDeque::from_iter(0..10);
+///
+/// assert_eq!(first, second);
+/// ```
+///
 /// Implementing `FromIterator` for your type:
 ///
 /// ```
-/// use std::iter::FromIterator;
-///
 /// // A sample collection, that's just a wrapper over Vec<T>
 /// #[derive(Debug)]
 /// struct MyCollection(Vec<i32>);
@@ -85,10 +96,41 @@
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_on_unimplemented(
+    on(
+        Self = "&[{A}]",
+        message = "a slice of type `{Self}` cannot be built since we need to store the elements somewhere",
+        label = "try explicitly collecting into a `Vec<{A}>`",
+    ),
+    on(
+        all(A = "{integer}", any(Self = "&[{integral}]",)),
+        message = "a slice of type `{Self}` cannot be built since we need to store the elements somewhere",
+        label = "try explicitly collecting into a `Vec<{A}>`",
+    ),
+    on(
+        Self = "[{A}]",
+        message = "a slice of type `{Self}` cannot be built since `{Self}` has no definite size",
+        label = "try explicitly collecting into a `Vec<{A}>`",
+    ),
+    on(
+        all(A = "{integer}", any(Self = "[{integral}]",)),
+        message = "a slice of type `{Self}` cannot be built since `{Self}` has no definite size",
+        label = "try explicitly collecting into a `Vec<{A}>`",
+    ),
+    on(
+        Self = "[{A}; _]",
+        message = "an array of type `{Self}` cannot be built directly from an iterator",
+        label = "try collecting into a `Vec<{A}>`, then using `.try_into()`",
+    ),
+    on(
+        all(A = "{integer}", any(Self = "[{integral}; _]",)),
+        message = "an array of type `{Self}` cannot be built directly from an iterator",
+        label = "try collecting into a `Vec<{A}>`, then using `.try_into()`",
+    ),
     message = "a value of type `{Self}` cannot be built from an iterator \
                over elements of type `{A}`",
     label = "value of type `{Self}` cannot be built from `std::iter::Iterator<Item={A}>`"
 )]
+#[rustc_diagnostic_item = "FromIterator"]
 pub trait FromIterator<A>: Sized {
     /// Creates a value from an iterator.
     ///
@@ -98,11 +140,7 @@ pub trait FromIterator<A>: Sized {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
-    /// use std::iter::FromIterator;
-    ///
     /// let five_fives = std::iter::repeat(5).take(5);
     ///
     /// let v = Vec::from_iter(five_fives);
@@ -110,6 +148,7 @@ pub trait FromIterator<A>: Sized {
     /// assert_eq!(v, vec![5, 5, 5, 5, 5]);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_diagnostic_item = "from_iter_fn"]
     fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self;
 }
 
@@ -129,7 +168,7 @@ pub trait FromIterator<A>: Sized {
 /// Basic usage:
 ///
 /// ```
-/// let v = vec![1, 2, 3];
+/// let v = [1, 2, 3];
 /// let mut iter = v.into_iter();
 ///
 /// assert_eq!(Some(1), iter.next());
@@ -193,11 +232,52 @@ pub trait FromIterator<A>: Sized {
 /// {
 ///     collection
 ///         .into_iter()
-///         .map(|item| format!("{:?}", item))
+///         .map(|item| format!("{item:?}"))
 ///         .collect()
 /// }
 /// ```
 #[rustc_diagnostic_item = "IntoIterator"]
+#[rustc_on_unimplemented(
+    on(
+        Self = "core::ops::range::RangeTo<Idx>",
+        label = "if you meant to iterate until a value, add a starting value",
+        note = "`..end` is a `RangeTo`, which cannot be iterated on; you might have meant to have a \
+              bounded `Range`: `0..end`"
+    ),
+    on(
+        Self = "core::ops::range::RangeToInclusive<Idx>",
+        label = "if you meant to iterate until a value (including it), add a starting value",
+        note = "`..=end` is a `RangeToInclusive`, which cannot be iterated on; you might have meant \
+              to have a bounded `RangeInclusive`: `0..=end`"
+    ),
+    on(
+        Self = "[]",
+        label = "`{Self}` is not an iterator; try calling `.into_iter()` or `.iter()`"
+    ),
+    on(Self = "&[]", label = "`{Self}` is not an iterator; try calling `.iter()`"),
+    on(
+        Self = "alloc::vec::Vec<T, A>",
+        label = "`{Self}` is not an iterator; try calling `.into_iter()` or `.iter()`"
+    ),
+    on(Self = "&str", label = "`{Self}` is not an iterator; try calling `.chars()` or `.bytes()`"),
+    on(
+        Self = "alloc::string::String",
+        label = "`{Self}` is not an iterator; try calling `.chars()` or `.bytes()`"
+    ),
+    on(
+        Self = "{integral}",
+        note = "if you want to iterate between `start` until a value `end`, use the exclusive range \
+              syntax `start..end` or the inclusive range syntax `start..=end`"
+    ),
+    on(
+        Self = "{float}",
+        note = "if you want to iterate between `start` until a value `end`, use the exclusive range \
+              syntax `start..end` or the inclusive range syntax `start..=end`"
+    ),
+    label = "`{Self}` is not an iterator",
+    message = "`{Self}` is not an iterator"
+)]
+#[rustc_skip_during_method_dispatch(array, boxed_slice)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub trait IntoIterator {
     /// The type of the elements being iterated over.
@@ -216,10 +296,8 @@ pub trait IntoIterator {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
-    /// let v = vec![1, 2, 3];
+    /// let v = [1, 2, 3];
     /// let mut iter = v.into_iter();
     ///
     /// assert_eq!(Some(1), iter.next());
@@ -237,6 +315,7 @@ impl<I: Iterator> IntoIterator for I {
     type Item = I::Item;
     type IntoIter = I;
 
+    #[inline]
     fn into_iter(self) -> I {
         self
     }
@@ -309,7 +388,7 @@ impl<I: Iterator> IntoIterator for I {
 /// c.extend(vec![1, 2, 3]);
 ///
 /// // we've added these elements onto the end
-/// assert_eq!("MyCollection([5, 6, 7, 1, 2, 3])", format!("{:?}", c));
+/// assert_eq!("MyCollection([5, 6, 7, 1, 2, 3])", format!("{c:?}"));
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub trait Extend<A> {
@@ -321,8 +400,6 @@ pub trait Extend<A> {
     /// [trait-level]: Extend
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// // You can extend a String with some chars:
@@ -348,6 +425,26 @@ pub trait Extend<A> {
     fn extend_reserve(&mut self, additional: usize) {
         let _ = additional;
     }
+
+    /// Extends a collection with one element, without checking there is enough capacity for it.
+    ///
+    /// # Safety
+    ///
+    /// **For callers:** This must only be called when we know the collection has enough capacity
+    /// to contain the new item, for example because we previously called `extend_reserve`.
+    ///
+    /// **For implementors:** For a collection to unsafely rely on this method's safety precondition (that is,
+    /// invoke UB if they are violated), it must implement `extend_reserve` correctly. In other words,
+    /// callers may assume that if they `extend_reserve`ed enough space they can call this method.
+    // This method is for internal usage only. It is only on the trait because of specialization's limitations.
+    #[unstable(feature = "extend_one_unchecked", issue = "none")]
+    #[doc(hidden)]
+    unsafe fn extend_one_unchecked(&mut self, item: A)
+    where
+        Self: Sized,
+    {
+        self.extend_one(item);
+    }
 }
 
 #[stable(feature = "extend_for_unit", since = "1.28.0")]
@@ -357,3 +454,275 @@ impl Extend<()> for () {
     }
     fn extend_one(&mut self, _item: ()) {}
 }
+
+/// This trait is implemented for tuples up to twelve items long. The `impl`s for
+/// 1- and 3- through 12-ary tuples were stabilized after 2-tuples, in 1.85.0.
+#[doc(fake_variadic)] // the other implementations are below.
+#[stable(feature = "extend_for_tuple", since = "1.56.0")]
+impl<T, ExtendT> Extend<(T,)> for (ExtendT,)
+where
+    ExtendT: Extend<T>,
+{
+    /// Allows to `extend` a tuple of collections that also implement `Extend`.
+    ///
+    /// See also: [`Iterator::unzip`]
+    ///
+    /// # Examples
+    /// ```
+    /// // Example given for a 2-tuple, but 1- through 12-tuples are supported
+    /// let mut tuple = (vec![0], vec![1]);
+    /// tuple.extend([(2, 3), (4, 5), (6, 7)]);
+    /// assert_eq!(tuple.0, [0, 2, 4, 6]);
+    /// assert_eq!(tuple.1, [1, 3, 5, 7]);
+    ///
+    /// // also allows for arbitrarily nested tuples as elements
+    /// let mut nested_tuple = (vec![1], (vec![2], vec![3]));
+    /// nested_tuple.extend([(4, (5, 6)), (7, (8, 9))]);
+    ///
+    /// let (a, (b, c)) = nested_tuple;
+    /// assert_eq!(a, [1, 4, 7]);
+    /// assert_eq!(b, [2, 5, 8]);
+    /// assert_eq!(c, [3, 6, 9]);
+    /// ```
+    fn extend<I: IntoIterator<Item = (T,)>>(&mut self, iter: I) {
+        self.0.extend(iter.into_iter().map(|t| t.0));
+    }
+
+    fn extend_one(&mut self, item: (T,)) {
+        self.0.extend_one(item.0)
+    }
+
+    fn extend_reserve(&mut self, additional: usize) {
+        self.0.extend_reserve(additional)
+    }
+
+    unsafe fn extend_one_unchecked(&mut self, item: (T,)) {
+        // SAFETY: the caller guarantees all preconditions.
+        unsafe { self.0.extend_one_unchecked(item.0) }
+    }
+}
+
+/// This implementation turns an iterator of tuples into a tuple of types which implement
+/// [`Default`] and [`Extend`].
+///
+/// This is similar to [`Iterator::unzip`], but is also composable with other [`FromIterator`]
+/// implementations:
+///
+/// ```rust
+/// # fn main() -> Result<(), core::num::ParseIntError> {
+/// let string = "1,2,123,4";
+///
+/// // Example given for a 2-tuple, but 1- through 12-tuples are supported
+/// let (numbers, lengths): (Vec<_>, Vec<_>) = string
+///     .split(',')
+///     .map(|s| s.parse().map(|n: u32| (n, s.len())))
+///     .collect::<Result<_, _>>()?;
+///
+/// assert_eq!(numbers, [1, 2, 123, 4]);
+/// assert_eq!(lengths, [1, 1, 3, 1]);
+/// # Ok(()) }
+/// ```
+#[doc(fake_variadic)] // the other implementations are below.
+#[stable(feature = "from_iterator_for_tuple", since = "1.79.0")]
+impl<T, ExtendT> FromIterator<(T,)> for (ExtendT,)
+where
+    ExtendT: Default + Extend<T>,
+{
+    fn from_iter<Iter: IntoIterator<Item = (T,)>>(iter: Iter) -> Self {
+        let mut res = ExtendT::default();
+        res.extend(iter.into_iter().map(|t| t.0));
+        (res,)
+    }
+}
+
+/// An implementation of [`extend`](Extend::extend) that calls `extend_one` or
+/// `extend_one_unchecked` for each element of the iterator.
+fn default_extend<ExtendT, I, T>(collection: &mut ExtendT, iter: I)
+where
+    ExtendT: Extend<T>,
+    I: IntoIterator<Item = T>,
+{
+    // Specialize on `TrustedLen` and call `extend_one_unchecked` where
+    // applicable.
+    trait SpecExtend<I> {
+        fn extend(&mut self, iter: I);
+    }
+
+    // Extracting these to separate functions avoid monomorphising the closures
+    // for every iterator type.
+    fn extender<ExtendT, T>(collection: &mut ExtendT) -> impl FnMut(T) + use<'_, ExtendT, T>
+    where
+        ExtendT: Extend<T>,
+    {
+        move |item| collection.extend_one(item)
+    }
+
+    unsafe fn unchecked_extender<ExtendT, T>(
+        collection: &mut ExtendT,
+    ) -> impl FnMut(T) + use<'_, ExtendT, T>
+    where
+        ExtendT: Extend<T>,
+    {
+        // SAFETY: we make sure that there is enough space at the callsite of
+        // this function.
+        move |item| unsafe { collection.extend_one_unchecked(item) }
+    }
+
+    impl<ExtendT, I, T> SpecExtend<I> for ExtendT
+    where
+        ExtendT: Extend<T>,
+        I: Iterator<Item = T>,
+    {
+        default fn extend(&mut self, iter: I) {
+            let (lower_bound, _) = iter.size_hint();
+            if lower_bound > 0 {
+                self.extend_reserve(lower_bound);
+            }
+
+            iter.for_each(extender(self))
+        }
+    }
+
+    impl<ExtendT, I, T> SpecExtend<I> for ExtendT
+    where
+        ExtendT: Extend<T>,
+        I: TrustedLen<Item = T>,
+    {
+        fn extend(&mut self, iter: I) {
+            let (lower_bound, upper_bound) = iter.size_hint();
+            if lower_bound > 0 {
+                self.extend_reserve(lower_bound);
+            }
+
+            if upper_bound.is_none() {
+                // We cannot reserve more than `usize::MAX` items, and this is likely to go out of memory anyway.
+                iter.for_each(extender(self))
+            } else {
+                // SAFETY: We reserve enough space for the `size_hint`, and the iterator is
+                // `TrustedLen` so its `size_hint` is exact.
+                iter.for_each(unsafe { unchecked_extender(self) })
+            }
+        }
+    }
+
+    SpecExtend::extend(collection, iter.into_iter());
+}
+
+// Implements `Extend` and `FromIterator` for tuples with length larger than one.
+macro_rules! impl_extend_tuple {
+    ($(($ty:tt, $extend_ty:tt, $index:tt)),+) => {
+        #[doc(hidden)]
+        #[stable(feature = "extend_for_tuple", since = "1.56.0")]
+        impl<$($ty,)+ $($extend_ty,)+> Extend<($($ty,)+)> for ($($extend_ty,)+)
+        where
+            $($extend_ty: Extend<$ty>,)+
+        {
+            fn extend<T: IntoIterator<Item = ($($ty,)+)>>(&mut self, iter: T) {
+                default_extend(self, iter)
+            }
+
+            fn extend_one(&mut self, item: ($($ty,)+)) {
+                $(self.$index.extend_one(item.$index);)+
+            }
+
+            fn extend_reserve(&mut self, additional: usize) {
+                $(self.$index.extend_reserve(additional);)+
+            }
+
+            unsafe fn extend_one_unchecked(&mut self, item: ($($ty,)+)) {
+                // SAFETY: Those are our safety preconditions, and we correctly forward `extend_reserve`.
+                unsafe {
+                    $(self.$index.extend_one_unchecked(item.$index);)+
+                }
+            }
+        }
+
+        #[doc(hidden)]
+        #[stable(feature = "from_iterator_for_tuple", since = "1.79.0")]
+        impl<$($ty,)+ $($extend_ty,)+> FromIterator<($($ty,)+)> for ($($extend_ty,)+)
+        where
+            $($extend_ty: Default + Extend<$ty>,)+
+        {
+            fn from_iter<Iter: IntoIterator<Item = ($($ty,)+)>>(iter: Iter) -> Self {
+                let mut res = Self::default();
+                res.extend(iter);
+                res
+            }
+        }
+    };
+}
+
+impl_extend_tuple!((A, ExA, 0), (B, ExB, 1));
+impl_extend_tuple!((A, ExA, 0), (B, ExB, 1), (C, ExC, 2));
+impl_extend_tuple!((A, ExA, 0), (B, ExB, 1), (C, ExC, 2), (D, ExD, 3));
+impl_extend_tuple!((A, ExA, 0), (B, ExB, 1), (C, ExC, 2), (D, ExD, 3), (E, ExE, 4));
+impl_extend_tuple!((A, ExA, 0), (B, ExB, 1), (C, ExC, 2), (D, ExD, 3), (E, ExE, 4), (F, ExF, 5));
+impl_extend_tuple!(
+    (A, ExA, 0),
+    (B, ExB, 1),
+    (C, ExC, 2),
+    (D, ExD, 3),
+    (E, ExE, 4),
+    (F, ExF, 5),
+    (G, ExG, 6)
+);
+impl_extend_tuple!(
+    (A, ExA, 0),
+    (B, ExB, 1),
+    (C, ExC, 2),
+    (D, ExD, 3),
+    (E, ExE, 4),
+    (F, ExF, 5),
+    (G, ExG, 6),
+    (H, ExH, 7)
+);
+impl_extend_tuple!(
+    (A, ExA, 0),
+    (B, ExB, 1),
+    (C, ExC, 2),
+    (D, ExD, 3),
+    (E, ExE, 4),
+    (F, ExF, 5),
+    (G, ExG, 6),
+    (H, ExH, 7),
+    (I, ExI, 8)
+);
+impl_extend_tuple!(
+    (A, ExA, 0),
+    (B, ExB, 1),
+    (C, ExC, 2),
+    (D, ExD, 3),
+    (E, ExE, 4),
+    (F, ExF, 5),
+    (G, ExG, 6),
+    (H, ExH, 7),
+    (I, ExI, 8),
+    (J, ExJ, 9)
+);
+impl_extend_tuple!(
+    (A, ExA, 0),
+    (B, ExB, 1),
+    (C, ExC, 2),
+    (D, ExD, 3),
+    (E, ExE, 4),
+    (F, ExF, 5),
+    (G, ExG, 6),
+    (H, ExH, 7),
+    (I, ExI, 8),
+    (J, ExJ, 9),
+    (K, ExK, 10)
+);
+impl_extend_tuple!(
+    (A, ExA, 0),
+    (B, ExB, 1),
+    (C, ExC, 2),
+    (D, ExD, 3),
+    (E, ExE, 4),
+    (F, ExF, 5),
+    (G, ExG, 6),
+    (H, ExH, 7),
+    (I, ExI, 8),
+    (J, ExJ, 9),
+    (K, ExK, 10),
+    (L, ExL, 11)
+);

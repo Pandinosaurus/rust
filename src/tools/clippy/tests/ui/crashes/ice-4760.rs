@@ -1,3 +1,7 @@
+//@ check-pass
+
+#![allow(non_local_definitions)]
+
 const COUNT: usize = 2;
 struct Thing;
 trait Dummy {}

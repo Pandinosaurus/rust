@@ -1,10 +1,7 @@
-// edition:2018
-// aux-build:proc_macro_derive.rs
-
+//@aux-build:proc_macro_derive.rs
 #![feature(rustc_private)]
-#![warn(clippy::all)]
-#![allow(clippy::blacklisted_name, clippy::eq_op)]
 #![warn(clippy::used_underscore_binding)]
+#![allow(clippy::disallowed_names, clippy::eq_op, clippy::uninlined_format_args)]
 
 #[macro_use]
 extern crate proc_macro_derive;
@@ -24,12 +21,16 @@ macro_rules! test_macro {
 /// Tests that we lint if we use a binding with a single leading underscore
 fn prefix_underscore(_foo: u32) -> u32 {
     _foo + 1
+    //~^ used_underscore_binding
 }
 
 /// Tests that we lint if we use a `_`-variable defined outside within a macro expansion
 fn in_macro_or_desugar(_foo: u32) {
     println!("{}", _foo);
+    //~^ used_underscore_binding
     assert_eq!(_foo, _foo);
+    //~^ used_underscore_binding
+    //~| used_underscore_binding
 
     test_macro!() + 1;
 }
@@ -43,6 +44,13 @@ struct StructFieldTest {
 fn in_struct_field() {
     let mut s = StructFieldTest { _underscore_field: 0 };
     s._underscore_field += 1;
+    //~^ used_underscore_binding
+}
+
+/// Tests that we do not lint if the struct field is used in code created with derive.
+#[derive(Clone, Debug)]
+pub struct UnderscoreInStruct {
+    _foo: u32,
 }
 
 /// Tests that we do not lint if the underscore is not a prefix
@@ -98,9 +106,35 @@ async fn await_desugaring() {
     ({
         let _i = 5;
         uses_i(_i);
+        //~^ used_underscore_binding
         foo()
     })
     .await
+}
+
+struct PhantomField<T> {
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T> std::fmt::Debug for PhantomField<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("PhantomField").field("_marker", &self._marker).finish()
+    }
+}
+
+struct AllowedField {
+    #[allow(clippy::used_underscore_binding)]
+    _allowed: usize,
+}
+
+struct ExpectedField {
+    #[expect(clippy::used_underscore_binding)]
+    _expected: usize,
+}
+
+fn lint_levels(allowed: AllowedField, expected: ExpectedField) {
+    let _ = allowed._allowed;
+    let _ = expected._expected;
 }
 
 fn main() {

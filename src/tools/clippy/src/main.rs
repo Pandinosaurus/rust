@@ -1,44 +1,22 @@
-#![cfg_attr(feature = "deny-warnings", deny(warnings))]
+// We need this feature as it changes `dylib` linking behavior and allows us to link to
+// `rustc_driver`.
+#![feature(rustc_private)]
 // warn on lints, that are included in `rust-lang/rust`s bootstrap
 #![warn(rust_2018_idioms, unused_lifetimes)]
 
-use rustc_tools_util::VersionInfo;
 use std::env;
-use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::{self, Command};
 
-const CARGO_CLIPPY_HELP: &str = r#"Checks a package to catch common mistakes and improve your Rust code.
-
-Usage:
-    cargo clippy [options] [--] [<opts>...]
-
-Common options:
-    -h, --help               Print this message
-    -V, --version            Print version info and exit
-
-Other options are the same as `cargo check`.
-
-To allow or deny a lint from the command line you can use `cargo clippy --`
-with:
-
-    -W --warn OPT       Set lint warnings
-    -A --allow OPT      Set lint allowed
-    -D --deny OPT       Set lint denied
-    -F --forbid OPT     Set lint forbidden
-
-You can use tool lints to allow or deny lints from your code, eg.:
-
-    #[allow(clippy::needless_lifetimes)]
-"#;
+use anstream::println;
 
 fn show_help() {
-    println!("{}", CARGO_CLIPPY_HELP);
+    println!("{}", help_message());
 }
 
 fn show_version() {
     let version_info = rustc_tools_util::get_version_info!();
-    println!("{}", version_info);
+    println!("{version_info}");
 }
 
 pub fn main() {
@@ -50,6 +28,18 @@ pub fn main() {
 
     if env::args().any(|a| a == "--version" || a == "-V") {
         show_version();
+        return;
+    }
+
+    if let Some(pos) = env::args().position(|a| a == "--explain") {
+        if let Some(mut lint) = env::args().nth(pos + 1) {
+            lint.make_ascii_lowercase();
+            process::exit(clippy_lints::explain(
+                &lint.strip_prefix("clippy::").unwrap_or(&lint).replace('-', "_"),
+            ));
+        } else {
+            show_help();
+        }
         return;
     }
 
@@ -70,8 +60,8 @@ impl ClippyCmd {
         I: Iterator<Item = String>,
     {
         let mut cargo_subcommand = "check";
-        let mut unstable_options = false;
         let mut args = vec![];
+        let mut clippy_args: Vec<String> = vec![];
 
         for arg in old_args.by_ref() {
             match arg.as_str() {
@@ -79,25 +69,23 @@ impl ClippyCmd {
                     cargo_subcommand = "fix";
                     continue;
                 },
+                "--no-deps" => {
+                    clippy_args.push("--no-deps".into());
+                    continue;
+                },
                 "--" => break,
-                // Cover -Zunstable-options and -Z unstable-options
-                s if s.ends_with("unstable-options") => unstable_options = true,
                 _ => {},
             }
 
             args.push(arg);
         }
 
-        if cargo_subcommand == "fix" && !unstable_options {
-            panic!("Usage of `--fix` requires `-Z unstable-options`");
-        }
-
-        let mut clippy_args: Vec<String> = old_args.collect();
+        clippy_args.append(&mut (old_args.collect()));
         if cargo_subcommand == "fix" && !clippy_args.iter().any(|arg| arg == "--no-deps") {
             clippy_args.push("--no-deps".into());
         }
 
-        ClippyCmd {
+        Self {
             cargo_subcommand,
             args,
             clippy_args,
@@ -116,33 +104,19 @@ impl ClippyCmd {
         path
     }
 
-    fn target_dir() -> Option<(&'static str, OsString)> {
-        env::var_os("CLIPPY_DOGFOOD")
-            .map(|_| {
-                env::var_os("CARGO_MANIFEST_DIR").map_or_else(
-                    || std::ffi::OsString::from("clippy_dogfood"),
-                    |d| {
-                        std::path::PathBuf::from(d)
-                            .join("target")
-                            .join("dogfood")
-                            .into_os_string()
-                    },
-                )
-            })
-            .map(|p| ("CARGO_TARGET_DIR", p))
-    }
-
     fn into_std_cmd(self) -> Command {
-        let mut cmd = Command::new("cargo");
+        let mut cmd = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
         let clippy_args: String = self
             .clippy_args
             .iter()
-            .map(|arg| format!("{}__CLIPPY_HACKERY__", arg))
-            .collect();
+            .fold(String::new(), |s, arg| s + arg + "__CLIPPY_HACKERY__");
+
+        // Currently, `CLIPPY_TERMINAL_WIDTH` is used only to format "unknown field" error messages.
+        let terminal_width = termize::dimensions().map_or(0, |(w, _)| w);
 
         cmd.env("RUSTC_WORKSPACE_WRAPPER", Self::path())
-            .envs(ClippyCmd::target_dir())
             .env("CLIPPY_ARGS", clippy_args)
+            .env("CLIPPY_TERMINAL_WIDTH", terminal_width.to_string())
             .arg(self.cargo_subcommand)
             .args(&self.args);
 
@@ -171,39 +145,65 @@ where
     }
 }
 
+#[must_use]
+pub fn help_message() -> &'static str {
+    color_print::cstr!(
+"Checks a package to catch common mistakes and improve your Rust code.
+
+<green,bold>Usage</>:
+    <cyan,bold>cargo clippy</> <cyan>[OPTIONS] [--] [<<ARGS>>...]</>
+
+<green,bold>Common options:</>
+    <cyan,bold>--no-deps</>                Run Clippy only on the given crate, without linting the dependencies
+    <cyan,bold>--fix</>                    Automatically apply lint suggestions. This flag implies <cyan>--no-deps</> and <cyan>--all-targets</>
+    <cyan,bold>-h</>, <cyan,bold>--help</>               Print this message
+    <cyan,bold>-V</>, <cyan,bold>--version</>            Print version info and exit
+    <cyan,bold>--explain [LINT]</>         Print the documentation for a given lint
+
+See all options with <cyan,bold>cargo check --help</>.
+
+<green,bold>Allowing / Denying lints</>
+
+To allow or deny a lint from the command line you can use <cyan,bold>cargo clippy --</> with:
+
+    <cyan,bold>-W</> / <cyan,bold>--warn</> <cyan>[LINT]</>       Set lint warnings
+    <cyan,bold>-A</> / <cyan,bold>--allow</> <cyan>[LINT]</>      Set lint allowed
+    <cyan,bold>-D</> / <cyan,bold>--deny</> <cyan>[LINT]</>       Set lint denied
+    <cyan,bold>-F</> / <cyan,bold>--forbid</> <cyan>[LINT]</>     Set lint forbidden
+
+You can use tool lints to allow or deny lints from your code, e.g.:
+
+    <yellow,bold>#[allow(clippy::needless_lifetimes)]</>
+
+<green,bold>Manifest Options:</>
+    <cyan,bold>--manifest-path</> <cyan><<PATH>></>  Path to Cargo.toml
+    <cyan,bold>--frozen</>                Require Cargo.lock and cache are up to date
+    <cyan,bold>--locked</>                Require Cargo.lock is up to date
+    <cyan,bold>--offline</>               Run without accessing the network
+")
+}
 #[cfg(test)]
 mod tests {
     use super::ClippyCmd;
 
     #[test]
-    #[should_panic]
-    fn fix_without_unstable() {
+    fn fix() {
         let args = "cargo clippy --fix".split_whitespace().map(ToString::to_string);
-        ClippyCmd::new(args);
-    }
-
-    #[test]
-    fn fix_unstable() {
-        let args = "cargo clippy --fix -Zunstable-options"
-            .split_whitespace()
-            .map(ToString::to_string);
         let cmd = ClippyCmd::new(args);
         assert_eq!("fix", cmd.cargo_subcommand);
-        assert!(cmd.args.iter().any(|arg| arg.ends_with("unstable-options")));
+        assert!(!cmd.args.iter().any(|arg| arg.ends_with("unstable-options")));
     }
 
     #[test]
     fn fix_implies_no_deps() {
-        let args = "cargo clippy --fix -Zunstable-options"
-            .split_whitespace()
-            .map(ToString::to_string);
+        let args = "cargo clippy --fix".split_whitespace().map(ToString::to_string);
         let cmd = ClippyCmd::new(args);
         assert!(cmd.clippy_args.iter().any(|arg| arg == "--no-deps"));
     }
 
     #[test]
     fn no_deps_not_duplicated_with_fix() {
-        let args = "cargo clippy --fix -Zunstable-options -- --no-deps"
+        let args = "cargo clippy --fix -- --no-deps"
             .split_whitespace()
             .map(ToString::to_string);
         let cmd = ClippyCmd::new(args);

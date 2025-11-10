@@ -1,5 +1,3 @@
-// run-rustfix
-
 #![warn(clippy::needless_arbitrary_self_type)]
 #![allow(unused_mut, clippy::needless_lifetimes)]
 
@@ -10,6 +8,7 @@ pub enum ValType {
 
 impl ValType {
     pub fn bad(self: Self) {
+        //~^ needless_arbitrary_self_type
         unimplemented!();
     }
 
@@ -18,6 +17,7 @@ impl ValType {
     }
 
     pub fn mut_bad(mut self: Self) {
+        //~^ needless_arbitrary_self_type
         unimplemented!();
     }
 
@@ -26,6 +26,7 @@ impl ValType {
     }
 
     pub fn ref_bad(self: &Self) {
+        //~^ needless_arbitrary_self_type
         unimplemented!();
     }
 
@@ -34,6 +35,7 @@ impl ValType {
     }
 
     pub fn ref_bad_with_lifetime<'a>(self: &'a Self) {
+        //~^ needless_arbitrary_self_type
         unimplemented!();
     }
 
@@ -42,6 +44,7 @@ impl ValType {
     }
 
     pub fn mut_ref_bad(self: &mut Self) {
+        //~^ needless_arbitrary_self_type
         unimplemented!();
     }
 
@@ -50,6 +53,7 @@ impl ValType {
     }
 
     pub fn mut_ref_bad_with_lifetime<'a>(self: &'a mut Self) {
+        //~^ needless_arbitrary_self_type
         unimplemented!();
     }
 
@@ -64,6 +68,13 @@ impl ValType {
     pub fn mut_ref_mut_ref_good(self: &&mut &mut Self) {
         unimplemented!();
     }
+}
+
+trait Foo<'r#struct> {
+    fn f1(self: &'r#struct Self) {}
+    //~^ needless_arbitrary_self_type
+    fn f2(self: &'r#struct mut Self) {}
+    //~^ needless_arbitrary_self_type
 }
 
 fn main() {}

@@ -1,5 +1,5 @@
-use super::header::extract_llvm_version;
-use super::*;
+use crate::debuggers::{extract_gdb_version, extract_lldb_version};
+use crate::is_test;
 
 #[test]
 fn test_extract_gdb_version() {
@@ -39,33 +39,51 @@ fn test_extract_gdb_version() {
         7012000: "GNU gdb (GDB) 7.12",
         7012000: "GNU gdb (GDB) 7.12.20161027-git",
         7012050: "GNU gdb (GDB) 7.12.50.20161027-git",
+
+        9002000: "GNU gdb (Ubuntu 9.2-0ubuntu1~20.04) 9.2",
+        10001000: "GNU gdb (GDB) 10.1 [GDB v10.1 for FreeBSD]",
     }
 }
 
 #[test]
 fn test_extract_lldb_version() {
     // Apple variants
-    assert_eq!(extract_lldb_version("LLDB-179.5"), Some((179, false)));
-    assert_eq!(extract_lldb_version("lldb-300.2.51"), Some((300, false)));
+    assert_eq!(extract_lldb_version("LLDB-179.5"), Some(179));
+    assert_eq!(extract_lldb_version("lldb-300.2.51"), Some(300));
 
     // Upstream versions
-    assert_eq!(extract_lldb_version("lldb version 6.0.1"), Some((600, false)));
-    assert_eq!(extract_lldb_version("lldb version 9.0.0"), Some((900, false)));
+    assert_eq!(extract_lldb_version("lldb version 6.0.1"), Some(600));
+    assert_eq!(extract_lldb_version("lldb version 9.0.0"), Some(900));
 }
 
 #[test]
 fn is_test_test() {
-    assert_eq!(true, is_test(&OsString::from("a_test.rs")));
-    assert_eq!(false, is_test(&OsString::from(".a_test.rs")));
-    assert_eq!(false, is_test(&OsString::from("a_cat.gif")));
-    assert_eq!(false, is_test(&OsString::from("#a_dog_gif")));
-    assert_eq!(false, is_test(&OsString::from("~a_temp_file")));
+    assert!(is_test("a_test.rs"));
+    assert!(!is_test(".a_test.rs"));
+    assert!(!is_test("a_cat.gif"));
+    assert!(!is_test("#a_dog_gif"));
+    assert!(!is_test("~a_temp_file"));
 }
 
 #[test]
-fn test_extract_llvm_version() {
-    assert_eq!(extract_llvm_version("8.1.2-rust"), Some(80102));
-    assert_eq!(extract_llvm_version("9.0.1-rust-1.43.0-dev"), Some(90001));
-    assert_eq!(extract_llvm_version("9.3.1-rust-1.43.0-dev"), Some(90301));
-    assert_eq!(extract_llvm_version("10.0.0-rust"), Some(100000));
+fn string_enums() {
+    crate::util::string_enum! {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Animal {
+            Cat => "meow",
+            Dog => "woof",
+        }
+    }
+
+    // General assertions, mostly to silence the dead code warnings
+    assert_eq!(Animal::VARIANTS.len(), 2);
+    assert_eq!(Animal::STR_VARIANTS.len(), 2);
+
+    // Correct string conversions
+    assert_eq!(Animal::Cat, "meow".parse().unwrap());
+    assert_eq!(Animal::Dog, "woof".parse().unwrap());
+
+    // Invalid conversions
+    let animal = "nya".parse::<Animal>();
+    assert_eq!("unknown `Animal` variant: `nya`", animal.unwrap_err());
 }

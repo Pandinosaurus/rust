@@ -1,12 +1,16 @@
-use super::{InlineAsmArch, InlineAsmType};
-use crate::spec::Target;
-use rustc_macros::HashStable_Generic;
 use std::fmt;
+
+use rustc_data_structures::fx::FxIndexSet;
+use rustc_span::{Symbol, sym};
+
+use super::{InlineAsmArch, InlineAsmType, ModifierInfo};
+use crate::spec::{RelocModel, Target};
 
 def_reg_class! {
     RiscV RiscVInlineAsmRegClass {
         reg,
         freg,
+        vreg,
     }
 }
 
@@ -23,38 +27,45 @@ impl RiscVInlineAsmRegClass {
         self,
         _arch: InlineAsmArch,
         _ty: InlineAsmType,
-    ) -> Option<(char, &'static str)> {
+    ) -> Option<ModifierInfo> {
         None
     }
 
-    pub fn default_modifier(self, _arch: InlineAsmArch) -> Option<(char, &'static str)> {
+    pub fn default_modifier(self, _arch: InlineAsmArch) -> Option<ModifierInfo> {
         None
     }
 
     pub fn supported_types(
         self,
         arch: InlineAsmArch,
-    ) -> &'static [(InlineAsmType, Option<&'static str>)] {
+    ) -> &'static [(InlineAsmType, Option<Symbol>)] {
         match self {
             Self::reg => {
                 if arch == InlineAsmArch::RiscV64 {
-                    types! { _: I8, I16, I32, I64, F32, F64; }
+                    types! { _: I8, I16, I32, I64, F16, F32, F64; }
                 } else {
-                    types! { _: I8, I16, I32, F32; }
+                    types! { _: I8, I16, I32, F16, F32; }
                 }
             }
-            Self::freg => types! { "f": F32; "d": F64; },
+            // FIXME(f16_f128): Add `q: F128;` once LLVM support the `Q` extension.
+            Self::freg => types! { f: F16, F32; d: F64; },
+            Self::vreg => &[],
         }
     }
 }
 
+pub(crate) fn is_e(target_features: &FxIndexSet<Symbol>) -> bool {
+    target_features.contains(&sym::e)
+}
+
 fn not_e(
     _arch: InlineAsmArch,
-    mut has_feature: impl FnMut(&str) -> bool,
+    _reloc_model: RelocModel,
+    target_features: &FxIndexSet<Symbol>,
     _target: &Target,
-    _allocating: bool,
+    _is_clobber: bool,
 ) -> Result<(), &'static str> {
-    if has_feature("e") {
+    if is_e(target_features) {
         Err("register can't be used with the `e` target feature")
     } else {
         Ok(())
@@ -67,7 +78,6 @@ def_regs! {
         x5: reg = ["x5", "t0"],
         x6: reg = ["x6", "t1"],
         x7: reg = ["x7", "t2"],
-        x9: reg = ["x9", "s1"],
         x10: reg = ["x10", "a0"],
         x11: reg = ["x11", "a1"],
         x12: reg = ["x12", "a2"],
@@ -122,6 +132,40 @@ def_regs! {
         f29: freg = ["f29", "ft9"],
         f30: freg = ["f30", "ft10"],
         f31: freg = ["f31", "ft11"],
+        v0: vreg = ["v0"],
+        v1: vreg = ["v1"],
+        v2: vreg = ["v2"],
+        v3: vreg = ["v3"],
+        v4: vreg = ["v4"],
+        v5: vreg = ["v5"],
+        v6: vreg = ["v6"],
+        v7: vreg = ["v7"],
+        v8: vreg = ["v8"],
+        v9: vreg = ["v9"],
+        v10: vreg = ["v10"],
+        v11: vreg = ["v11"],
+        v12: vreg = ["v12"],
+        v13: vreg = ["v13"],
+        v14: vreg = ["v14"],
+        v15: vreg = ["v15"],
+        v16: vreg = ["v16"],
+        v17: vreg = ["v17"],
+        v18: vreg = ["v18"],
+        v19: vreg = ["v19"],
+        v20: vreg = ["v20"],
+        v21: vreg = ["v21"],
+        v22: vreg = ["v22"],
+        v23: vreg = ["v23"],
+        v24: vreg = ["v24"],
+        v25: vreg = ["v25"],
+        v26: vreg = ["v26"],
+        v27: vreg = ["v27"],
+        v28: vreg = ["v28"],
+        v29: vreg = ["v29"],
+        v30: vreg = ["v30"],
+        v31: vreg = ["v31"],
+        #error = ["x9", "s1"] =>
+            "s1 is used internally by LLVM and cannot be used as an operand for inline asm",
         #error = ["x8", "s0", "fp"] =>
             "the frame pointer cannot be used as an operand for inline asm",
         #error = ["x2", "sp"] =>

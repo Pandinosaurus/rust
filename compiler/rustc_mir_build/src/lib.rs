@@ -1,31 +1,33 @@
 //! Construction of MIR from HIR.
-//!
-//! This crate also contains the match exhaustiveness and usefulness checking.
-#![feature(array_windows)]
+
+// tidy-alphabetical-start
+#![allow(rustc::diagnostic_outside_of_impl)]
+#![allow(rustc::untranslatable_diagnostic)]
+#![feature(assert_matches)]
 #![feature(box_patterns)]
-#![feature(box_syntax)]
-#![feature(const_fn)]
-#![feature(const_panic)]
-#![feature(control_flow_enum)]
-#![feature(crate_visibility_modifier)]
-#![feature(bool_to_option)]
-#![feature(once_cell)]
-#![cfg_attr(bootstrap, feature(or_patterns))]
-#![recursion_limit = "256"]
+#![feature(if_let_guard)]
+#![feature(try_blocks)]
+// tidy-alphabetical-end
 
-#[macro_use]
-extern crate tracing;
-#[macro_use]
-extern crate rustc_middle;
-
-mod build;
-mod lints;
+// The `builder` module used to be named `build`, but that was causing GitHub's
+// "Go to file" feature to silently ignore all files in the module, probably
+// because it assumes that "build" is a build-output directory. See #134365.
+pub mod builder;
+mod check_tail_calls;
+mod check_unsafety;
+mod errors;
 pub mod thir;
 
-use rustc_middle::ty::query::Providers;
+use rustc_middle::util::Providers;
+
+rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 
 pub fn provide(providers: &mut Providers) {
     providers.check_match = thir::pattern::check_match;
     providers.lit_to_const = thir::constant::lit_to_const;
-    providers.mir_built = build::mir_built;
+    providers.closure_saved_names_of_captured_variables =
+        builder::closure_saved_names_of_captured_variables;
+    providers.check_unsafety = check_unsafety::check_unsafety;
+    providers.check_tail_calls = check_tail_calls::check_tail_calls;
+    providers.thir_body = thir::cx::thir_body;
 }

@@ -1,8 +1,9 @@
-#[warn(clippy::exit)]
+#![warn(clippy::exit)]
 
 fn not_main() {
     if true {
         std::process::exit(4);
+        //~^ exit
     }
 }
 

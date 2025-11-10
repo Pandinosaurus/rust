@@ -1,43 +1,61 @@
 //! Temporal quantification.
 //!
-//! Example:
+//! # Examples
+//!
+//! There are multiple ways to create a new [`Duration`]:
 //!
 //! ```
-//! use std::time::Duration;
+//! # use std::time::Duration;
+//! let five_seconds = Duration::from_secs(5);
+//! assert_eq!(five_seconds, Duration::from_millis(5_000));
+//! assert_eq!(five_seconds, Duration::from_micros(5_000_000));
+//! assert_eq!(five_seconds, Duration::from_nanos(5_000_000_000));
 //!
-//! let five_seconds = Duration::new(5, 0);
-//! // both declarations are equivalent
-//! assert_eq!(Duration::new(5, 0), Duration::from_secs(5));
+//! let ten_seconds = Duration::from_secs(10);
+//! let seven_nanos = Duration::from_nanos(7);
+//! let total = ten_seconds + seven_nanos;
+//! assert_eq!(total, Duration::new(10, 7));
+//! ```
+//!
+//! Using [`Instant`] to calculate how long a function took to run:
+//!
+//! ```ignore (incomplete)
+//! let now = Instant::now();
+//!
+//! // Calling a slow function, it may take a while
+//! slow_function();
+//!
+//! let elapsed_time = now.elapsed();
+//! println!("Running slow_function() took {} seconds.", elapsed_time.as_secs());
 //! ```
 
 #![stable(feature = "time", since = "1.3.0")]
 
-#[cfg(test)]
-mod tests;
+#[stable(feature = "time", since = "1.3.0")]
+pub use core::time::Duration;
+#[stable(feature = "duration_checked_float", since = "1.66.0")]
+pub use core::time::TryFromFloatSecsError;
 
-use crate::cmp;
 use crate::error::Error;
 use crate::fmt;
 use crate::ops::{Add, AddAssign, Sub, SubAssign};
 use crate::sys::time;
-use crate::sys_common::mutex::StaticMutex;
-use crate::sys_common::FromInner;
-
-#[stable(feature = "time", since = "1.3.0")]
-pub use core::time::Duration;
+use crate::sys_common::{FromInner, IntoInner};
 
 /// A measurement of a monotonically nondecreasing clock.
-/// Opaque and useful only with `Duration`.
+/// Opaque and useful only with [`Duration`].
 ///
-/// Instants are always guaranteed to be no less than any previously measured
-/// instant when created, and are often useful for tasks such as measuring
+/// Instants are always guaranteed, barring [platform bugs], to be no less than any previously
+/// measured instant when created, and are often useful for tasks such as measuring
 /// benchmarks or timing how long an operation takes.
 ///
-/// Note, however, that instants are not guaranteed to be **steady**. In other
-/// words, each tick of the underlying clock may not be the same length (e.g.
+/// Note, however, that instants are **not** guaranteed to be **steady**. In other
+/// words, each tick of the underlying clock might not be the same length (e.g.
 /// some seconds may be longer than others). An instant may jump forwards or
 /// experience time dilation (slow down or speed up), but it will never go
 /// backwards.
+/// As part of this non-guarantee it is also not specified whether system suspends count as
+/// elapsed time or not. The behavior varies across platforms and Rust versions.
 ///
 /// Instants are opaque types that can only be compared to one another. There is
 /// no method to get "the number of seconds" from an instant. Instead, it only
@@ -63,6 +81,8 @@ pub use core::time::Duration;
 /// }
 /// ```
 ///
+/// [platform bugs]: Instant#monotonicity
+///
 /// # OS-specific behaviors
 ///
 /// An `Instant` is a wrapper around system-specific types and it may behave
@@ -73,29 +93,38 @@ pub use core::time::Duration;
 /// use std::time::{Instant, Duration};
 ///
 /// let now = Instant::now();
-/// let max_nanoseconds = u64::MAX / 1_000_000_000;
-/// let duration = Duration::new(max_nanoseconds, 0);
+/// let days_per_10_millennia = 365_2425;
+/// let solar_seconds_per_day = 60 * 60 * 24;
+/// let millennium_in_solar_seconds = 31_556_952_000;
+/// assert_eq!(millennium_in_solar_seconds, days_per_10_millennia * solar_seconds_per_day / 10);
+///
+/// let duration = Duration::new(millennium_in_solar_seconds, 0);
 /// println!("{:?}", now + duration);
 /// ```
 ///
+/// For cross-platform code, you can comfortably use durations of up to around one hundred years.
+///
 /// # Underlying System calls
-/// Currently, the following system calls are being used to get the current time using `now()`:
+///
+/// The following system calls are [currently] being used by `now()` to find out
+/// the current time:
 ///
 /// |  Platform |               System call                                            |
-/// |:---------:|:--------------------------------------------------------------------:|
+/// |-----------|----------------------------------------------------------------------|
 /// | SGX       | [`insecure_time` usercall]. More information on [timekeeping in SGX] |
-/// | UNIX      | [clock_gettime (Monotonic Clock)]                                    |
-/// | Darwin    | [mach_absolute_time]                                                 |
-/// | VXWorks   | [clock_gettime (Monotonic Clock)]                                    |
-/// | WASI      | [__wasi_clock_time_get (Monotonic Clock)]                            |
+/// | UNIX      | [clock_gettime] with `CLOCK_MONOTONIC`                               |
+/// | Darwin    | [clock_gettime] with `CLOCK_UPTIME_RAW`                              |
+/// | VXWorks   | [clock_gettime] with `CLOCK_MONOTONIC`                               |
+/// | SOLID     | `get_tim`                                                            |
+/// | WASI      | [__wasi_clock_time_get] with `monotonic`                             |
 /// | Windows   | [QueryPerformanceCounter]                                            |
 ///
+/// [currently]: crate::io#platform-specific-behavior
 /// [QueryPerformanceCounter]: https://docs.microsoft.com/en-us/windows/win32/api/profileapi/nf-profileapi-queryperformancecounter
 /// [`insecure_time` usercall]: https://edp.fortanix.com/docs/api/fortanix_sgx_abi/struct.Usercalls.html#method.insecure_time
 /// [timekeeping in SGX]: https://edp.fortanix.com/docs/concepts/rust-std/#codestdtimecode
-/// [__wasi_clock_time_get (Monotonic Clock)]: https://github.com/WebAssembly/WASI/blob/master/phases/snapshot/docs.md#clock_time_get
-/// [clock_gettime (Monotonic Clock)]: https://linux.die.net/man/3/clock_gettime
-/// [mach_absolute_time]: https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/KernelProgramming/services/services.html
+/// [__wasi_clock_time_get]: https://github.com/WebAssembly/WASI/blob/main/legacy/preview1/docs.md#clock_time_get
+/// [clock_gettime]: https://linux.die.net/man/3/clock_gettime
 ///
 /// **Disclaimer:** These system calls might change over time.
 ///
@@ -103,8 +132,29 @@ pub use core::time::Duration;
 /// > structure cannot represent the new point in time.
 ///
 /// [`add`]: Instant::add
+///
+/// ## Monotonicity
+///
+/// On all platforms `Instant` will try to use an OS API that guarantees monotonic behavior
+/// if available, which is the case for all [tier 1] platforms.
+/// In practice such guarantees are – under rare circumstances – broken by hardware, virtualization
+/// or operating system bugs. To work around these bugs and platforms not offering monotonic clocks
+/// [`duration_since`], [`elapsed`] and [`sub`] saturate to zero. In older Rust versions this
+/// lead to a panic instead. [`checked_duration_since`] can be used to detect and handle situations
+/// where monotonicity is violated, or `Instant`s are subtracted in the wrong order.
+///
+/// This workaround obscures programming errors where earlier and later instants are accidentally
+/// swapped. For this reason future Rust versions may reintroduce panics.
+///
+/// [tier 1]: https://doc.rust-lang.org/rustc/platform-support.html
+/// [`duration_since`]: Instant::duration_since
+/// [`elapsed`]: Instant::elapsed
+/// [`sub`]: Instant::sub
+/// [`checked_duration_since`]: Instant::checked_duration_since
+///
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[stable(feature = "time2", since = "1.8.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "Instant")]
 pub struct Instant(time::Instant);
 
 /// A measurement of the system clock, useful for talking to
@@ -130,6 +180,14 @@ pub struct Instant(time::Instant);
 /// The size of a `SystemTime` struct may vary depending on the target operating
 /// system.
 ///
+/// A `SystemTime` does not count leap seconds.
+/// `SystemTime::now()`'s behavior around a leap second
+/// is the same as the operating system's wall clock.
+/// The precise behavior near a leap second
+/// (e.g. whether the clock appears to run slow or fast, or stop, or jump)
+/// depends on platform and configuration,
+/// so should not be relied on.
+///
 /// Example:
 ///
 /// ```no_run
@@ -147,30 +205,37 @@ pub struct Instant(time::Instant);
 ///            println!("{}", elapsed.as_secs());
 ///        }
 ///        Err(e) => {
-///            // an error occurred!
-///            println!("Error: {:?}", e);
+///            // the system clock went backwards!
+///            println!("Great Scott! {e:?}");
 ///        }
 ///    }
 /// }
 /// ```
 ///
-/// # Underlying System calls
-/// Currently, the following system calls are being used to get the current time using `now()`:
+/// # Platform-specific behavior
+///
+/// The precision of `SystemTime` can depend on the underlying OS-specific time format.
+/// For example, on Windows the time is represented in 100 nanosecond intervals whereas Linux
+/// can represent nanosecond intervals.
+///
+/// The following system calls are [currently] being used by `now()` to find out
+/// the current time:
 ///
 /// |  Platform |               System call                                            |
-/// |:---------:|:--------------------------------------------------------------------:|
+/// |-----------|----------------------------------------------------------------------|
 /// | SGX       | [`insecure_time` usercall]. More information on [timekeeping in SGX] |
 /// | UNIX      | [clock_gettime (Realtime Clock)]                                     |
-/// | Darwin    | [gettimeofday]                                                       |
+/// | Darwin    | [clock_gettime (Realtime Clock)]                                     |
 /// | VXWorks   | [clock_gettime (Realtime Clock)]                                     |
+/// | SOLID     | `SOLID_RTC_ReadTime`                                                 |
 /// | WASI      | [__wasi_clock_time_get (Realtime Clock)]                             |
 /// | Windows   | [GetSystemTimePreciseAsFileTime] / [GetSystemTimeAsFileTime]         |
 ///
+/// [currently]: crate::io#platform-specific-behavior
 /// [`insecure_time` usercall]: https://edp.fortanix.com/docs/api/fortanix_sgx_abi/struct.Usercalls.html#method.insecure_time
 /// [timekeeping in SGX]: https://edp.fortanix.com/docs/concepts/rust-std/#codestdtimecode
-/// [gettimeofday]: http://man7.org/linux/man-pages/man2/gettimeofday.2.html
 /// [clock_gettime (Realtime Clock)]: https://linux.die.net/man/3/clock_gettime
-/// [__wasi_clock_time_get (Realtime Clock)]: https://github.com/WebAssembly/WASI/blob/master/phases/snapshot/docs.md#clock_time_get
+/// [__wasi_clock_time_get (Realtime Clock)]: https://github.com/WebAssembly/WASI/blob/main/legacy/preview1/docs.md#clock_time_get
 /// [GetSystemTimePreciseAsFileTime]: https://docs.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsystemtimepreciseasfiletime
 /// [GetSystemTimeAsFileTime]: https://docs.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsystemtimeasfiletime
 ///
@@ -180,6 +245,7 @@ pub struct Instant(time::Instant);
 /// > structure cannot represent the new point in time.
 ///
 /// [`add`]: SystemTime::add
+/// [`UNIX_EPOCH`]: SystemTime::UNIX_EPOCH
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[stable(feature = "time2", since = "1.8.0")]
 pub struct SystemTime(time::SystemTime);
@@ -216,54 +282,23 @@ impl Instant {
     ///
     /// let now = Instant::now();
     /// ```
+    #[must_use]
     #[stable(feature = "time2", since = "1.8.0")]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "instant_now")]
     pub fn now() -> Instant {
-        let os_now = time::Instant::now();
-
-        // And here we come upon a sad state of affairs. The whole point of
-        // `Instant` is that it's monotonically increasing. We've found in the
-        // wild, however, that it's not actually monotonically increasing for
-        // one reason or another. These appear to be OS and hardware level bugs,
-        // and there's not really a whole lot we can do about them. Here's a
-        // taste of what we've found:
-        //
-        // * #48514 - OpenBSD, x86_64
-        // * #49281 - linux arm64 and s390x
-        // * #51648 - windows, x86
-        // * #56560 - windows, x86_64, AWS
-        // * #56612 - windows, x86, vm (?)
-        // * #56940 - linux, arm64
-        // * https://bugzilla.mozilla.org/show_bug.cgi?id=1487778 - a similar
-        //   Firefox bug
-        //
-        // It seems that this just happens a lot in the wild.
-        // We're seeing panics across various platforms where consecutive calls
-        // to `Instant::now`, such as via the `elapsed` function, are panicking
-        // as they're going backwards. Placed here is a last-ditch effort to try
-        // to fix things up. We keep a global "latest now" instance which is
-        // returned instead of what the OS says if the OS goes backwards.
-        //
-        // To hopefully mitigate the impact of this, a few platforms are
-        // excluded as "these at least haven't gone backwards yet".
-        if time::Instant::actually_monotonic() {
-            return Instant(os_now);
-        }
-
-        static LOCK: StaticMutex = StaticMutex::new();
-        static mut LAST_NOW: time::Instant = time::Instant::zero();
-        unsafe {
-            let _lock = LOCK.lock();
-            let now = cmp::max(LAST_NOW, os_now);
-            LAST_NOW = now;
-            Instant(now)
-        }
+        Instant(time::Instant::now())
     }
 
-    /// Returns the amount of time elapsed from another instant to this one.
+    /// Returns the amount of time elapsed from another instant to this one,
+    /// or zero duration if that instant is later than this one.
     ///
     /// # Panics
     ///
-    /// This function will panic if `earlier` is later than `self`.
+    /// Previous Rust versions panicked when `earlier` was later than `self`. Currently this
+    /// method saturates. Future versions may reintroduce the panic in some circumstances.
+    /// See [Monotonicity].
+    ///
+    /// [Monotonicity]: Instant#monotonicity
     ///
     /// # Examples
     ///
@@ -275,14 +310,21 @@ impl Instant {
     /// sleep(Duration::new(1, 0));
     /// let new_now = Instant::now();
     /// println!("{:?}", new_now.duration_since(now));
+    /// println!("{:?}", now.duration_since(new_now)); // 0ns
     /// ```
+    #[must_use]
     #[stable(feature = "time2", since = "1.8.0")]
     pub fn duration_since(&self, earlier: Instant) -> Duration {
-        self.0.checked_sub_instant(&earlier.0).expect("supplied instant is later than self")
+        self.checked_duration_since(earlier).unwrap_or_default()
     }
 
     /// Returns the amount of time elapsed from another instant to this one,
     /// or None if that instant is later than this one.
+    ///
+    /// Due to [monotonicity bugs], even under correct logical ordering of the passed `Instant`s,
+    /// this method can return `None`.
+    ///
+    /// [monotonicity bugs]: Instant#monotonicity
     ///
     /// # Examples
     ///
@@ -296,6 +338,7 @@ impl Instant {
     /// println!("{:?}", new_now.checked_duration_since(now));
     /// println!("{:?}", now.checked_duration_since(new_now)); // None
     /// ```
+    #[must_use]
     #[stable(feature = "checked_duration_since", since = "1.39.0")]
     pub fn checked_duration_since(&self, earlier: Instant) -> Option<Duration> {
         self.0.checked_sub_instant(&earlier.0)
@@ -316,18 +359,21 @@ impl Instant {
     /// println!("{:?}", new_now.saturating_duration_since(now));
     /// println!("{:?}", now.saturating_duration_since(new_now)); // 0ns
     /// ```
+    #[must_use]
     #[stable(feature = "checked_duration_since", since = "1.39.0")]
     pub fn saturating_duration_since(&self, earlier: Instant) -> Duration {
         self.checked_duration_since(earlier).unwrap_or_default()
     }
 
-    /// Returns the amount of time elapsed since this instant was created.
+    /// Returns the amount of time elapsed since this instant.
     ///
     /// # Panics
     ///
-    /// This function may panic if the current time is earlier than this
-    /// instant, which is something that can happen if an `Instant` is
-    /// produced synthetically.
+    /// Previous Rust versions panicked when the current time was earlier than self. Currently this
+    /// method returns a Duration of zero in that case. Future versions may reintroduce the panic.
+    /// See [Monotonicity].
+    ///
+    /// [Monotonicity]: Instant#monotonicity
     ///
     /// # Examples
     ///
@@ -340,6 +386,7 @@ impl Instant {
     /// sleep(three_secs);
     /// assert!(instant.elapsed() >= three_secs);
     /// ```
+    #[must_use]
     #[stable(feature = "time2", since = "1.8.0")]
     pub fn elapsed(&self) -> Duration {
         Instant::now() - *self
@@ -359,6 +406,15 @@ impl Instant {
     #[stable(feature = "time_checked_add", since = "1.34.0")]
     pub fn checked_sub(&self, duration: Duration) -> Option<Instant> {
         self.0.checked_sub_duration(&duration).map(Instant)
+    }
+
+    // Used by platform specific `sleep_until` implementations such as the one used on Linux.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(unused, reason = "not every platform has a specific `sleep_until`")
+    )]
+    pub(crate) fn into_inner(self) -> time::Instant {
+        self.0
     }
 }
 
@@ -402,6 +458,16 @@ impl SubAssign<Duration> for Instant {
 impl Sub<Instant> for Instant {
     type Output = Duration;
 
+    /// Returns the amount of time elapsed from another instant to this one,
+    /// or zero duration if that instant is later than this one.
+    ///
+    /// # Panics
+    ///
+    /// Previous Rust versions panicked when `other` was later than `self`. Currently this
+    /// method saturates. Future versions may reintroduce the panic in some circumstances.
+    /// See [Monotonicity].
+    ///
+    /// [Monotonicity]: Instant#monotonicity
     fn sub(self, other: Instant) -> Duration {
         self.duration_since(other)
     }
@@ -417,12 +483,20 @@ impl fmt::Debug for Instant {
 impl SystemTime {
     /// An anchor in time which can be used to create new `SystemTime` instances or
     /// learn about where in time a `SystemTime` lies.
+    //
+    // NOTE! this documentation is duplicated, here and in std::time::UNIX_EPOCH.
+    // The two copies are not quite identical, because of the difference in naming.
     ///
     /// This constant is defined to be "1970-01-01 00:00:00 UTC" on all systems with
     /// respect to the system clock. Using `duration_since` on an existing
     /// `SystemTime` instance can tell how far away from this point in time a
     /// measurement lies, and using `UNIX_EPOCH + duration` can be used to create a
     /// `SystemTime` instance to represent another fixed point in time.
+    ///
+    /// `duration_since(UNIX_EPOCH).unwrap().as_secs()` returns
+    /// the number of non-leap seconds since the start of 1970 UTC.
+    /// This is a POSIX `time_t` (as a `u64`),
+    /// and is the same time representation as used in many Internet protocols.
     ///
     /// # Examples
     ///
@@ -446,6 +520,7 @@ impl SystemTime {
     ///
     /// let sys_time = SystemTime::now();
     /// ```
+    #[must_use]
     #[stable(feature = "time2", since = "1.8.0")]
     pub fn now() -> SystemTime {
         SystemTime(time::SystemTime::now())
@@ -458,7 +533,7 @@ impl SystemTime {
     /// as the system clock being adjusted either forwards or backwards).
     /// [`Instant`] can be used to measure elapsed time without this risk of failure.
     ///
-    /// If successful, [`Ok`]`(`[`Duration`]`)` is returned where the duration represents
+    /// If successful, <code>[Ok]\([Duration])</code> is returned where the duration represents
     /// the amount of time elapsed from the specified measurement to this one.
     ///
     /// Returns an [`Err`] if `earlier` is later than `self`, and the error
@@ -473,19 +548,19 @@ impl SystemTime {
     /// let new_sys_time = SystemTime::now();
     /// let difference = new_sys_time.duration_since(sys_time)
     ///     .expect("Clock may have gone backwards");
-    /// println!("{:?}", difference);
+    /// println!("{difference:?}");
     /// ```
     #[stable(feature = "time2", since = "1.8.0")]
     pub fn duration_since(&self, earlier: SystemTime) -> Result<Duration, SystemTimeError> {
         self.0.sub_time(&earlier.0).map_err(SystemTimeError)
     }
 
-    /// Returns the difference between the clock time when this
-    /// system time was created, and the current clock time.
+    /// Returns the difference from this system time to the
+    /// current clock time.
     ///
     /// This function may fail as the underlying system clock is susceptible to
     /// drift and updates (e.g., the system clock could go backwards), so this
-    /// function may not always succeed. If successful, [`Ok`]`(`[`Duration`]`)` is
+    /// function might not always succeed. If successful, <code>[Ok]\([Duration])</code> is
     /// returned where the duration represents the amount of time elapsed from
     /// this time measurement to the current time.
     ///
@@ -572,12 +647,20 @@ impl fmt::Debug for SystemTime {
 
 /// An anchor in time which can be used to create new `SystemTime` instances or
 /// learn about where in time a `SystemTime` lies.
+//
+// NOTE! this documentation is duplicated, here and in SystemTime::UNIX_EPOCH.
+// The two copies are not quite identical, because of the difference in naming.
 ///
 /// This constant is defined to be "1970-01-01 00:00:00 UTC" on all systems with
 /// respect to the system clock. Using `duration_since` on an existing
 /// [`SystemTime`] instance can tell how far away from this point in time a
 /// measurement lies, and using `UNIX_EPOCH + duration` can be used to create a
 /// [`SystemTime`] instance to represent another fixed point in time.
+///
+/// `duration_since(UNIX_EPOCH).unwrap().as_secs()` returns
+/// the number of non-leap seconds since the start of 1970 UTC.
+/// This is a POSIX `time_t` (as a `u64`),
+/// and is the same time representation as used in many Internet protocols.
 ///
 /// # Examples
 ///
@@ -614,6 +697,7 @@ impl SystemTimeError {
     ///     Err(e) => println!("SystemTimeError difference: {:?}", e.duration()),
     /// }
     /// ```
+    #[must_use]
     #[stable(feature = "time2", since = "1.8.0")]
     pub fn duration(&self) -> Duration {
         self.0
@@ -621,12 +705,7 @@ impl SystemTimeError {
 }
 
 #[stable(feature = "time2", since = "1.8.0")]
-impl Error for SystemTimeError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "other time was not earlier than self"
-    }
-}
+impl Error for SystemTimeError {}
 
 #[stable(feature = "time2", since = "1.8.0")]
 impl fmt::Display for SystemTimeError {
@@ -638,5 +717,11 @@ impl fmt::Display for SystemTimeError {
 impl FromInner<time::SystemTime> for SystemTime {
     fn from_inner(time: time::SystemTime) -> SystemTime {
         SystemTime(time)
+    }
+}
+
+impl IntoInner<time::SystemTime> for SystemTime {
+    fn into_inner(self) -> time::SystemTime {
+        self.0
     }
 }

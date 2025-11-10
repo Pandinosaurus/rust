@@ -1,10 +1,10 @@
-#!/bin/bash
-#![forbid(unsafe_code)]/* This line is ignored by bash
+#!/usr/bin/env bash
+#![rustfmt::skip]/* This line is ignored by bash
 # This block is ignored by rustc
 pushd $(dirname "$0")/../
-source build/config.sh
+RUSTC="$(pwd)/dist/rustc-clif"
 popd
-PROFILE=$1 OUTPUT=$2 exec $RUSTC $RUSTFLAGS -Cllvm-args=mode=jit -Cprefer-dynamic $0
+PROFILE=$1 OUTPUT=$2 exec $RUSTC -Zunstable-options -Cllvm-args=jit-mode -Cprefer-dynamic $0
 #*/
 
 //! This program filters away uninteresting samples and trims uninteresting frames for stackcollapse
@@ -26,11 +26,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let profile = std::fs::read_to_string(profile_name)
         .map_err(|err| format!("Failed to read profile {}", err))?;
-    let mut output = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(output_name)?;
+    let mut output =
+        std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(output_name)?;
 
     for line in profile.lines() {
         let mut stack = &line[..line.rfind(" ").unwrap()];
@@ -41,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        if stack.contains("rustc_mir::monomorphize::partitioning::collect_and_partition_mono_items")
+        if stack.contains("rustc_monomorphize::partitioning::collect_and_partition_mono_items")
             || stack.contains("rustc_incremental::assert_dep_graph::assert_dep_graph")
             || stack.contains("rustc_symbol_mangling::test::report_symbol_names")
         {
@@ -80,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         const COLLECT_AND_PARTITION_MONO_ITEMS: &str =
-            "rustc_mir::monomorphize::partitioning::collect_and_partition_mono_items";
+            "rustc_monomorphize::partitioning::collect_and_partition_mono_items";
         if let Some(index) = stack.find(COLLECT_AND_PARTITION_MONO_ITEMS) {
             stack = &stack[..index + COLLECT_AND_PARTITION_MONO_ITEMS.len()];
         }
@@ -95,14 +92,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             stack = &stack[..index + REPORT_SYMBOL_NAMES.len()];
         }
 
-        const ENCODE_METADATA: &str = "rustc_middle::ty::context::TyCtxt::encode_metadata";
+        const ENCODE_METADATA: &str = "rustc_metadata::rmeta::encoder::encode_metadata";
         if let Some(index) = stack.find(ENCODE_METADATA) {
             stack = &stack[..index + ENCODE_METADATA.len()];
         }
 
-        const SUBST_AND_NORMALIZE_ERASING_REGIONS: &str = "rustc_middle::ty::normalize_erasing_regions::<impl rustc_middle::ty::context::TyCtxt>::subst_and_normalize_erasing_regions";
-        if let Some(index) = stack.find(SUBST_AND_NORMALIZE_ERASING_REGIONS) {
-            stack = &stack[..index + SUBST_AND_NORMALIZE_ERASING_REGIONS.len()];
+        const INSTANTIATE_AND_NORMALIZE_ERASING_REGIONS: &str = "rustc_middle::ty::normalize_erasing_regions::<impl rustc_middle::ty::context::TyCtxt>::instantiate_and_normalize_erasing_regions";
+        if let Some(index) = stack.find(INSTANTIATE_AND_NORMALIZE_ERASING_REGIONS) {
+            stack = &stack[..index + INSTANTIATE_AND_NORMALIZE_ERASING_REGIONS.len()];
         }
 
         const NORMALIZE_ERASING_LATE_BOUND_REGIONS: &str = "rustc_middle::ty::normalize_erasing_regions::<impl rustc_middle::ty::context::TyCtxt>::normalize_erasing_late_bound_regions";

@@ -1,13 +1,10 @@
 //! Serialization for client-server communication.
 
 use std::any::Any;
-use std::char;
 use std::io::Write;
-use std::num::NonZeroU32;
-use std::ops::Bound;
-use std::str;
+use std::num::NonZero;
 
-pub(super) type Writer = super::buffer::Buffer<u8>;
+pub(super) type Writer = super::buffer::Buffer;
 
 pub(super) trait Encode<S>: Sized {
     fn encode(self, w: &mut Writer, s: &mut S);
@@ -16,10 +13,6 @@ pub(super) trait Encode<S>: Sized {
 pub(super) type Reader<'a> = &'a [u8];
 
 pub(super) trait Decode<'a, 's, S>: Sized {
-    fn decode(r: &mut Reader<'a>, s: &'s S) -> Self;
-}
-
-pub(super) trait DecodeMut<'a, 's, S>: Sized {
     fn decode(r: &mut Reader<'a>, s: &'s mut S) -> Self;
 }
 
@@ -27,13 +20,13 @@ macro_rules! rpc_encode_decode {
     (le $ty:ty) => {
         impl<S> Encode<S> for $ty {
             fn encode(self, w: &mut Writer, _: &mut S) {
-                w.write_all(&self.to_le_bytes()).unwrap();
+                w.extend_from_array(&self.to_le_bytes());
             }
         }
 
-        impl<S> DecodeMut<'_, '_, S> for $ty {
+        impl<S> Decode<'_, '_, S> for $ty {
             fn decode(r: &mut Reader<'_>, _: &mut S) -> Self {
-                const N: usize = ::std::mem::size_of::<$ty>();
+                const N: usize = size_of::<$ty>();
 
                 let mut bytes = [0; N];
                 bytes.copy_from_slice(&r[..N]);
@@ -43,17 +36,19 @@ macro_rules! rpc_encode_decode {
             }
         }
     };
-    (struct $name:ident { $($field:ident),* $(,)? }) => {
-        impl<S> Encode<S> for $name {
+    (struct $name:ident $(<$($T:ident),+>)? { $($field:ident),* $(,)? }) => {
+        impl<S, $($($T: Encode<S>),+)?> Encode<S> for $name $(<$($T),+>)? {
             fn encode(self, w: &mut Writer, s: &mut S) {
                 $(self.$field.encode(w, s);)*
             }
         }
 
-        impl<S> DecodeMut<'_, '_, S> for $name {
-            fn decode(r: &mut Reader<'_>, s: &mut S) -> Self {
+        impl<'a, S, $($($T: for<'s> Decode<'a, 's, S>),+)?> Decode<'a, '_, S>
+            for $name $(<$($T),+>)?
+        {
+            fn decode(r: &mut Reader<'a>, s: &mut S) -> Self {
                 $name {
-                    $($field: DecodeMut::decode(r, s)),*
+                    $($field: Decode::decode(r, s)),*
                 }
             }
         }
@@ -63,23 +58,18 @@ macro_rules! rpc_encode_decode {
             fn encode(self, w: &mut Writer, s: &mut S) {
                 // HACK(eddyb): `Tag` enum duplicated between the
                 // two impls as there's no other place to stash it.
-                #[allow(non_upper_case_globals)]
-                mod tag {
-                    #[repr(u8)] enum Tag { $($variant),* }
-
-                    $(pub const $variant: u8 = Tag::$variant as u8;)*
-                }
+                #[repr(u8)] enum Tag { $($variant),* }
 
                 match self {
                     $($name::$variant $(($field))* => {
-                        tag::$variant.encode(w, s);
+                        (Tag::$variant as u8).encode(w, s);
                         $($field.encode(w, s);)*
                     })*
                 }
             }
         }
 
-        impl<S, $($($T: for<'s> DecodeMut<'a, 's, S>),+)?> DecodeMut<'a, '_, S>
+        impl<'a, S, $($($T: for<'s> Decode<'a, 's, S>),+)?> Decode<'a, '_, S>
             for $name $(<$($T),+>)?
         {
             fn decode(r: &mut Reader<'a>, s: &mut S) -> Self {
@@ -89,12 +79,12 @@ macro_rules! rpc_encode_decode {
                 mod tag {
                     #[repr(u8)] enum Tag { $($variant),* }
 
-                    $(pub const $variant: u8 = Tag::$variant as u8;)*
+                    $(pub(crate) const $variant: u8 = Tag::$variant as u8;)*
                 }
 
                 match u8::decode(r, s) {
                     $(tag::$variant => {
-                        $(let $field = DecodeMut::decode(r, s);)*
+                        $(let $field = Decode::decode(r, s);)*
                         $name::$variant $(($field))*
                     })*
                     _ => unreachable!(),
@@ -108,17 +98,17 @@ impl<S> Encode<S> for () {
     fn encode(self, _: &mut Writer, _: &mut S) {}
 }
 
-impl<S> DecodeMut<'_, '_, S> for () {
+impl<S> Decode<'_, '_, S> for () {
     fn decode(_: &mut Reader<'_>, _: &mut S) -> Self {}
 }
 
 impl<S> Encode<S> for u8 {
     fn encode(self, w: &mut Writer, _: &mut S) {
-        w.write_all(&[self]).unwrap();
+        w.push(self);
     }
 }
 
-impl<S> DecodeMut<'_, '_, S> for u8 {
+impl<S> Decode<'_, '_, S> for u8 {
     fn decode(r: &mut Reader<'_>, _: &mut S) -> Self {
         let x = r[0];
         *r = &r[1..];
@@ -135,7 +125,7 @@ impl<S> Encode<S> for bool {
     }
 }
 
-impl<S> DecodeMut<'_, '_, S> for bool {
+impl<S> Decode<'_, '_, S> for bool {
     fn decode(r: &mut Reader<'_>, s: &mut S) -> Self {
         match u8::decode(r, s) {
             0 => false,
@@ -151,19 +141,19 @@ impl<S> Encode<S> for char {
     }
 }
 
-impl<S> DecodeMut<'_, '_, S> for char {
+impl<S> Decode<'_, '_, S> for char {
     fn decode(r: &mut Reader<'_>, s: &mut S) -> Self {
         char::from_u32(u32::decode(r, s)).unwrap()
     }
 }
 
-impl<S> Encode<S> for NonZeroU32 {
+impl<S> Encode<S> for NonZero<u32> {
     fn encode(self, w: &mut Writer, s: &mut S) {
         self.get().encode(w, s);
     }
 }
 
-impl<S> DecodeMut<'_, '_, S> for NonZeroU32 {
+impl<S> Decode<'_, '_, S> for NonZero<u32> {
     fn decode(r: &mut Reader<'_>, s: &mut S) -> Self {
         Self::new(u32::decode(r, s)).unwrap()
     }
@@ -176,35 +166,13 @@ impl<S, A: Encode<S>, B: Encode<S>> Encode<S> for (A, B) {
     }
 }
 
-impl<S, A: for<'s> DecodeMut<'a, 's, S>, B: for<'s> DecodeMut<'a, 's, S>> DecodeMut<'a, '_, S>
+impl<'a, S, A: for<'s> Decode<'a, 's, S>, B: for<'s> Decode<'a, 's, S>> Decode<'a, '_, S>
     for (A, B)
 {
     fn decode(r: &mut Reader<'a>, s: &mut S) -> Self {
-        (DecodeMut::decode(r, s), DecodeMut::decode(r, s))
+        (Decode::decode(r, s), Decode::decode(r, s))
     }
 }
-
-rpc_encode_decode!(
-    enum Bound<T> {
-        Included(x),
-        Excluded(x),
-        Unbounded,
-    }
-);
-
-rpc_encode_decode!(
-    enum Option<T> {
-        None,
-        Some(x),
-    }
-);
-
-rpc_encode_decode!(
-    enum Result<T, E> {
-        Ok(x),
-        Err(e),
-    }
-);
 
 impl<S> Encode<S> for &[u8] {
     fn encode(self, w: &mut Writer, s: &mut S) {
@@ -213,7 +181,7 @@ impl<S> Encode<S> for &[u8] {
     }
 }
 
-impl<S> DecodeMut<'a, '_, S> for &'a [u8] {
+impl<'a, S> Decode<'a, '_, S> for &'a [u8] {
     fn decode(r: &mut Reader<'a>, s: &mut S) -> Self {
         let len = usize::decode(r, s);
         let xs = &r[..len];
@@ -228,7 +196,7 @@ impl<S> Encode<S> for &str {
     }
 }
 
-impl<S> DecodeMut<'a, '_, S> for &'a str {
+impl<'a, S> Decode<'a, '_, S> for &'a str {
     fn decode(r: &mut Reader<'a>, s: &mut S) -> Self {
         str::from_utf8(<&[u8]>::decode(r, s)).unwrap()
     }
@@ -240,13 +208,33 @@ impl<S> Encode<S> for String {
     }
 }
 
-impl<S> DecodeMut<'_, '_, S> for String {
+impl<S> Decode<'_, '_, S> for String {
     fn decode(r: &mut Reader<'_>, s: &mut S) -> Self {
         <&str>::decode(r, s).to_string()
     }
 }
 
-/// Simplied version of panic payloads, ignoring
+impl<S, T: Encode<S>> Encode<S> for Vec<T> {
+    fn encode(self, w: &mut Writer, s: &mut S) {
+        self.len().encode(w, s);
+        for x in self {
+            x.encode(w, s);
+        }
+    }
+}
+
+impl<'a, S, T: for<'s> Decode<'a, 's, S>> Decode<'a, '_, S> for Vec<T> {
+    fn decode(r: &mut Reader<'a>, s: &mut S) -> Self {
+        let len = usize::decode(r, s);
+        let mut vec = Vec::with_capacity(len);
+        for _ in 0..len {
+            vec.push(T::decode(r, s));
+        }
+        vec
+    }
+}
+
+/// Simplified version of panic payloads, ignoring
 /// types other than `&'static str` and `String`.
 pub enum PanicMessage {
     StaticStr(&'static str),
@@ -266,9 +254,9 @@ impl From<Box<dyn Any + Send>> for PanicMessage {
     }
 }
 
-impl Into<Box<dyn Any + Send>> for PanicMessage {
-    fn into(self) -> Box<dyn Any + Send> {
-        match self {
+impl From<PanicMessage> for Box<dyn Any + Send> {
+    fn from(val: PanicMessage) -> Self {
+        match val {
             PanicMessage::StaticStr(s) => Box::new(s),
             PanicMessage::String(s) => Box::new(s),
             PanicMessage::Unknown => {
@@ -295,7 +283,7 @@ impl<S> Encode<S> for PanicMessage {
     }
 }
 
-impl<S> DecodeMut<'_, '_, S> for PanicMessage {
+impl<S> Decode<'_, '_, S> for PanicMessage {
     fn decode(r: &mut Reader<'_>, s: &mut S) -> Self {
         match Option::<String>::decode(r, s) {
             Some(s) => PanicMessage::String(s),

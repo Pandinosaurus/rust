@@ -1,78 +1,122 @@
+use std::fmt::Debug;
+
+use rustc_hir::def_id::DefId;
+use rustc_middle::ty::{self, Ty, Upcast};
+
+use super::{ObligationCause, PredicateObligation, PredicateObligations};
 use crate::infer::InferCtxt;
 use crate::traits::Obligation;
-use rustc_hir::def_id::DefId;
-use rustc_middle::ty::{self, ToPredicate, Ty, WithConstness};
 
-use super::FulfillmentError;
-use super::{ObligationCause, PredicateObligation};
+/// A trait error with most of its information removed. This is the error
+/// returned by an `ObligationCtxt` by default, and suitable if you just
+/// want to see if a predicate holds, and don't particularly care about the
+/// error itself (except for if it's an ambiguity or true error).
+///
+/// use `ObligationCtxt::new_with_diagnostics` to get a `FulfillmentError`.
+#[derive(Clone, Debug)]
+pub enum ScrubbedTraitError<'tcx> {
+    /// A real error. This goal definitely does not hold.
+    TrueError,
+    /// An ambiguity. This goal may hold if further inference is done.
+    Ambiguity,
+    /// An old-solver-style cycle error, which will fatal. This is not
+    /// returned by the new solver.
+    Cycle(PredicateObligations<'tcx>),
+}
 
-pub trait TraitEngine<'tcx>: 'tcx {
-    fn normalize_projection_type(
-        &mut self,
-        infcx: &InferCtxt<'_, 'tcx>,
-        param_env: ty::ParamEnv<'tcx>,
-        projection_ty: ty::ProjectionTy<'tcx>,
-        cause: ObligationCause<'tcx>,
-    ) -> Ty<'tcx>;
+impl<'tcx> ScrubbedTraitError<'tcx> {
+    pub fn is_true_error(&self) -> bool {
+        match self {
+            ScrubbedTraitError::TrueError => true,
+            ScrubbedTraitError::Ambiguity | ScrubbedTraitError::Cycle(_) => false,
+        }
+    }
+}
 
+pub trait TraitEngine<'tcx, E: 'tcx>: 'tcx {
     /// Requires that `ty` must implement the trait with `def_id` in
     /// the given environment. This trait must not have any type
     /// parameters (except for `Self`).
     fn register_bound(
         &mut self,
-        infcx: &InferCtxt<'_, 'tcx>,
+        infcx: &InferCtxt<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
         ty: Ty<'tcx>,
         def_id: DefId,
         cause: ObligationCause<'tcx>,
     ) {
-        let trait_ref = ty::TraitRef { def_id, substs: infcx.tcx.mk_substs_trait(ty, &[]) };
+        let trait_ref = ty::TraitRef::new(infcx.tcx, def_id, [ty]);
         self.register_predicate_obligation(
             infcx,
             Obligation {
                 cause,
                 recursion_depth: 0,
                 param_env,
-                predicate: trait_ref.without_const().to_predicate(infcx.tcx),
+                predicate: trait_ref.upcast(infcx.tcx),
             },
         );
     }
 
     fn register_predicate_obligation(
         &mut self,
-        infcx: &InferCtxt<'_, 'tcx>,
+        infcx: &InferCtxt<'tcx>,
         obligation: PredicateObligation<'tcx>,
     );
 
-    fn select_all_or_error(
-        &mut self,
-        infcx: &InferCtxt<'_, 'tcx>,
-    ) -> Result<(), Vec<FulfillmentError<'tcx>>>;
-
-    fn select_where_possible(
-        &mut self,
-        infcx: &InferCtxt<'_, 'tcx>,
-    ) -> Result<(), Vec<FulfillmentError<'tcx>>>;
-
-    fn pending_obligations(&self) -> Vec<PredicateObligation<'tcx>>;
-}
-
-pub trait TraitEngineExt<'tcx> {
     fn register_predicate_obligations(
         &mut self,
-        infcx: &InferCtxt<'_, 'tcx>,
-        obligations: impl IntoIterator<Item = PredicateObligation<'tcx>>,
-    );
-}
-
-impl<T: ?Sized + TraitEngine<'tcx>> TraitEngineExt<'tcx> for T {
-    fn register_predicate_obligations(
-        &mut self,
-        infcx: &InferCtxt<'_, 'tcx>,
-        obligations: impl IntoIterator<Item = PredicateObligation<'tcx>>,
+        infcx: &InferCtxt<'tcx>,
+        obligations: PredicateObligations<'tcx>,
     ) {
         for obligation in obligations {
             self.register_predicate_obligation(infcx, obligation);
         }
     }
+
+    /// Go over the list of pending obligations and try to evaluate them.
+    ///
+    /// For each result:
+    /// Ok: remove the obligation from the list
+    /// Ambiguous: leave the obligation in the list to be evaluated later
+    /// Err: remove the obligation from the list and return an error
+    ///
+    /// Returns a list of errors from obligations that evaluated to Err.
+    #[must_use]
+    fn try_evaluate_obligations(&mut self, infcx: &InferCtxt<'tcx>) -> Vec<E>;
+
+    fn collect_remaining_errors(&mut self, infcx: &InferCtxt<'tcx>) -> Vec<E>;
+
+    /// Evaluate all pending obligations, return error if they can't be evaluated.
+    ///
+    /// For each result:
+    /// Ok: remove the obligation from the list
+    /// Ambiguous: remove the obligation from the list and return an error
+    /// Err: remove the obligation from the list and return an error
+    ///
+    /// Returns a list of errors from obligations that evaluated to Ambiguous or Err.
+    #[must_use]
+    fn evaluate_obligations_error_on_ambiguity(&mut self, infcx: &InferCtxt<'tcx>) -> Vec<E> {
+        let errors = self.try_evaluate_obligations(infcx);
+        if !errors.is_empty() {
+            return errors;
+        }
+
+        self.collect_remaining_errors(infcx)
+    }
+
+    fn has_pending_obligations(&self) -> bool;
+
+    fn pending_obligations(&self) -> PredicateObligations<'tcx>;
+
+    /// Among all pending obligations, collect those are stalled on a inference variable which has
+    /// changed since the last call to `try_evaluate_obligations`. Those obligations are marked as
+    /// successful and returned.
+    fn drain_stalled_obligations_for_coroutines(
+        &mut self,
+        infcx: &InferCtxt<'tcx>,
+    ) -> PredicateObligations<'tcx>;
+}
+
+pub trait FromSolverError<'tcx, E>: Debug + 'tcx {
+    fn from_solver_error(infcx: &InferCtxt<'tcx>, error: E) -> Self;
 }

@@ -1,11 +1,12 @@
 //! Ways to create a `str` from bytes slice.
 
-use crate::mem;
-
-use super::validations::run_utf8_validation;
 use super::Utf8Error;
+use super::validations::run_utf8_validation;
+use crate::{mem, ptr};
 
 /// Converts a slice of bytes to a string slice.
+///
+/// This is an alias to [`str::from_utf8`].
 ///
 /// A string slice ([`&str`]) is made of bytes ([`u8`]), and a byte slice
 /// ([`&[u8]`][byteslice]) is made of bytes, so this function converts between
@@ -48,10 +49,11 @@ use super::Utf8Error;
 /// // some bytes, in a vector
 /// let sparkle_heart = vec![240, 159, 146, 150];
 ///
-/// // We know these bytes are valid, so just use `unwrap()`.
-/// let sparkle_heart = str::from_utf8(&sparkle_heart).unwrap();
+/// // We can use the ? (try) operator to check if the bytes are valid
+/// let sparkle_heart = str::from_utf8(&sparkle_heart)?;
 ///
 /// assert_eq!("💖", sparkle_heart);
+/// # Ok::<_, str::Utf8Error>(())
 /// ```
 ///
 /// Incorrect bytes:
@@ -77,18 +79,27 @@ use super::Utf8Error;
 /// let sparkle_heart = [240, 159, 146, 150];
 ///
 /// // We know these bytes are valid, so just use `unwrap()`.
-/// let sparkle_heart = str::from_utf8(&sparkle_heart).unwrap();
+/// let sparkle_heart: &str = str::from_utf8(&sparkle_heart).unwrap();
 ///
 /// assert_eq!("💖", sparkle_heart);
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-pub fn from_utf8(v: &[u8]) -> Result<&str, Utf8Error> {
-    run_utf8_validation(v)?;
-    // SAFETY: Just ran validation.
-    Ok(unsafe { from_utf8_unchecked(v) })
+#[rustc_const_stable(feature = "const_str_from_utf8_shared", since = "1.63.0")]
+#[rustc_diagnostic_item = "str_from_utf8"]
+pub const fn from_utf8(v: &[u8]) -> Result<&str, Utf8Error> {
+    // FIXME(const-hack): This should use `?` again, once it's `const`
+    match run_utf8_validation(v) {
+        Ok(_) => {
+            // SAFETY: validation succeeded.
+            Ok(unsafe { from_utf8_unchecked(v) })
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Converts a mutable slice of bytes to a mutable string slice.
+///
+/// This is an alias to [`str::from_utf8_mut`].
 ///
 /// # Examples
 ///
@@ -119,24 +130,29 @@ pub fn from_utf8(v: &[u8]) -> Result<&str, Utf8Error> {
 /// See the docs for [`Utf8Error`] for more details on the kinds of
 /// errors that can be returned.
 #[stable(feature = "str_mut_extras", since = "1.20.0")]
-pub fn from_utf8_mut(v: &mut [u8]) -> Result<&mut str, Utf8Error> {
-    run_utf8_validation(v)?;
-    // SAFETY: Just ran validation.
-    Ok(unsafe { from_utf8_unchecked_mut(v) })
+#[rustc_const_stable(feature = "const_str_from_utf8", since = "1.87.0")]
+#[rustc_diagnostic_item = "str_from_utf8_mut"]
+pub const fn from_utf8_mut(v: &mut [u8]) -> Result<&mut str, Utf8Error> {
+    // FIXME(const-hack): This should use `?` again, once it's `const`
+    match run_utf8_validation(v) {
+        Ok(_) => {
+            // SAFETY: validation succeeded.
+            Ok(unsafe { from_utf8_unchecked_mut(v) })
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Converts a slice of bytes to a string slice without checking
 /// that the string contains valid UTF-8.
 ///
+/// This is an alias to [`str::from_utf8_unchecked`].
+///
 /// See the safe version, [`from_utf8`], for more information.
 ///
 /// # Safety
 ///
-/// This function is unsafe because it does not check that the bytes passed to
-/// it are valid UTF-8. If this constraint is violated, undefined behavior
-/// results, as the rest of Rust assumes that [`&str`]s are valid UTF-8.
-///
-/// [`&str`]: str
+/// The bytes passed in must be valid UTF-8.
 ///
 /// # Examples
 ///
@@ -155,9 +171,10 @@ pub fn from_utf8_mut(v: &mut [u8]) -> Result<&mut str, Utf8Error> {
 /// assert_eq!("💖", sparkle_heart);
 /// ```
 #[inline]
+#[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_const_unstable(feature = "const_str_from_utf8_unchecked", issue = "75196")]
-#[rustc_allow_const_fn_unstable(const_fn_transmute)]
+#[rustc_const_stable(feature = "const_str_from_utf8_unchecked", since = "1.55.0")]
+#[rustc_diagnostic_item = "str_from_utf8_unchecked"]
 pub const unsafe fn from_utf8_unchecked(v: &[u8]) -> &str {
     // SAFETY: the caller must guarantee that the bytes `v` are valid UTF-8.
     // Also relies on `&str` and `&[u8]` having the same layout.
@@ -167,7 +184,9 @@ pub const unsafe fn from_utf8_unchecked(v: &[u8]) -> &str {
 /// Converts a slice of bytes to a string slice without checking
 /// that the string contains valid UTF-8; mutable version.
 ///
-/// See the immutable version, [`from_utf8_unchecked()`] for more information.
+/// This is an alias to [`str::from_utf8_unchecked_mut`].
+///
+/// See the immutable version, [`from_utf8_unchecked()`] for documentation and safety requirements.
 ///
 /// # Examples
 ///
@@ -182,11 +201,50 @@ pub const unsafe fn from_utf8_unchecked(v: &[u8]) -> &str {
 /// assert_eq!("💖", heart);
 /// ```
 #[inline]
+#[must_use]
 #[stable(feature = "str_mut_extras", since = "1.20.0")]
-pub unsafe fn from_utf8_unchecked_mut(v: &mut [u8]) -> &mut str {
+#[rustc_const_stable(feature = "const_str_from_utf8_unchecked_mut", since = "1.83.0")]
+#[rustc_diagnostic_item = "str_from_utf8_unchecked_mut"]
+pub const unsafe fn from_utf8_unchecked_mut(v: &mut [u8]) -> &mut str {
     // SAFETY: the caller must guarantee that the bytes `v`
     // are valid UTF-8, thus the cast to `*mut str` is safe.
     // Also, the pointer dereference is safe because that pointer
     // comes from a reference which is guaranteed to be valid for writes.
     unsafe { &mut *(v as *mut [u8] as *mut str) }
+}
+
+/// Creates a `&str` from a pointer and a length.
+///
+/// The pointed-to bytes must be valid UTF-8.
+/// If this might not be the case, use `str::from_utf8(slice::from_raw_parts(ptr, len))`,
+/// which will return an `Err` if the data isn't valid UTF-8.
+///
+/// This function is the `str` equivalent of [`slice::from_raw_parts`](crate::slice::from_raw_parts).
+/// See that function's documentation for safety concerns and examples.
+///
+/// The mutable version of this function is [`from_raw_parts_mut`].
+#[inline]
+#[must_use]
+#[unstable(feature = "str_from_raw_parts", issue = "119206")]
+pub const unsafe fn from_raw_parts<'a>(ptr: *const u8, len: usize) -> &'a str {
+    // SAFETY: the caller must uphold the safety contract for `from_raw_parts`.
+    unsafe { &*ptr::from_raw_parts(ptr, len) }
+}
+
+/// Creates a `&mut str` from a pointer and a length.
+///
+/// The pointed-to bytes must be valid UTF-8.
+/// If this might not be the case, use `str::from_utf8_mut(slice::from_raw_parts_mut(ptr, len))`,
+/// which will return an `Err` if the data isn't valid UTF-8.
+///
+/// This function is the `str` equivalent of [`slice::from_raw_parts_mut`](crate::slice::from_raw_parts_mut).
+/// See that function's documentation for safety concerns and examples.
+///
+/// The immutable version of this function is [`from_raw_parts`].
+#[inline]
+#[must_use]
+#[unstable(feature = "str_from_raw_parts", issue = "119206")]
+pub const unsafe fn from_raw_parts_mut<'a>(ptr: *mut u8, len: usize) -> &'a mut str {
+    // SAFETY: the caller must uphold the safety contract for `from_raw_parts_mut`.
+    unsafe { &mut *ptr::from_raw_parts_mut(ptr, len) }
 }

@@ -1,11 +1,10 @@
-use rustc_index::bit_set::BitSet;
-
 use super::*;
 
 /// Preorder traversal of a graph.
 ///
-/// Preorder traversal is when each node is visited before any of its
-/// successors
+/// Preorder traversal is when each node is visited after at least one of its predecessors. If you
+/// are familiar with some basic graph theory, then this performs a depth first search and returns
+/// nodes in order of discovery time.
 ///
 /// ```text
 ///
@@ -22,24 +21,24 @@ use super::*;
 #[derive(Clone)]
 pub struct Preorder<'a, 'tcx> {
     body: &'a Body<'tcx>,
-    visited: BitSet<BasicBlock>,
+    visited: DenseBitSet<BasicBlock>,
     worklist: Vec<BasicBlock>,
-    root_is_start_block: bool,
 }
 
 impl<'a, 'tcx> Preorder<'a, 'tcx> {
     pub fn new(body: &'a Body<'tcx>, root: BasicBlock) -> Preorder<'a, 'tcx> {
         let worklist = vec![root];
 
-        Preorder {
-            body,
-            visited: BitSet::new_empty(body.basic_blocks().len()),
-            worklist,
-            root_is_start_block: root == START_BLOCK,
-        }
+        Preorder { body, visited: DenseBitSet::new_empty(body.basic_blocks.len()), worklist }
     }
 }
 
+/// Preorder traversal of a graph.
+///
+/// This function creates an iterator over the `Body`'s basic blocks, that
+/// returns basic blocks in a preorder.
+///
+/// See [`Preorder`]'s docs to learn what is preorder traversal.
 pub fn preorder<'a, 'tcx>(body: &'a Body<'tcx>) -> Preorder<'a, 'tcx> {
     Preorder::new(body, START_BLOCK)
 }
@@ -66,15 +65,11 @@ impl<'a, 'tcx> Iterator for Preorder<'a, 'tcx> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        // All the blocks, minus the number of blocks we've visited.
-        let upper = self.body.basic_blocks().len() - self.visited.count();
+        // The worklist might be only things already visited.
+        let lower = 0;
 
-        let lower = if self.root_is_start_block {
-            // We will visit all remaining blocks exactly once.
-            upper
-        } else {
-            self.worklist.len()
-        };
+        // This is extremely loose, but it's not worth a popcnt loop to do better.
+        let upper = self.body.basic_blocks.len();
 
         (lower, Some(upper))
     }
@@ -82,8 +77,9 @@ impl<'a, 'tcx> Iterator for Preorder<'a, 'tcx> {
 
 /// Postorder traversal of a graph.
 ///
-/// Postorder traversal is when each node is visited after all of its
-/// successors, except when the successor is only reachable by a back-edge
+/// Postorder traversal is when each node is visited after all of its successors, except when the
+/// successor is only reachable by a back-edge. If you are familiar with some basic graph theory,
+/// then this performs a depth first search and returns nodes in order of completion time.
 ///
 ///
 /// ```text
@@ -99,30 +95,43 @@ impl<'a, 'tcx> Iterator for Preorder<'a, 'tcx> {
 ///
 /// A Postorder traversal of this graph is `D B C A` or `D C B A`
 pub struct Postorder<'a, 'tcx> {
-    body: &'a Body<'tcx>,
-    visited: BitSet<BasicBlock>,
+    basic_blocks: &'a IndexSlice<BasicBlock, BasicBlockData<'tcx>>,
+    visited: DenseBitSet<BasicBlock>,
     visit_stack: Vec<(BasicBlock, Successors<'a>)>,
-    root_is_start_block: bool,
+    /// A non-empty `extra` allows for a precise calculation of the successors.
+    extra: Option<(TyCtxt<'tcx>, Instance<'tcx>)>,
 }
 
 impl<'a, 'tcx> Postorder<'a, 'tcx> {
-    pub fn new(body: &'a Body<'tcx>, root: BasicBlock) -> Postorder<'a, 'tcx> {
+    pub fn new(
+        basic_blocks: &'a IndexSlice<BasicBlock, BasicBlockData<'tcx>>,
+        root: BasicBlock,
+        extra: Option<(TyCtxt<'tcx>, Instance<'tcx>)>,
+    ) -> Postorder<'a, 'tcx> {
         let mut po = Postorder {
-            body,
-            visited: BitSet::new_empty(body.basic_blocks().len()),
+            basic_blocks,
+            visited: DenseBitSet::new_empty(basic_blocks.len()),
             visit_stack: Vec::new(),
-            root_is_start_block: root == START_BLOCK,
+            extra,
         };
 
-        let data = &po.body[root];
-
-        if let Some(ref term) = data.terminator {
-            po.visited.insert(root);
-            po.visit_stack.push((root, term.successors()));
-            po.traverse_successor();
-        }
+        po.visit(root);
+        po.traverse_successor();
 
         po
+    }
+
+    fn visit(&mut self, bb: BasicBlock) {
+        if !self.visited.insert(bb) {
+            return;
+        }
+        let data = &self.basic_blocks[bb];
+        let successors = if let Some(extra) = self.extra {
+            data.mono_successors(extra.0, extra.1)
+        } else {
+            data.terminator().successors()
+        };
+        self.visit_stack.push((bb, successors));
     }
 
     fn traverse_successor(&mut self) {
@@ -144,7 +153,7 @@ impl<'a, 'tcx> Postorder<'a, 'tcx> {
         //      B     C
         //      |     |
         //      |     |
-        //      D     |
+        //      |     D
         //       \   /
         //        \ /
         //         E
@@ -154,77 +163,104 @@ impl<'a, 'tcx> Postorder<'a, 'tcx> {
         //
         // When the first call to `traverse_successor` happens, the following happens:
         //
-        //     [(B, [D]),  // `B` taken from the successors of `A`, pushed to the
-        //                 // top of the stack along with the successors of `B`
-        //      (A, [C])]
+        //     [(C, [D]),  // `C` taken from the successors of `A`, pushed to the
+        //                 // top of the stack along with the successors of `C`
+        //      (A, [B])]
         //
-        //     [(D, [E]),  // `D` taken from successors of `B`, pushed to stack
-        //      (B, []),
-        //      (A, [C])]
+        //     [(D, [E]),  // `D` taken from successors of `C`, pushed to stack
+        //      (C, []),
+        //      (A, [B])]
         //
         //     [(E, []),   // `E` taken from successors of `D`, pushed to stack
         //      (D, []),
-        //      (B, []),
-        //      (A, [C])]
+        //      (C, []),
+        //      (A, [B])]
         //
         // Now that the top of the stack has no successors we can traverse, each item will
-        // be popped off during iteration until we get back to `A`. This yields [E, D, B].
+        // be popped off during iteration until we get back to `A`. This yields [E, D, C].
         //
-        // When we yield `B` and call `traverse_successor`, we push `C` to the stack, but
+        // When we yield `C` and call `traverse_successor`, we push `B` to the stack, but
         // since we've already visited `E`, that child isn't added to the stack. The last
-        // two iterations yield `C` and finally `A` for a final traversal of [E, D, B, C, A]
-        loop {
-            let bb = if let Some(&mut (_, ref mut iter)) = self.visit_stack.last_mut() {
-                if let Some(&bb) = iter.next() {
-                    bb
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            };
-
-            if self.visited.insert(bb) {
-                if let Some(term) = &self.body[bb].terminator {
-                    self.visit_stack.push((bb, term.successors()));
-                }
-            }
+        // two iterations yield `B` and finally `A` for a final traversal of [E, D, C, B, A]
+        while let Some(bb) = self.visit_stack.last_mut().and_then(|(_, iter)| iter.next_back()) {
+            self.visit(bb);
         }
     }
 }
 
-pub fn postorder<'a, 'tcx>(body: &'a Body<'tcx>) -> Postorder<'a, 'tcx> {
-    Postorder::new(body, START_BLOCK)
-}
+impl<'tcx> Iterator for Postorder<'_, 'tcx> {
+    type Item = BasicBlock;
 
-impl<'a, 'tcx> Iterator for Postorder<'a, 'tcx> {
-    type Item = (BasicBlock, &'a BasicBlockData<'tcx>);
+    fn next(&mut self) -> Option<BasicBlock> {
+        let (bb, _) = self.visit_stack.pop()?;
+        self.traverse_successor();
 
-    fn next(&mut self) -> Option<(BasicBlock, &'a BasicBlockData<'tcx>)> {
-        let next = self.visit_stack.pop();
-        if next.is_some() {
-            self.traverse_successor();
-        }
-
-        next.map(|(bb, _)| (bb, &self.body[bb]))
+        Some(bb)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        // All the blocks, minus the number of blocks we've visited.
-        let upper = self.body.basic_blocks().len() - self.visited.count();
+        // These bounds are not at all tight, but that's fine.
+        // It's not worth a popcnt loop in `DenseBitSet` to improve the upper,
+        // and in mono-reachable we can't be precise anyway.
+        // Leaning on amortized growth is fine.
 
-        let lower = if self.root_is_start_block {
-            // We will visit all remaining blocks exactly once.
-            upper
-        } else {
-            self.visit_stack.len()
-        };
-
+        let lower = self.visit_stack.len();
+        let upper = self.basic_blocks.len();
         (lower, Some(upper))
     }
 }
 
-/// Reverse postorder traversal of a graph
+/// Postorder traversal of a graph.
+///
+/// This function creates an iterator over the `Body`'s basic blocks, that:
+/// - returns basic blocks in a postorder,
+/// - traverses the `BasicBlocks` CFG cache's reverse postorder backwards, and does not cache the
+///   postorder itself.
+///
+/// See [`Postorder`]'s docs to learn what is postorder traversal.
+pub fn postorder<'a, 'tcx>(
+    body: &'a Body<'tcx>,
+) -> impl Iterator<Item = (BasicBlock, &'a BasicBlockData<'tcx>)> + ExactSizeIterator + DoubleEndedIterator
+{
+    reverse_postorder(body).rev()
+}
+
+pub fn mono_reachable_reverse_postorder<'a, 'tcx>(
+    body: &'a Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> Vec<BasicBlock> {
+    let mut iter = Postorder::new(&body.basic_blocks, START_BLOCK, Some((tcx, instance)));
+    let mut items = Vec::with_capacity(body.basic_blocks.len());
+    while let Some(block) = iter.next() {
+        items.push(block);
+    }
+    items.reverse();
+    items
+}
+
+/// Returns an iterator over all basic blocks reachable from the `START_BLOCK` in no particular
+/// order.
+///
+/// This is clearer than writing `preorder` in cases where the order doesn't matter.
+pub fn reachable<'a, 'tcx>(
+    body: &'a Body<'tcx>,
+) -> impl 'a + Iterator<Item = (BasicBlock, &'a BasicBlockData<'tcx>)> {
+    preorder(body)
+}
+
+/// Returns a `DenseBitSet` containing all basic blocks reachable from the `START_BLOCK`.
+pub fn reachable_as_bitset(body: &Body<'_>) -> DenseBitSet<BasicBlock> {
+    let mut iter = preorder(body);
+    while let Some(_) = iter.next() {}
+    iter.visited
+}
+
+/// Reverse postorder traversal of a graph.
+///
+/// This function creates an iterator over the `Body`'s basic blocks, that:
+/// - returns basic blocks in a reverse postorder,
+/// - makes use of the `BasicBlocks` CFG cache's reverse postorder.
 ///
 /// Reverse postorder is the reverse order of a postorder traversal.
 /// This is different to a preorder traversal and represents a natural
@@ -244,68 +280,97 @@ impl<'a, 'tcx> Iterator for Postorder<'a, 'tcx> {
 /// A reverse postorder traversal of this graph is either `A B C D` or `A C B D`
 /// Note that for a graph containing no loops (i.e., A DAG), this is equivalent to
 /// a topological sort.
-///
-/// Construction of a `ReversePostorder` traversal requires doing a full
-/// postorder traversal of the graph, therefore this traversal should be
-/// constructed as few times as possible. Use the `reset` method to be able
-/// to re-use the traversal
-#[derive(Clone)]
-pub struct ReversePostorder<'a, 'tcx> {
+pub fn reverse_postorder<'a, 'tcx>(
     body: &'a Body<'tcx>,
-    blocks: Vec<BasicBlock>,
-    idx: usize,
+) -> impl Iterator<Item = (BasicBlock, &'a BasicBlockData<'tcx>)> + ExactSizeIterator + DoubleEndedIterator
+{
+    body.basic_blocks.reverse_postorder().iter().map(|&bb| (bb, &body.basic_blocks[bb]))
 }
 
-impl<'a, 'tcx> ReversePostorder<'a, 'tcx> {
-    pub fn new(body: &'a Body<'tcx>, root: BasicBlock) -> ReversePostorder<'a, 'tcx> {
-        let blocks: Vec<_> = Postorder::new(body, root).map(|(bb, _)| bb).collect();
+/// Traversal of a [`Body`] that tries to avoid unreachable blocks in a monomorphized [`Instance`].
+///
+/// This is allowed to have false positives; blocks may be visited even if they are not actually
+/// reachable.
+///
+/// Such a traversal is mostly useful because it lets us skip lowering the `false` side
+/// of `if <T as Trait>::CONST`, as well as [`NullOp::RuntimeChecks`].
+///
+/// [`NullOp::RuntimeChecks`]: rustc_middle::mir::NullOp::RuntimeChecks
+pub fn mono_reachable<'a, 'tcx>(
+    body: &'a Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> MonoReachable<'a, 'tcx> {
+    MonoReachable::new(body, tcx, instance)
+}
 
-        let len = blocks.len();
+/// [`MonoReachable`] internally accumulates a [`DenseBitSet`] of visited blocks. This is just a
+/// convenience function to run that traversal then extract its set of reached blocks.
+pub fn mono_reachable_as_bitset<'a, 'tcx>(
+    body: &'a Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> DenseBitSet<BasicBlock> {
+    let mut iter = mono_reachable(body, tcx, instance);
+    while let Some(_) = iter.next() {}
+    iter.visited
+}
 
-        ReversePostorder { body, blocks, idx: len }
+pub struct MonoReachable<'a, 'tcx> {
+    body: &'a Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    visited: DenseBitSet<BasicBlock>,
+    // Other traversers track their worklist in a Vec. But we don't care about order, so we can
+    // store ours in a DenseBitSet and thus save allocations because DenseBitSet has a small size
+    // optimization.
+    worklist: DenseBitSet<BasicBlock>,
+}
+
+impl<'a, 'tcx> MonoReachable<'a, 'tcx> {
+    pub fn new(
+        body: &'a Body<'tcx>,
+        tcx: TyCtxt<'tcx>,
+        instance: Instance<'tcx>,
+    ) -> MonoReachable<'a, 'tcx> {
+        let mut worklist = DenseBitSet::new_empty(body.basic_blocks.len());
+        worklist.insert(START_BLOCK);
+        MonoReachable {
+            body,
+            tcx,
+            instance,
+            visited: DenseBitSet::new_empty(body.basic_blocks.len()),
+            worklist,
+        }
     }
 
-    pub fn reset(&mut self) {
-        self.idx = self.blocks.len();
+    fn add_work(&mut self, blocks: impl IntoIterator<Item = BasicBlock>) {
+        for block in blocks.into_iter() {
+            if !self.visited.contains(block) {
+                self.worklist.insert(block);
+            }
+        }
     }
 }
 
-pub fn reverse_postorder<'a, 'tcx>(body: &'a Body<'tcx>) -> ReversePostorder<'a, 'tcx> {
-    ReversePostorder::new(body, START_BLOCK)
-}
-
-impl<'a, 'tcx> Iterator for ReversePostorder<'a, 'tcx> {
+impl<'a, 'tcx> Iterator for MonoReachable<'a, 'tcx> {
     type Item = (BasicBlock, &'a BasicBlockData<'tcx>);
 
     fn next(&mut self) -> Option<(BasicBlock, &'a BasicBlockData<'tcx>)> {
-        if self.idx == 0 {
-            return None;
+        while let Some(idx) = self.worklist.iter().next() {
+            self.worklist.remove(idx);
+            if !self.visited.insert(idx) {
+                continue;
+            }
+
+            let data = &self.body[idx];
+
+            let targets = data.mono_successors(self.tcx, self.instance);
+            self.add_work(targets);
+
+            return Some((idx, data));
         }
-        self.idx -= 1;
 
-        self.blocks.get(self.idx).map(|&bb| (bb, &self.body[bb]))
+        None
     }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.idx, Some(self.idx))
-    }
-}
-
-impl<'a, 'tcx> ExactSizeIterator for ReversePostorder<'a, 'tcx> {}
-
-/// Returns an iterator over all basic blocks reachable from the `START_BLOCK` in no particular
-/// order.
-///
-/// This is clearer than writing `preorder` in cases where the order doesn't matter.
-pub fn reachable<'a, 'tcx>(
-    body: &'a Body<'tcx>,
-) -> impl 'a + Iterator<Item = (BasicBlock, &'a BasicBlockData<'tcx>)> {
-    preorder(body)
-}
-
-/// Returns a `BitSet` containing all basic blocks reachable from the `START_BLOCK`.
-pub fn reachable_as_bitset(body: &Body<'tcx>) -> BitSet<BasicBlock> {
-    let mut iter = preorder(body);
-    (&mut iter).for_each(drop);
-    iter.visited
 }

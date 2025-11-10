@@ -1,8 +1,6 @@
-// run-rustfix
+#![allow(clippy::stable_sort_primitive, clippy::useless_vec)]
 
-#![allow(clippy::stable_sort_primitive)]
-
-use std::cmp::Reverse;
+use std::cell::Ref;
 
 fn unnecessary_sort_by() {
     fn id(x: isize) -> isize {
@@ -12,13 +10,19 @@ fn unnecessary_sort_by() {
     let mut vec: Vec<isize> = vec![3, 6, 1, 2, 5];
     // Forward examples
     vec.sort();
+    //~^ unnecessary_sort_by
     vec.sort_unstable();
+    //~^ unnecessary_sort_by
     vec.sort_by_key(|a| (a + 5).abs());
+    //~^ unnecessary_sort_by
     vec.sort_unstable_by_key(|a| id(-a));
+    //~^ unnecessary_sort_by
     // Reverse examples
     vec.sort_by(|a, b| b.cmp(a)); // not linted to avoid suggesting `Reverse(b)` which would borrow
-    vec.sort_by_key(|b| Reverse((b + 5).abs()));
-    vec.sort_unstable_by_key(|b| Reverse(id(-b)));
+    vec.sort_by_key(|b| std::cmp::Reverse((b + 5).abs()));
+    //~^ unnecessary_sort_by
+    vec.sort_unstable_by_key(|b| std::cmp::Reverse(id(-b)));
+    //~^ unnecessary_sort_by
     // Negative examples (shouldn't be changed)
     let c = &7;
     vec.sort_by(|a, b| (b - a).cmp(&(a - b)));
@@ -29,10 +33,16 @@ fn unnecessary_sort_by() {
     // Vectors of references are fine as long as the resulting key does not borrow
     let mut vec: Vec<&&&isize> = vec![&&&3, &&&6, &&&1, &&&2, &&&5];
     vec.sort_by_key(|a| (***a).abs());
+    //~^ unnecessary_sort_by
     vec.sort_unstable_by_key(|a| (***a).abs());
+    //~^ unnecessary_sort_by
     // `Reverse(b)` would borrow in the following cases, don't lint
     vec.sort_by(|a, b| b.cmp(a));
     vec.sort_unstable_by(|a, b| b.cmp(a));
+
+    // No warning if element does not implement `Ord`
+    let mut vec: Vec<Ref<usize>> = Vec::new();
+    vec.sort_unstable_by(|a, b| a.cmp(b));
 }
 
 // Do not suggest returning a reference to the closure parameter of `Vec::sort_by_key`
@@ -71,7 +81,6 @@ mod issue_5754 {
 
 // The closure parameter is not dereferenced anymore, so non-Copy types can be linted
 mod issue_6001 {
-    use super::*;
     struct Test(String);
 
     impl Test {
@@ -86,10 +95,14 @@ mod issue_6001 {
 
         // Forward
         args.sort_by_key(|a| a.name());
+        //~^ unnecessary_sort_by
         args.sort_unstable_by_key(|a| a.name());
+        //~^ unnecessary_sort_by
         // Reverse
-        args.sort_by_key(|b| Reverse(b.name()));
-        args.sort_unstable_by_key(|b| Reverse(b.name()));
+        args.sort_by_key(|b| std::cmp::Reverse(b.name()));
+        //~^ unnecessary_sort_by
+        args.sort_unstable_by_key(|b| std::cmp::Reverse(b.name()));
+        //~^ unnecessary_sort_by
     }
 }
 

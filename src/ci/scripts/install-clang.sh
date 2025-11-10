@@ -1,4 +1,5 @@
 #!/bin/bash
+# ignore-tidy-linelength
 # This script installs clang on the local machine. Note that we don't install
 # clang on Linux since its compiler story is just so different. Each container
 # has its own toolchain configured appropriately already.
@@ -9,17 +10,24 @@ IFS=$'\n\t'
 source "$(cd "$(dirname "$0")" && pwd)/../shared.sh"
 
 # Update both macOS's and Windows's tarballs when bumping the version here.
-LLVM_VERSION="10.0.0"
+# Try to keep this in sync with src/ci/docker/scripts/build-clang.sh
+LLVM_VERSION="20.1.3"
 
 if isMacOS; then
+    # FIXME: This is the latest pre-built version of LLVM that's available for
+    # x86_64 MacOS. We may want to consider building our own LLVM binaries
+    # instead, or set `USE_XCODE_CLANG` like AArch64 does.
+    LLVM_VERSION="15.0.7"
+
     # If the job selects a specific Xcode version, use that instead of
     # downloading our own version.
     if [[ ${USE_XCODE_CLANG-0} -eq 1 ]]; then
         bindir="$(xcode-select --print-path)/Toolchains/XcodeDefault.xctoolchain/usr/bin"
     else
-        file="${MIRRORS_BASE}/clang%2Bllvm-${LLVM_VERSION}-x86_64-apple-darwin.tar.xz"
-        curl -f "${file}" | tar xJf -
-        bindir="$(pwd)/clang+llvm-${LLVM_VERSION}-x86_64-apple-darwin/bin"
+        file="${MIRRORS_BASE}/clang%2Bllvm-${LLVM_VERSION}-x86_64-apple-darwin21.0.tar.xz"
+        retry curl -f "${file}" -o "clang+llvm-${LLVM_VERSION}-x86_64-apple-darwin21.0.tar.xz"
+        tar xJf "clang+llvm-${LLVM_VERSION}-x86_64-apple-darwin21.0.tar.xz"
+        bindir="$(pwd)/clang+llvm-${LLVM_VERSION}-x86_64-apple-darwin21.0/bin"
     fi
 
     ciCommandSetEnv CC "${bindir}/clang"
@@ -32,33 +40,45 @@ if isMacOS; then
     # our own clang can figure out the correct include path on its own.
     ciCommandSetEnv SDKROOT "$(xcrun --sdk macosx --show-sdk-path)"
 
-    # Configure `AR` specifically so rustbuild doesn't try to infer it as
+    # Configure `AR` specifically so bootstrap doesn't try to infer it as
     # `clang-ar` by accident.
     ciCommandSetEnv AR "ar"
-elif isWindows && [[ ${CUSTOM_MINGW-0} -ne 1 ]]; then
+elif isWindows && ! isKnownToBeMingwBuild; then
     # If we're compiling for MSVC then we, like most other distribution builders,
     # switch to clang as the compiler. This'll allow us eventually to enable LTO
     # amongst LLVM and rustc. Note that we only do this on MSVC as I don't think
     # clang has an output mode compatible with MinGW that we need. If it does we
     # should switch to clang for MinGW as well!
     #
-    # Note that the LLVM installer is an NSIS installer
-    #
-    # Original downloaded here came from:
-    #
-    #   https://github.com/llvm/llvm-project/releases/download/llvmorg-10.0.0/LLVM-10.0.0-win64.exe
-    #
-    # That installer was run through `wine ./installer.exe /S /NCRC` on Linux
-    # and then the resulting installation directory (found in
-    # `$HOME/.wine/drive_c/Program Files/LLVM`) was packaged up into a tarball.
-    # We've had issues otherwise that the installer will randomly hang, provide
-    # not a lot of useful information, pollute global state, etc. In general the
-    # tarball is just more confined and easier to deal with when working with
-    # various CI environments.
+    # The LLVM installer is an NSIS installer, which we can extract with 7z. We
+    # don't want to run the installer directly; extracting it is more reliable
+    # in CI environments.
 
-    mkdir -p citools
+    mkdir -p citools/clang-rust
     cd citools
-    curl -f "${MIRRORS_BASE}/LLVM-${LLVM_VERSION}-win64.tar.gz" | tar xzf -
+
+    if [[ "${CI_JOB_NAME}" = *aarch64* ]]; then
+        suffix=woa64
+
+        # On Arm64, the Ring crate requires that Clang be on the PATH.
+        # https://github.com/briansmith/ring/blob/main/BUILDING.md
+        ciCommandAddPath "$(cygpath -m "$(pwd)/clang-rust/bin")"
+    else
+        suffix=win64
+    fi
+    retry curl -f "${MIRRORS_BASE}/LLVM-${LLVM_VERSION}-${suffix}.exe" \
+        -o "LLVM-${LLVM_VERSION}-${suffix}.exe"
+    7z x -oclang-rust/ "LLVM-${LLVM_VERSION}-${suffix}.exe"
     ciCommandSetEnv RUST_CONFIGURE_ARGS \
         "${RUST_CONFIGURE_ARGS} --set llvm.clang-cl=$(pwd)/clang-rust/bin/clang-cl.exe"
+
+    # Disable downloading CI LLVM on this builder;
+    # setting up clang-cl just above conflicts with the default if-unchanged option.
+    ciCommandSetEnv NO_DOWNLOAD_CI_LLVM 1
+fi
+
+if isWindows; then
+    # GitHub image 20210928.2 added LLVM, but it is broken (and we don't want
+    # to use it anyways).
+    rm -rf /c/Program\ Files/LLVM
 fi

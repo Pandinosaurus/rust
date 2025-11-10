@@ -1,5 +1,3 @@
-// run-rustfix
-
 #[derive(Copy, Clone)]
 struct HasChars;
 
@@ -16,12 +14,15 @@ fn main() {
 
     s.push_str(abc);
     s.push_str(abc);
+    //~^ string_extend_chars
 
     s.push_str("abc");
     s.push_str("abc");
+    //~^ string_extend_chars
 
     s.push_str(&def);
     s.push_str(&def);
+    //~^ string_extend_chars
 
     s.extend(abc.chars().skip(1));
     s.extend("abc".chars().skip(1));
@@ -29,4 +30,8 @@ fn main() {
 
     let f = HasChars;
     s.extend(f.chars());
+
+    // issue #9735
+    s.push_str(&abc[0..2]);
+    //~^ string_extend_chars
 }

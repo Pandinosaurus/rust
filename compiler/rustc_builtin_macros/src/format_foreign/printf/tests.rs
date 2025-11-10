@@ -1,9 +1,9 @@
-use super::{iter_subs, parse_next_substitution as pns, Format as F, Num as N, Substitution as S};
+use super::{Format as F, Num as N, Substitution as S, iter_subs, parse_next_substitution as pns};
 
 macro_rules! assert_eq_pnsat {
     ($lhs:expr, $rhs:expr) => {
         assert_eq!(
-            pns($lhs).and_then(|(s, _)| s.translate()),
+            pns($lhs).and_then(|(s, _)| s.translate().ok()),
             $rhs.map(<String as From<&str>>::from)
         )
     };
@@ -13,9 +13,9 @@ macro_rules! assert_eq_pnsat {
 fn test_escape() {
     assert_eq!(pns("has no escapes"), None);
     assert_eq!(pns("has no escapes, either %"), None);
-    assert_eq!(pns("*so* has a %% escape"), Some((S::Escape, " escape")));
-    assert_eq!(pns("%% leading escape"), Some((S::Escape, " leading escape")));
-    assert_eq!(pns("trailing escape %%"), Some((S::Escape, "")));
+    assert_eq!(pns("*so* has a %% escape"), Some((S::Escape((11, 13)), " escape")));
+    assert_eq!(pns("%% leading escape"), Some((S::Escape((0, 2)), " leading escape")));
+    assert_eq!(pns("trailing escape %%"), Some((S::Escape((16, 18)), "")));
 }
 
 #[test]
@@ -98,9 +98,9 @@ fn test_parse() {
 #[test]
 fn test_iter() {
     let s = "The %d'th word %% is: `%.*s` %!\n";
-    let subs: Vec<_> = iter_subs(s, 0).map(|sub| sub.translate()).collect();
+    let subs: Vec<_> = iter_subs(s, 0).map(|sub| sub.translate().ok()).collect();
     assert_eq!(
-        subs.iter().map(|ms| ms.as_ref().map(|s| &s[..])).collect::<Vec<_>>(),
+        subs.iter().map(Option::as_deref).collect::<Vec<_>>(),
         vec![Some("{}"), None, Some("{:.*}"), None]
     );
 }

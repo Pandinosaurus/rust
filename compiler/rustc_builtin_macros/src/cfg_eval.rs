@@ -1,103 +1,173 @@
-use crate::util::check_builtin_macro_attribute;
+use core::ops::ControlFlow;
 
-use rustc_ast::mut_visit::{self, MutVisitor};
-use rustc_ast::ptr::P;
-use rustc_ast::{self as ast, AstLike};
+use rustc_ast as ast;
+use rustc_ast::mut_visit::MutVisitor;
+use rustc_ast::visit::{AssocCtxt, Visitor};
+use rustc_ast::{Attribute, HasAttrs, HasTokens, NodeId, mut_visit, visit};
+use rustc_errors::PResult;
 use rustc_expand::base::{Annotatable, ExtCtxt};
 use rustc_expand::config::StripUnconfigured;
 use rustc_expand::configure;
-use rustc_span::symbol::sym;
-use rustc_span::Span;
+use rustc_feature::Features;
+use rustc_parse::parser::{ForceCollect, Parser};
+use rustc_session::Session;
+use rustc_span::{Span, sym};
 use smallvec::SmallVec;
+use tracing::instrument;
 
-crate fn expand(
+use crate::util::{check_builtin_macro_attribute, warn_on_duplicate_attribute};
+
+pub(crate) fn expand(
     ecx: &mut ExtCtxt<'_>,
     _span: Span,
     meta_item: &ast::MetaItem,
     annotatable: Annotatable,
 ) -> Vec<Annotatable> {
     check_builtin_macro_attribute(ecx, meta_item, sym::cfg_eval);
-    cfg_eval(ecx, annotatable)
+    warn_on_duplicate_attribute(ecx, &annotatable, sym::cfg_eval);
+    vec![cfg_eval(ecx.sess, ecx.ecfg.features, annotatable, ecx.current_expansion.lint_node_id)]
 }
 
-crate fn cfg_eval(ecx: &ExtCtxt<'_>, annotatable: Annotatable) -> Vec<Annotatable> {
-    let mut visitor = CfgEval {
-        cfg: StripUnconfigured { sess: ecx.sess, features: ecx.ecfg.features, modified: false },
-    };
-    let mut annotatable = visitor.configure_annotatable(annotatable);
-    if visitor.cfg.modified {
-        // Erase the tokens if cfg-stripping modified the item
-        // This will cause us to synthesize fake tokens
-        // when `nt_to_tokenstream` is called on this item.
-        if let Some(tokens) = annotatable.tokens_mut() {
-            *tokens = None;
+pub(crate) fn cfg_eval(
+    sess: &Session,
+    features: &Features,
+    annotatable: Annotatable,
+    lint_node_id: NodeId,
+) -> Annotatable {
+    let features = Some(features);
+    CfgEval(StripUnconfigured { sess, features, config_tokens: true, lint_node_id })
+        .configure_annotatable(annotatable)
+}
+
+struct CfgEval<'a>(StripUnconfigured<'a>);
+
+fn has_cfg_or_cfg_attr(annotatable: &Annotatable) -> bool {
+    struct CfgFinder;
+
+    impl<'ast> visit::Visitor<'ast> for CfgFinder {
+        type Result = ControlFlow<()>;
+        fn visit_attribute(&mut self, attr: &'ast Attribute) -> ControlFlow<()> {
+            if attr
+                .ident()
+                .is_some_and(|ident| ident.name == sym::cfg || ident.name == sym::cfg_attr)
+            {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
         }
     }
-    vec![annotatable]
-}
 
-struct CfgEval<'a> {
-    cfg: StripUnconfigured<'a>,
+    let res = match annotatable {
+        Annotatable::Item(item) => CfgFinder.visit_item(item),
+        Annotatable::AssocItem(item, ctxt) => CfgFinder.visit_assoc_item(item, *ctxt),
+        Annotatable::ForeignItem(item) => CfgFinder.visit_foreign_item(item),
+        Annotatable::Stmt(stmt) => CfgFinder.visit_stmt(stmt),
+        Annotatable::Expr(expr) => CfgFinder.visit_expr(expr),
+        _ => unreachable!(),
+    };
+    res.is_break()
 }
 
 impl CfgEval<'_> {
-    fn configure<T: AstLike>(&mut self, node: T) -> Option<T> {
-        self.cfg.configure(node)
+    fn configure<T: HasAttrs + HasTokens>(&mut self, node: T) -> Option<T> {
+        self.0.configure(node)
     }
 
-    fn configure_annotatable(&mut self, annotatable: Annotatable) -> Annotatable {
-        // Since the item itself has already been configured by the InvocationCollector,
-        // we know that fold result vector will contain exactly one element
-        match annotatable {
-            Annotatable::Item(item) => Annotatable::Item(self.flat_map_item(item).pop().unwrap()),
-            Annotatable::TraitItem(item) => {
-                Annotatable::TraitItem(self.flat_map_trait_item(item).pop().unwrap())
+    fn configure_annotatable(mut self, annotatable: Annotatable) -> Annotatable {
+        // Tokenizing and re-parsing the `Annotatable` can have a significant
+        // performance impact, so try to avoid it if possible
+        if !has_cfg_or_cfg_attr(&annotatable) {
+            return annotatable;
+        }
+
+        // The majority of parsed attribute targets will never need to have early cfg-expansion
+        // run (e.g. they are not part of a `#[derive]` or `#[cfg_eval]` macro input).
+        // Therefore, we normally do not capture the necessary information about `#[cfg]`
+        // and `#[cfg_attr]` attributes during parsing.
+        //
+        // Therefore, when we actually *do* run early cfg-expansion, we need to tokenize
+        // and re-parse the attribute target, this time capturing information about
+        // the location of `#[cfg]` and `#[cfg_attr]` in the token stream. The tokenization
+        // process is lossless, so this process is invisible to proc-macros.
+
+        // Interesting cases:
+        //
+        // ```rust
+        // #[cfg_eval] #[cfg] $item
+        //```
+        //
+        // where `$item` is `#[cfg_attr] struct Foo {}`. We want to make
+        // sure to evaluate *all* `#[cfg]` and `#[cfg_attr]` attributes - the simplest
+        // way to do this is to do a single parse of the token stream.
+        let orig_tokens = annotatable.to_tokens();
+
+        // Re-parse the tokens, setting the `capture_cfg` flag to save extra information
+        // to the captured `AttrTokenStream` (specifically, we capture
+        // `AttrTokenTree::AttrsTarget` for all occurrences of `#[cfg]` and `#[cfg_attr]`)
+        //
+        // After that we have our re-parsed `AttrTokenStream`, recursively configuring
+        // our attribute target will correctly configure the tokens as well.
+        let mut parser = Parser::new(&self.0.sess.psess, orig_tokens, None);
+        parser.capture_cfg = true;
+        let res: PResult<'_, Annotatable> = try {
+            match annotatable {
+                Annotatable::Item(_) => {
+                    let item = parser.parse_item(ForceCollect::Yes)?.unwrap();
+                    Annotatable::Item(self.flat_map_item(item).pop().unwrap())
+                }
+                Annotatable::AssocItem(_, ctxt) => {
+                    let item = parser.parse_trait_item(ForceCollect::Yes)?.unwrap().unwrap();
+                    Annotatable::AssocItem(
+                        self.flat_map_assoc_item(item, ctxt).pop().unwrap(),
+                        ctxt,
+                    )
+                }
+                Annotatable::ForeignItem(_) => {
+                    let item = parser.parse_foreign_item(ForceCollect::Yes)?.unwrap().unwrap();
+                    Annotatable::ForeignItem(self.flat_map_foreign_item(item).pop().unwrap())
+                }
+                Annotatable::Stmt(_) => {
+                    let stmt = parser
+                        .parse_stmt_without_recovery(false, ForceCollect::Yes, false)?
+                        .unwrap();
+                    Annotatable::Stmt(Box::new(self.flat_map_stmt(stmt).pop().unwrap()))
+                }
+                Annotatable::Expr(_) => {
+                    let mut expr = parser.parse_expr_force_collect()?;
+                    self.visit_expr(&mut expr);
+                    Annotatable::Expr(expr)
+                }
+                _ => unreachable!(),
             }
-            Annotatable::ImplItem(item) => {
-                Annotatable::ImplItem(self.flat_map_impl_item(item).pop().unwrap())
-            }
-            Annotatable::ForeignItem(item) => {
-                Annotatable::ForeignItem(self.flat_map_foreign_item(item).pop().unwrap())
-            }
-            Annotatable::Stmt(stmt) => {
-                Annotatable::Stmt(stmt.map(|stmt| self.flat_map_stmt(stmt).pop().unwrap()))
-            }
-            Annotatable::Expr(mut expr) => Annotatable::Expr({
-                self.visit_expr(&mut expr);
-                expr
-            }),
-            Annotatable::Arm(arm) => Annotatable::Arm(self.flat_map_arm(arm).pop().unwrap()),
-            Annotatable::ExprField(field) => {
-                Annotatable::ExprField(self.flat_map_expr_field(field).pop().unwrap())
-            }
-            Annotatable::PatField(fp) => {
-                Annotatable::PatField(self.flat_map_pat_field(fp).pop().unwrap())
-            }
-            Annotatable::GenericParam(param) => {
-                Annotatable::GenericParam(self.flat_map_generic_param(param).pop().unwrap())
-            }
-            Annotatable::Param(param) => {
-                Annotatable::Param(self.flat_map_param(param).pop().unwrap())
-            }
-            Annotatable::FieldDef(sf) => {
-                Annotatable::FieldDef(self.flat_map_field_def(sf).pop().unwrap())
-            }
-            Annotatable::Variant(v) => {
-                Annotatable::Variant(self.flat_map_variant(v).pop().unwrap())
+        };
+
+        match res {
+            Ok(ann) => ann,
+            Err(err) => {
+                err.emit();
+                annotatable
             }
         }
     }
 }
 
 impl MutVisitor for CfgEval<'_> {
-    fn visit_expr(&mut self, expr: &mut P<ast::Expr>) {
-        self.cfg.configure_expr(expr);
-        mut_visit::noop_visit_expr(expr, self);
+    #[instrument(level = "trace", skip(self))]
+    fn visit_expr(&mut self, expr: &mut ast::Expr) {
+        self.0.configure_expr(expr, false);
+        mut_visit::walk_expr(self, expr);
     }
 
-    fn filter_map_expr(&mut self, expr: P<ast::Expr>) -> Option<P<ast::Expr>> {
+    #[instrument(level = "trace", skip(self))]
+    fn visit_method_receiver_expr(&mut self, expr: &mut ast::Expr) {
+        self.0.configure_expr(expr, true);
+        mut_visit::walk_expr(self, expr);
+    }
+
+    fn filter_map_expr(&mut self, expr: Box<ast::Expr>) -> Option<Box<ast::Expr>> {
         let mut expr = configure!(self, expr);
-        mut_visit::noop_visit_expr(&mut expr, self);
+        mut_visit::walk_expr(self, &mut expr);
         Some(expr)
     }
 
@@ -105,53 +175,64 @@ impl MutVisitor for CfgEval<'_> {
         &mut self,
         param: ast::GenericParam,
     ) -> SmallVec<[ast::GenericParam; 1]> {
-        mut_visit::noop_flat_map_generic_param(configure!(self, param), self)
+        let param = configure!(self, param);
+        mut_visit::walk_flat_map_generic_param(self, param)
     }
 
     fn flat_map_stmt(&mut self, stmt: ast::Stmt) -> SmallVec<[ast::Stmt; 1]> {
-        mut_visit::noop_flat_map_stmt(configure!(self, stmt), self)
+        let stmt = configure!(self, stmt);
+        mut_visit::walk_flat_map_stmt(self, stmt)
     }
 
-    fn flat_map_item(&mut self, item: P<ast::Item>) -> SmallVec<[P<ast::Item>; 1]> {
-        mut_visit::noop_flat_map_item(configure!(self, item), self)
+    fn flat_map_item(&mut self, item: Box<ast::Item>) -> SmallVec<[Box<ast::Item>; 1]> {
+        let item = configure!(self, item);
+        mut_visit::walk_flat_map_item(self, item)
     }
 
-    fn flat_map_impl_item(&mut self, item: P<ast::AssocItem>) -> SmallVec<[P<ast::AssocItem>; 1]> {
-        mut_visit::noop_flat_map_assoc_item(configure!(self, item), self)
-    }
-
-    fn flat_map_trait_item(&mut self, item: P<ast::AssocItem>) -> SmallVec<[P<ast::AssocItem>; 1]> {
-        mut_visit::noop_flat_map_assoc_item(configure!(self, item), self)
+    fn flat_map_assoc_item(
+        &mut self,
+        item: Box<ast::AssocItem>,
+        ctxt: AssocCtxt,
+    ) -> SmallVec<[Box<ast::AssocItem>; 1]> {
+        let item = configure!(self, item);
+        mut_visit::walk_flat_map_assoc_item(self, item, ctxt)
     }
 
     fn flat_map_foreign_item(
         &mut self,
-        foreign_item: P<ast::ForeignItem>,
-    ) -> SmallVec<[P<ast::ForeignItem>; 1]> {
-        mut_visit::noop_flat_map_foreign_item(configure!(self, foreign_item), self)
+        foreign_item: Box<ast::ForeignItem>,
+    ) -> SmallVec<[Box<ast::ForeignItem>; 1]> {
+        let foreign_item = configure!(self, foreign_item);
+        mut_visit::walk_flat_map_foreign_item(self, foreign_item)
     }
 
     fn flat_map_arm(&mut self, arm: ast::Arm) -> SmallVec<[ast::Arm; 1]> {
-        mut_visit::noop_flat_map_arm(configure!(self, arm), self)
+        let arm = configure!(self, arm);
+        mut_visit::walk_flat_map_arm(self, arm)
     }
 
     fn flat_map_expr_field(&mut self, field: ast::ExprField) -> SmallVec<[ast::ExprField; 1]> {
-        mut_visit::noop_flat_map_expr_field(configure!(self, field), self)
+        let field = configure!(self, field);
+        mut_visit::walk_flat_map_expr_field(self, field)
     }
 
     fn flat_map_pat_field(&mut self, fp: ast::PatField) -> SmallVec<[ast::PatField; 1]> {
-        mut_visit::noop_flat_map_pat_field(configure!(self, fp), self)
+        let fp = configure!(self, fp);
+        mut_visit::walk_flat_map_pat_field(self, fp)
     }
 
     fn flat_map_param(&mut self, p: ast::Param) -> SmallVec<[ast::Param; 1]> {
-        mut_visit::noop_flat_map_param(configure!(self, p), self)
+        let p = configure!(self, p);
+        mut_visit::walk_flat_map_param(self, p)
     }
 
     fn flat_map_field_def(&mut self, sf: ast::FieldDef) -> SmallVec<[ast::FieldDef; 1]> {
-        mut_visit::noop_flat_map_field_def(configure!(self, sf), self)
+        let sf = configure!(self, sf);
+        mut_visit::walk_flat_map_field_def(self, sf)
     }
 
     fn flat_map_variant(&mut self, variant: ast::Variant) -> SmallVec<[ast::Variant; 1]> {
-        mut_visit::noop_flat_map_variant(configure!(self, variant), self)
+        let variant = configure!(self, variant);
+        mut_visit::walk_flat_map_variant(self, variant)
     }
 }

@@ -1,34 +1,33 @@
 use super::utils::derefs_to_slice;
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::paths;
+use clippy_utils::res::MaybeDef;
 use clippy_utils::source::snippet_with_applicability;
-use clippy_utils::ty::{is_type_diagnostic_item, match_type};
 use rustc_errors::Applicability;
 use rustc_hir::Expr;
 use rustc_lint::LateContext;
-use rustc_span::sym;
+use rustc_span::{Symbol, sym};
 
 use super::ITER_COUNT;
 
-pub(crate) fn check<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'_>, iter_args: &'tcx [Expr<'tcx>], iter_method: &str) {
-    let ty = cx.typeck_results().expr_ty(&iter_args[0]);
-    let caller_type = if derefs_to_slice(cx, &iter_args[0], ty).is_some() {
+pub(crate) fn check<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'_>, recv: &'tcx Expr<'tcx>, iter_method: Symbol) {
+    let ty = cx.typeck_results().expr_ty(recv);
+    let caller_type = if derefs_to_slice(cx, recv, ty).is_some() {
         "slice"
-    } else if is_type_diagnostic_item(cx, ty, sym::vec_type) {
+    } else if ty.is_diag_item(cx, sym::Vec) {
         "Vec"
-    } else if is_type_diagnostic_item(cx, ty, sym::vecdeque_type) {
+    } else if ty.is_diag_item(cx, sym::VecDeque) {
         "VecDeque"
-    } else if is_type_diagnostic_item(cx, ty, sym::hashset_type) {
+    } else if ty.is_diag_item(cx, sym::HashSet) {
         "HashSet"
-    } else if is_type_diagnostic_item(cx, ty, sym::hashmap_type) {
+    } else if ty.is_diag_item(cx, sym::HashMap) {
         "HashMap"
-    } else if match_type(cx, ty, &paths::BTREEMAP) {
+    } else if ty.is_diag_item(cx, sym::BTreeMap) {
         "BTreeMap"
-    } else if match_type(cx, ty, &paths::BTREESET) {
+    } else if ty.is_diag_item(cx, sym::BTreeSet) {
         "BTreeSet"
-    } else if match_type(cx, ty, &paths::LINKED_LIST) {
+    } else if ty.is_diag_item(cx, sym::LinkedList) {
         "LinkedList"
-    } else if match_type(cx, ty, &paths::BINARY_HEAP) {
+    } else if ty.is_diag_item(cx, sym::BinaryHeap) {
         "BinaryHeap"
     } else {
         return;
@@ -38,11 +37,11 @@ pub(crate) fn check<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'_>, iter_args: &'
         cx,
         ITER_COUNT,
         expr.span,
-        &format!("called `.{}().count()` on a `{}`", iter_method, caller_type),
+        format!("called `.{iter_method}().count()` on a `{caller_type}`"),
         "try",
         format!(
             "{}.len()",
-            snippet_with_applicability(cx, iter_args[0].span, "..", &mut applicability),
+            snippet_with_applicability(cx, recv.span, "..", &mut applicability),
         ),
         applicability,
     );

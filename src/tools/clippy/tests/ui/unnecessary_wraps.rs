@@ -1,3 +1,4 @@
+//@no-rustfix: overlapping suggestions
 #![warn(clippy::unnecessary_wraps)]
 #![allow(clippy::no_effect)]
 #![allow(clippy::needless_return)]
@@ -6,6 +7,8 @@
 
 // should be linted
 fn func1(a: bool, b: bool) -> Option<i32> {
+    //~^ unnecessary_wraps
+
     if a && b {
         return Some(42);
     }
@@ -19,6 +22,8 @@ fn func1(a: bool, b: bool) -> Option<i32> {
 
 // should be linted
 fn func2(a: bool, b: bool) -> Option<i32> {
+    //~^ unnecessary_wraps
+
     if a && b {
         return Some(10);
     }
@@ -37,6 +42,8 @@ fn func4(a: bool) -> Option<i32> {
 
 // should be linted
 fn func5() -> Option<i32> {
+    //~^ unnecessary_wraps
+
     Some(1)
 }
 
@@ -47,6 +54,8 @@ fn func6() -> Option<i32> {
 
 // should be linted
 fn func7() -> Result<i32, ()> {
+    //~^ unnecessary_wraps
+
     Ok(1)
 }
 
@@ -65,7 +74,7 @@ fn func10() -> Option<()> {
     unimplemented!()
 }
 
-struct A;
+pub struct A;
 
 impl A {
     // should not be linted
@@ -75,6 +84,8 @@ impl A {
 
     // should be linted
     fn func12() -> Option<i32> {
+        //~^ unnecessary_wraps
+
         Some(1)
     }
 }
@@ -102,6 +113,8 @@ fn issue_6384(s: &str) -> Option<&str> {
 
 // should be linted
 fn issue_6640_1(a: bool, b: bool) -> Option<()> {
+    //~^ unnecessary_wraps
+
     if a && b {
         return Some(());
     }
@@ -115,6 +128,8 @@ fn issue_6640_1(a: bool, b: bool) -> Option<()> {
 
 // should be linted
 fn issue_6640_2(a: bool, b: bool) -> Result<(), i32> {
+    //~^ unnecessary_wraps
+
     if a && b {
         return Ok(());
     }

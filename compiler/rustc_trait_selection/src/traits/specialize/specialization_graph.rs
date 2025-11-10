@@ -1,29 +1,31 @@
-use super::OverlapError;
-
-use crate::traits;
+use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def_id::DefId;
-use rustc_middle::ty::fast_reject::{self, SimplifiedType};
-use rustc_middle::ty::print::with_no_trimmed_paths;
-use rustc_middle::ty::{self, TyCtxt, TypeFoldable};
-
+use rustc_macros::extension;
+use rustc_middle::bug;
 pub use rustc_middle::traits::specialization_graph::*;
+use rustc_middle::ty::fast_reject::{self, SimplifiedType, TreatParams};
+use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
+use tracing::{debug, instrument};
+
+use super::OverlapError;
+use crate::traits;
 
 #[derive(Copy, Clone, Debug)]
 pub enum FutureCompatOverlapErrorKind {
-    Issue33140,
     LeakCheck,
 }
 
 #[derive(Debug)]
-pub struct FutureCompatOverlapError {
-    pub error: OverlapError,
+pub struct FutureCompatOverlapError<'tcx> {
+    pub error: OverlapError<'tcx>,
     pub kind: FutureCompatOverlapErrorKind,
 }
 
 /// The result of attempting to insert an impl into a group of children.
-enum Inserted {
+#[derive(Debug)]
+enum Inserted<'tcx> {
     /// The impl was inserted as a new child in this group of children.
-    BecameNewSibling(Option<FutureCompatOverlapError>),
+    BecameNewSibling(Option<FutureCompatOverlapError<'tcx>>),
 
     /// The impl should replace existing impls [X1, ..], because the impl specializes X1, X2, etc.
     ReplaceChildren(Vec<DefId>),
@@ -32,25 +34,16 @@ enum Inserted {
     ShouldRecurseOn(DefId),
 }
 
-trait ChildrenExt {
-    fn insert_blindly(&mut self, tcx: TyCtxt<'tcx>, impl_def_id: DefId);
-    fn remove_existing(&mut self, tcx: TyCtxt<'tcx>, impl_def_id: DefId);
-
-    fn insert(
-        &mut self,
-        tcx: TyCtxt<'tcx>,
-        impl_def_id: DefId,
-        simplified_self: Option<SimplifiedType>,
-    ) -> Result<Inserted, OverlapError>;
-}
-
-impl ChildrenExt for Children {
+#[extension(trait ChildrenExt<'tcx>)]
+impl<'tcx> Children {
     /// Insert an impl into this set of children without comparing to any existing impls.
     fn insert_blindly(&mut self, tcx: TyCtxt<'tcx>, impl_def_id: DefId) {
-        let trait_ref = tcx.impl_trait_ref(impl_def_id).unwrap();
-        if let Some(st) = fast_reject::simplify_type(tcx, trait_ref.self_ty(), false) {
+        let trait_ref = tcx.impl_trait_ref(impl_def_id).skip_binder();
+        if let Some(st) =
+            fast_reject::simplify_type(tcx, trait_ref.self_ty(), TreatParams::InstantiateWithInfer)
+        {
             debug!("insert_blindly: impl_def_id={:?} st={:?}", impl_def_id, st);
-            self.nonblanket_impls.entry(st).or_default().push(impl_def_id)
+            self.non_blanket_impls.entry(st).or_default().push(impl_def_id)
         } else {
             debug!("insert_blindly: impl_def_id={:?} st=None", impl_def_id);
             self.blanket_impls.push(impl_def_id)
@@ -61,11 +54,13 @@ impl ChildrenExt for Children {
     /// an impl with a parent. The impl must be present in the list of
     /// children already.
     fn remove_existing(&mut self, tcx: TyCtxt<'tcx>, impl_def_id: DefId) {
-        let trait_ref = tcx.impl_trait_ref(impl_def_id).unwrap();
+        let trait_ref = tcx.impl_trait_ref(impl_def_id).skip_binder();
         let vec: &mut Vec<DefId>;
-        if let Some(st) = fast_reject::simplify_type(tcx, trait_ref.self_ty(), false) {
+        if let Some(st) =
+            fast_reject::simplify_type(tcx, trait_ref.self_ty(), TreatParams::InstantiateWithInfer)
+        {
             debug!("remove_existing: impl_def_id={:?} st={:?}", impl_def_id, st);
-            vec = self.nonblanket_impls.get_mut(&st).unwrap();
+            vec = self.non_blanket_impls.get_mut(&st).unwrap();
         } else {
             debug!("remove_existing: impl_def_id={:?} st=None", impl_def_id);
             vec = &mut self.blanket_impls;
@@ -77,16 +72,16 @@ impl ChildrenExt for Children {
 
     /// Attempt to insert an impl into this set of children, while comparing for
     /// specialization relationships.
+    #[instrument(level = "debug", skip(self, tcx), ret)]
     fn insert(
         &mut self,
         tcx: TyCtxt<'tcx>,
         impl_def_id: DefId,
         simplified_self: Option<SimplifiedType>,
-    ) -> Result<Inserted, OverlapError> {
+        overlap_mode: OverlapMode,
+    ) -> Result<Inserted<'tcx>, OverlapError<'tcx>> {
         let mut last_lint = None;
         let mut replace_children = Vec::new();
-
-        debug!("insert(impl_def_id={:?}, simplified_self={:?})", impl_def_id, simplified_self,);
 
         let possible_siblings = match simplified_self {
             Some(st) => PotentialSiblings::Filtered(filtered_children(self, st)),
@@ -94,45 +89,38 @@ impl ChildrenExt for Children {
         };
 
         for possible_sibling in possible_siblings {
-            debug!(
-                "insert: impl_def_id={:?}, simplified_self={:?}, possible_sibling={:?}",
-                impl_def_id, simplified_self, possible_sibling,
-            );
+            debug!(?possible_sibling);
 
-            let create_overlap_error = |overlap: traits::coherence::OverlapResult<'_>| {
+            let create_overlap_error = |overlap: traits::coherence::OverlapResult<'tcx>| {
                 let trait_ref = overlap.impl_header.trait_ref.unwrap();
                 let self_ty = trait_ref.self_ty();
 
-                // FIXME: should postpone string formatting until we decide to actually emit.
-                with_no_trimmed_paths(|| OverlapError {
+                OverlapError {
                     with_impl: possible_sibling,
-                    trait_desc: trait_ref.print_only_trait_path().to_string(),
+                    trait_ref,
                     // Only report the `Self` type if it has at least
                     // some outer concrete shell; otherwise, it's
                     // not adding much information.
-                    self_desc: if self_ty.has_concrete_skeleton() {
-                        Some(self_ty.to_string())
-                    } else {
-                        None
-                    },
+                    self_ty: self_ty.has_concrete_skeleton().then_some(self_ty),
                     intercrate_ambiguity_causes: overlap.intercrate_ambiguity_causes,
                     involves_placeholder: overlap.involves_placeholder,
-                })
+                    overflowing_predicates: overlap.overflowing_predicates,
+                }
             };
 
-            let report_overlap_error = |overlap: traits::coherence::OverlapResult<'_>,
+            let report_overlap_error = |overlap: traits::coherence::OverlapResult<'tcx>,
                                         last_lint: &mut _| {
                 // Found overlap, but no specialization; error out or report future-compat warning.
 
                 // Do we *still* get overlap if we disable the future-incompatible modes?
-                let should_err = traits::overlapping_impls(
+                let should_err = traits::overlapping_trait_impls(
                     tcx,
                     possible_sibling,
                     impl_def_id,
                     traits::SkipLeakCheck::default(),
-                    |_| true,
-                    || false,
-                );
+                    overlap_mode,
+                )
+                .is_some();
 
                 let error = create_overlap_error(overlap);
 
@@ -149,44 +137,34 @@ impl ChildrenExt for Children {
             };
 
             let last_lint_mut = &mut last_lint;
-            let (le, ge) = traits::overlapping_impls(
+            let (le, ge) = traits::overlapping_trait_impls(
                 tcx,
                 possible_sibling,
                 impl_def_id,
                 traits::SkipLeakCheck::Yes,
-                |overlap| {
-                    if let Some(overlap_kind) =
-                        tcx.impls_are_allowed_to_overlap(impl_def_id, possible_sibling)
-                    {
-                        match overlap_kind {
-                            ty::ImplOverlapKind::Permitted { marker: _ } => {}
-                            ty::ImplOverlapKind::Issue33140 => {
-                                *last_lint_mut = Some(FutureCompatOverlapError {
-                                    error: create_overlap_error(overlap),
-                                    kind: FutureCompatOverlapErrorKind::Issue33140,
-                                });
-                            }
-                        }
-
-                        return Ok((false, false));
+                overlap_mode,
+            )
+            .map_or(Ok((false, false)), |overlap| {
+                if let Some(overlap_kind) =
+                    tcx.impls_are_allowed_to_overlap(impl_def_id, possible_sibling)
+                {
+                    match overlap_kind {
+                        ty::ImplOverlapKind::Permitted { marker: _ } => {}
                     }
 
-                    let le = tcx.specializes((impl_def_id, possible_sibling));
-                    let ge = tcx.specializes((possible_sibling, impl_def_id));
+                    return Ok((false, false));
+                }
 
-                    if le == ge {
-                        report_overlap_error(overlap, last_lint_mut)
-                    } else {
-                        Ok((le, ge))
-                    }
-                },
-                || Ok((false, false)),
-            )?;
+                let le = tcx.specializes((impl_def_id, possible_sibling));
+                let ge = tcx.specializes((possible_sibling, impl_def_id));
+
+                if le == ge { report_overlap_error(overlap, last_lint_mut) } else { Ok((le, ge)) }
+            })?;
 
             if le && !ge {
                 debug!(
                     "descending as child of TraitRef {:?}",
-                    tcx.impl_trait_ref(possible_sibling).unwrap()
+                    tcx.impl_trait_ref(possible_sibling).instantiate_identity()
                 );
 
                 // The impl specializes `possible_sibling`.
@@ -194,7 +172,7 @@ impl ChildrenExt for Children {
             } else if ge && !le {
                 debug!(
                     "placing as parent of TraitRef {:?}",
-                    tcx.impl_trait_ref(possible_sibling).unwrap()
+                    tcx.impl_trait_ref(possible_sibling).instantiate_identity()
                 );
 
                 replace_children.push(possible_sibling);
@@ -215,16 +193,13 @@ impl ChildrenExt for Children {
     }
 }
 
-fn iter_children(children: &mut Children) -> impl Iterator<Item = DefId> + '_ {
-    let nonblanket = children.nonblanket_impls.iter_mut().flat_map(|(_, v)| v.iter());
+fn iter_children(children: &Children) -> impl Iterator<Item = DefId> {
+    let nonblanket = children.non_blanket_impls.iter().flat_map(|(_, v)| v.iter());
     children.blanket_impls.iter().chain(nonblanket).cloned()
 }
 
-fn filtered_children(
-    children: &mut Children,
-    st: SimplifiedType,
-) -> impl Iterator<Item = DefId> + '_ {
-    let nonblanket = children.nonblanket_impls.entry(st).or_default().iter();
+fn filtered_children(children: &mut Children, st: SimplifiedType) -> impl Iterator<Item = DefId> {
+    let nonblanket = children.non_blanket_impls.entry(st).or_default().iter();
     children.blanket_impls.iter().chain(nonblanket).cloned()
 }
 
@@ -253,7 +228,8 @@ where
     }
 }
 
-pub trait GraphExt {
+#[extension(pub trait GraphExt<'tcx>)]
+impl<'tcx> Graph {
     /// Insert a local impl into the specialization graph. If an existing impl
     /// conflicts with it (has overlap, but neither specializes the other),
     /// information about the area of overlap is returned in the `Err`.
@@ -261,24 +237,12 @@ pub trait GraphExt {
         &mut self,
         tcx: TyCtxt<'tcx>,
         impl_def_id: DefId,
-    ) -> Result<Option<FutureCompatOverlapError>, OverlapError>;
-
-    /// Insert cached metadata mapping from a child impl back to its parent.
-    fn record_impl_from_cstore(&mut self, tcx: TyCtxt<'tcx>, parent: DefId, child: DefId);
-}
-
-impl GraphExt for Graph {
-    /// Insert a local impl into the specialization graph. If an existing impl
-    /// conflicts with it (has overlap, but neither specializes the other),
-    /// information about the area of overlap is returned in the `Err`.
-    fn insert(
-        &mut self,
-        tcx: TyCtxt<'tcx>,
-        impl_def_id: DefId,
-    ) -> Result<Option<FutureCompatOverlapError>, OverlapError> {
+        overlap_mode: OverlapMode,
+    ) -> Result<Option<FutureCompatOverlapError<'tcx>>, OverlapError<'tcx>> {
         assert!(impl_def_id.is_local());
 
-        let trait_ref = tcx.impl_trait_ref(impl_def_id).unwrap();
+        // FIXME: use `EarlyBinder` in `self.children`
+        let trait_ref = tcx.impl_trait_ref(impl_def_id).skip_binder();
         let trait_def_id = trait_ref.def_id;
 
         debug!(
@@ -304,21 +268,24 @@ impl GraphExt for Graph {
 
         let mut parent = trait_def_id;
         let mut last_lint = None;
-        let simplified = fast_reject::simplify_type(tcx, trait_ref.self_ty(), false);
+        let simplified =
+            fast_reject::simplify_type(tcx, trait_ref.self_ty(), TreatParams::InstantiateWithInfer);
 
         // Descend the specialization tree, where `parent` is the current parent node.
         loop {
-            use self::Inserted::*;
-
-            let insert_result =
-                self.children.entry(parent).or_default().insert(tcx, impl_def_id, simplified)?;
+            let insert_result = self.children.entry(parent).or_default().insert(
+                tcx,
+                impl_def_id,
+                simplified,
+                overlap_mode,
+            )?;
 
             match insert_result {
-                BecameNewSibling(opt_lint) => {
+                Inserted::BecameNewSibling(opt_lint) => {
                     last_lint = opt_lint;
                     break;
                 }
-                ReplaceChildren(grand_children_to_be) => {
+                Inserted::ReplaceChildren(grand_children_to_be) => {
                     // We currently have
                     //
                     //     P
@@ -357,7 +324,7 @@ impl GraphExt for Graph {
                     }
                     break;
                 }
-                ShouldRecurseOn(new_parent) => {
+                Inserted::ShouldRecurseOn(new_parent) => {
                     parent = new_parent;
                 }
             }
@@ -377,5 +344,67 @@ impl GraphExt for Graph {
         }
 
         self.children.entry(parent).or_default().insert_blindly(tcx, child);
+    }
+}
+
+/// Locate the definition of an associated type in the specialization hierarchy,
+/// starting from the given impl.
+pub(crate) fn assoc_def(
+    tcx: TyCtxt<'_>,
+    impl_def_id: DefId,
+    assoc_def_id: DefId,
+) -> Result<LeafDef, ErrorGuaranteed> {
+    let trait_def_id = tcx.impl_trait_id(impl_def_id);
+    let trait_def = tcx.trait_def(trait_def_id);
+
+    // This function may be called while we are still building the
+    // specialization graph that is queried below (via TraitDef::ancestors()),
+    // so, in order to avoid unnecessary infinite recursion, we manually look
+    // for the associated item at the given impl.
+    // If there is no such item in that impl, this function will fail with a
+    // cycle error if the specialization graph is currently being built.
+    if let Some(&impl_item_id) = tcx.impl_item_implementor_ids(impl_def_id).get(&assoc_def_id) {
+        // Ensure that the impl is constrained, otherwise projection may give us
+        // bad unconstrained infer vars.
+        if let Some(impl_def_id) = impl_def_id.as_local() {
+            tcx.ensure_ok().enforce_impl_non_lifetime_params_are_constrained(impl_def_id)?;
+        }
+
+        let item = tcx.associated_item(impl_item_id);
+        let impl_node = Node::Impl(impl_def_id);
+        return Ok(LeafDef {
+            item,
+            defining_node: impl_node,
+            finalizing_node: if item.defaultness(tcx).is_default() {
+                None
+            } else {
+                Some(impl_node)
+            },
+        });
+    }
+
+    let ancestors = trait_def.ancestors(tcx, impl_def_id)?;
+    if let Some(assoc_item) = ancestors.leaf_def(tcx, assoc_def_id) {
+        // Ensure that the impl is constrained, otherwise projection may give us
+        // bad unconstrained infer vars.
+        if let ty::AssocContainer::TraitImpl(_) = assoc_item.item.container
+            && let Some(impl_def_id) = assoc_item.item.container_id(tcx).as_local()
+        {
+            tcx.ensure_ok().enforce_impl_non_lifetime_params_are_constrained(impl_def_id)?;
+        }
+
+        Ok(assoc_item)
+    } else {
+        // This is saying that neither the trait nor
+        // the impl contain a definition for this
+        // associated type. Normally this situation
+        // could only arise through a compiler bug --
+        // if the user wrote a bad item name, it
+        // should have failed during HIR ty lowering.
+        bug!(
+            "No associated type `{}` for {}",
+            tcx.item_name(assoc_def_id),
+            tcx.def_path_str(impl_def_id)
+        )
     }
 }

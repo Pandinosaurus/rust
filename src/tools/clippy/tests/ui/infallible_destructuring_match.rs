@@ -1,13 +1,15 @@
-// run-rustfix
 #![feature(exhaustive_patterns, never_type)]
 #![allow(dead_code, unreachable_code, unused_variables)]
-#![allow(clippy::let_and_return)]
+#![allow(clippy::let_and_return, clippy::uninhabited_references)]
 
 enum SingleVariantEnum {
     Variant(i32),
 }
 
 struct TupleStruct(i32);
+
+struct NonCopy;
+struct TupleStructWithNonCopy(NonCopy);
 
 enum EmptyEnum {}
 
@@ -24,6 +26,7 @@ fn infallible_destructuring_match_enum() {
 
     // This should lint!
     let data = match wrapper {
+        //~^ infallible_destructuring_match
         SingleVariantEnum::Variant(i) => i,
     };
 
@@ -56,6 +59,7 @@ fn infallible_destructuring_match_struct() {
 
     // This should lint!
     let data = match wrapper {
+        //~^ infallible_destructuring_match
         TupleStruct(i) => i,
     };
 
@@ -75,6 +79,18 @@ fn infallible_destructuring_match_struct() {
     let TupleStruct(data) = wrapper;
 }
 
+fn infallible_destructuring_match_struct_with_noncopy() {
+    let wrapper = TupleStructWithNonCopy(NonCopy);
+
+    // This should lint! (keeping `ref` in the suggestion)
+    let data = match wrapper {
+        //~^ infallible_destructuring_match
+        TupleStructWithNonCopy(ref n) => n,
+    };
+
+    let TupleStructWithNonCopy(ref data) = wrapper;
+}
+
 macro_rules! match_never_enum {
     ($param:expr) => {
         let data = match $param {
@@ -88,6 +104,7 @@ fn never_enum() {
 
     // This should lint!
     let data = match wrapper {
+        //~^ infallible_destructuring_match
         Ok(i) => i,
     };
 

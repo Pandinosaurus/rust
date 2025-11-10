@@ -1,4 +1,3 @@
-// edition:2018
 #![warn(clippy::wrong_self_convention)]
 #![allow(dead_code)]
 
@@ -13,6 +12,8 @@ mod issue6758 {
     impl<T> Test<T> {
         // If a method starts with `to_` and not ends with `_mut` it should expect `&self`
         pub fn to_many(&mut self) -> Option<&mut [T]> {
+            //~^ wrong_self_convention
+
             match self {
                 Self::Many(data) => Some(data),
                 _ => None,
@@ -21,6 +22,8 @@ mod issue6758 {
 
         // If a method starts with `to_` and ends with `_mut` it should expect `&mut self`
         pub fn to_many_mut(&self) -> Option<&[T]> {
+            //~^ wrong_self_convention
+
             match self {
                 Self::Many(data) => Some(data),
                 _ => None,

@@ -5,7 +5,13 @@ If your PR only includes internal changes, you can just write
 `changelog: none`. Otherwise, please write a short comment
 explaining your change.
 
-If your PR fixes an issue, you can add "fixes #issue_number" into this
+It's also helpful for us that the lint name is put within backticks (`` ` ` ``),
+and then encapsulated by square brackets (`[]`), for example:
+```
+changelog: [`lint_name`]: your change
+```
+
+If your PR fixes an issue, you can add `fixes #issue_number` into this
 PR description. This way the issue will be automatically closed when
 your PR is merged.
 
@@ -29,4 +35,5 @@ Delete this line and everything above before opening your PR.
 ---
 
 *Please write a short comment explaining your change (or "none" for internal only changes)*
+
 changelog:

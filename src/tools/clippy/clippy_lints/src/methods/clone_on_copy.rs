@@ -1,117 +1,93 @@
-use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::sugg;
+use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::source::snippet_with_context;
 use clippy_utils::ty::is_copy;
 use rustc_errors::Applicability;
-use rustc_hir as hir;
+use rustc_hir::{BindingMode, ByRef, Expr, ExprKind, MatchSource, Node, PatKind};
 use rustc_lint::LateContext;
 use rustc_middle::ty;
-use rustc_span::symbol::{sym, Symbol};
-use std::iter;
+use rustc_middle::ty::adjustment::Adjust;
+use rustc_middle::ty::print::with_forced_trimmed_paths;
 
-use super::CLONE_DOUBLE_REF;
 use super::CLONE_ON_COPY;
 
 /// Checks for the `CLONE_ON_COPY` lint.
-pub(super) fn check(cx: &LateContext<'_>, expr: &hir::Expr<'_>, method_name: Symbol, args: &[hir::Expr<'_>]) {
-    if !(args.len() == 1 && method_name == sym::clone) {
+pub(super) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, receiver: &Expr<'_>) {
+    if cx
+        .typeck_results()
+        .type_dependent_def_id(expr.hir_id)
+        .and_then(|id| cx.tcx.trait_of_assoc(id))
+        .zip(cx.tcx.lang_items().clone_trait())
+        .is_none_or(|(x, y)| x != y)
+    {
         return;
     }
-    let arg = &args[0];
-    let arg_ty = cx.typeck_results().expr_ty_adjusted(&args[0]);
+    let arg_adjustments = cx.typeck_results().expr_adjustments(receiver);
+    let arg_ty = arg_adjustments
+        .last()
+        .map_or_else(|| cx.typeck_results().expr_ty(receiver), |a| a.target);
+
     let ty = cx.typeck_results().expr_ty(expr);
-    if let ty::Ref(_, inner, _) = arg_ty.kind() {
-        if let ty::Ref(_, innermost, _) = inner.kind() {
-            span_lint_and_then(
-                cx,
-                CLONE_DOUBLE_REF,
-                expr.span,
-                &format!(
-                    "using `clone` on a double-reference; \
-                    this will copy the reference of type `{}` instead of cloning the inner type",
-                    ty
-                ),
-                |diag| {
-                    if let Some(snip) = sugg::Sugg::hir_opt(cx, arg) {
-                        let mut ty = innermost;
-                        let mut n = 0;
-                        while let ty::Ref(_, inner, _) = ty.kind() {
-                            ty = inner;
-                            n += 1;
-                        }
-                        let refs: String = iter::repeat('&').take(n + 1).collect();
-                        let derefs: String = iter::repeat('*').take(n).collect();
-                        let explicit = format!("<{}{}>::clone({})", refs, ty, snip);
-                        diag.span_suggestion(
-                            expr.span,
-                            "try dereferencing it",
-                            format!("{}({}{}).clone()", refs, derefs, snip.deref()),
-                            Applicability::MaybeIncorrect,
-                        );
-                        diag.span_suggestion(
-                            expr.span,
-                            "or try being explicit if you are sure, that you want to clone a reference",
-                            explicit,
-                            Applicability::MaybeIncorrect,
-                        );
-                    }
-                },
-            );
-            return; // don't report clone_on_copy
-        }
+    if let ty::Ref(_, inner, _) = arg_ty.kind()
+        && let ty::Ref(..) = inner.kind()
+    {
+        return; // don't report clone_on_copy
     }
 
     if is_copy(cx, ty) {
-        let snip;
-        if let Some(snippet) = sugg::Sugg::hir_opt(cx, arg) {
-            let parent = cx.tcx.hir().get_parent_node(expr.hir_id);
-            match &cx.tcx.hir().get(parent) {
-                hir::Node::Expr(parent) => match parent.kind {
-                    // &*x is a nop, &x.clone() is not
-                    hir::ExprKind::AddrOf(..) => return,
-                    // (*x).func() is useless, x.clone().func() can work in case func borrows mutably
-                    hir::ExprKind::MethodCall(_, _, parent_args, _) if expr.hir_id == parent_args[0].hir_id => {
-                        return;
-                    },
-
-                    _ => {},
+        let parent_is_suffix_expr = match cx.tcx.parent_hir_node(expr.hir_id) {
+            Node::Expr(parent) => match parent.kind {
+                // &*x is a nop, &x.clone() is not
+                ExprKind::AddrOf(..) => return,
+                // (*x).func() is useless, x.clone().func() can work in case func borrows self
+                ExprKind::MethodCall(_, self_arg, ..)
+                    if expr.hir_id == self_arg.hir_id && ty != cx.typeck_results().expr_ty_adjusted(expr) =>
+                {
+                    return;
                 },
-                hir::Node::Stmt(stmt) => {
-                    if let hir::StmtKind::Local(ref loc) = stmt.kind {
-                        if let hir::PatKind::Ref(..) = loc.pat.kind {
-                            // let ref y = *x borrows x, let ref y = x.clone() does not
-                            return;
-                        }
-                    }
-                },
-                _ => {},
-            }
+                // ? is a Call, makes sure not to rec *x?, but rather (*x)?
+                ExprKind::Call(hir_callee, [_]) => matches!(
+                    hir_callee.kind,
+                    ExprKind::Path(qpath)
+                    if cx.tcx.qpath_is_lang_item(qpath, rustc_hir::LangItem::TryTraitBranch)
+                ),
+                ExprKind::MethodCall(_, self_arg, ..) if expr.hir_id == self_arg.hir_id => true,
+                ExprKind::Match(_, _, MatchSource::TryDesugar(_) | MatchSource::AwaitDesugar)
+                | ExprKind::Field(..)
+                | ExprKind::Index(..) => true,
+                _ => false,
+            },
+            // local binding capturing a reference
+            Node::LetStmt(l) if matches!(l.pat.kind, PatKind::Binding(BindingMode(ByRef::Yes(..), _), ..)) => {
+                return;
+            },
+            _ => false,
+        };
 
-            // x.clone() might have dereferenced x, possibly through Deref impls
-            if cx.typeck_results().expr_ty(arg) == ty {
-                snip = Some(("try removing the `clone` call", format!("{}", snippet)));
-            } else {
-                let deref_count = cx
-                    .typeck_results()
-                    .expr_adjustments(arg)
-                    .iter()
-                    .filter(|adj| matches!(adj.kind, ty::adjustment::Adjust::Deref(_)))
-                    .count();
-                let derefs: String = iter::repeat('*').take(deref_count).collect();
-                snip = Some(("try dereferencing it", format!("{}{}", derefs, snippet)));
-            }
+        let mut app = Applicability::MachineApplicable;
+        let snip = snippet_with_context(cx, receiver.span, expr.span.ctxt(), "_", &mut app).0;
+
+        let deref_count = arg_adjustments
+            .iter()
+            .take_while(|adj| matches!(adj.kind, Adjust::Deref(_)))
+            .count();
+        let (help, sugg) = if deref_count == 0 {
+            ("try removing the `clone` call", snip.into())
+        } else if parent_is_suffix_expr {
+            ("try dereferencing it", format!("({}{snip})", "*".repeat(deref_count)))
         } else {
-            snip = None;
-        }
-        span_lint_and_then(
+            ("try dereferencing it", format!("{}{snip}", "*".repeat(deref_count)))
+        };
+
+        span_lint_and_sugg(
             cx,
             CLONE_ON_COPY,
             expr.span,
-            &format!("using `clone` on type `{}` which implements the `Copy` trait", ty),
-            |diag| {
-                if let Some((text, snip)) = snip {
-                    diag.span_suggestion(expr.span, text, snip, Applicability::MachineApplicable);
-                }
-            },
+            with_forced_trimmed_paths!(format!(
+                "using `clone` on type `{ty}` which implements the `Copy` trait"
+            )),
+            help,
+            sugg,
+            app,
         );
     }
 }

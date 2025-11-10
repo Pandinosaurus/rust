@@ -1,180 +1,203 @@
-use rustc_ast::ptr::P;
-use rustc_ast::token::{self, Nonterminal, NonterminalKind, Token};
-use rustc_ast_pretty::pprust;
+use rustc_ast::token::NtExprKind::*;
+use rustc_ast::token::NtPatKind::*;
+use rustc_ast::token::{self, InvisibleOrigin, MetaVarKind, NonterminalKind, Token};
 use rustc_errors::PResult;
-use rustc_span::symbol::{kw, Ident};
+use rustc_span::{Ident, kw};
 
-use crate::parser::pat::RecoverComma;
-use crate::parser::{FollowedByType, ForceCollect, Parser, PathStyle};
+use crate::errors::UnexpectedNonterminal;
+use crate::parser::pat::{CommaRecoveryMode, RecoverColon, RecoverComma};
+use crate::parser::{FollowedByType, ForceCollect, ParseNtResult, Parser, PathStyle};
 
 impl<'a> Parser<'a> {
     /// Checks whether a non-terminal may begin with a particular token.
     ///
-    /// Returning `false` is a *stability guarantee* that such a matcher will *never* begin with that
-    /// token. Be conservative (return true) if not sure.
+    /// Returning `false` is a *stability guarantee* that such a matcher will *never* begin with
+    /// that token. Be conservative (return true) if not sure. Inlined because it has a single call
+    /// site.
+    #[inline]
     pub fn nonterminal_may_begin_with(kind: NonterminalKind, token: &Token) -> bool {
         /// Checks whether the non-terminal may contain a single (non-keyword) identifier.
-        fn may_be_ident(nt: &token::Nonterminal) -> bool {
-            match *nt {
-                token::NtItem(_) | token::NtBlock(_) | token::NtVis(_) | token::NtLifetime(_) => {
-                    false
-                }
-                _ => true,
+        fn may_be_ident(kind: MetaVarKind) -> bool {
+            match kind {
+                MetaVarKind::Stmt
+                | MetaVarKind::Pat(_)
+                | MetaVarKind::Expr { .. }
+                | MetaVarKind::Ty { .. }
+                | MetaVarKind::Literal // `true`, `false`
+                | MetaVarKind::Meta { .. }
+                | MetaVarKind::Path => true,
+
+                MetaVarKind::Item
+                | MetaVarKind::Block
+                | MetaVarKind::Vis => false,
+
+                MetaVarKind::Ident
+                | MetaVarKind::Lifetime
+                | MetaVarKind::TT => unreachable!(),
             }
         }
 
         match kind {
-            NonterminalKind::Expr => {
+            // `expr_2021` and earlier
+            NonterminalKind::Expr(Expr2021 { .. }) => {
                 token.can_begin_expr()
                 // This exception is here for backwards compatibility.
                 && !token.is_keyword(kw::Let)
                 // This exception is here for backwards compatibility.
                 && !token.is_keyword(kw::Const)
             }
+            // Current edition expressions
+            NonterminalKind::Expr(Expr) => {
+                // In Edition 2024, `_` is considered an expression, so we
+                // need to allow it here because `token.can_begin_expr()` does
+                // not consider `_` to be an expression.
+                //
+                // Because `can_begin_expr` is used elsewhere, we need to reduce
+                // the scope of where the `_` is considered an expression to
+                // just macro parsing code.
+                (token.can_begin_expr() || token.is_keyword(kw::Underscore))
+                // This exception is here for backwards compatibility.
+                && !token.is_keyword(kw::Let)
+            }
             NonterminalKind::Ty => token.can_begin_type(),
             NonterminalKind::Ident => get_macro_ident(token).is_some(),
             NonterminalKind::Literal => token.can_begin_literal_maybe_minus(),
             NonterminalKind::Vis => match token.kind {
-                // The follow-set of :vis + "priv" keyword + interpolated
-                token::Comma | token::Ident(..) | token::Interpolated(..) => true,
+                // The follow-set of :vis + "priv" keyword + interpolated/metavar-expansion.
+                token::Comma
+                | token::Ident(..)
+                | token::NtIdent(..)
+                | token::NtLifetime(..)
+                | token::OpenInvisible(InvisibleOrigin::MetaVar(_)) => true,
                 _ => token.can_begin_type(),
             },
-            NonterminalKind::Block => match token.kind {
-                token::OpenDelim(token::Brace) => true,
-                token::Interpolated(ref nt) => !matches!(
-                    **nt,
-                    token::NtItem(_)
-                        | token::NtPat(_)
-                        | token::NtTy(_)
-                        | token::NtIdent(..)
-                        | token::NtMeta(_)
-                        | token::NtPath(_)
-                        | token::NtVis(_)
-                ),
-                _ => false,
-            },
-            NonterminalKind::Path | NonterminalKind::Meta => match token.kind {
-                token::ModSep | token::Ident(..) => true,
-                token::Interpolated(ref nt) => match **nt {
-                    token::NtPath(_) | token::NtMeta(_) => true,
-                    _ => may_be_ident(&nt),
+            NonterminalKind::Block => match &token.kind {
+                token::OpenBrace => true,
+                token::NtLifetime(..) => true,
+                token::OpenInvisible(InvisibleOrigin::MetaVar(k)) => match k {
+                    MetaVarKind::Block
+                    | MetaVarKind::Stmt
+                    | MetaVarKind::Expr { .. }
+                    | MetaVarKind::Literal => true,
+                    MetaVarKind::Item
+                    | MetaVarKind::Pat(_)
+                    | MetaVarKind::Ty { .. }
+                    | MetaVarKind::Meta { .. }
+                    | MetaVarKind::Path
+                    | MetaVarKind::Vis => false,
+                    MetaVarKind::Lifetime | MetaVarKind::Ident | MetaVarKind::TT => {
+                        unreachable!()
+                    }
                 },
                 _ => false,
             },
-            NonterminalKind::Pat2015 { .. } | NonterminalKind::Pat2021 { .. } => match token.kind {
-                token::Ident(..) |                  // box, ref, mut, and other identifiers (can stricten)
-                token::OpenDelim(token::Paren) |    // tuple pattern
-                token::OpenDelim(token::Bracket) |  // slice pattern
-                token::BinOp(token::And) |          // reference
-                token::BinOp(token::Minus) |        // negative literal
-                token::AndAnd |                     // double reference
-                token::Literal(..) |                // literal
-                token::DotDot |                     // range pattern (future compat)
-                token::DotDotDot |                  // range pattern (future compat)
-                token::ModSep |                     // path
-                token::Lt |                         // path (UFCS constant)
-                token::BinOp(token::Shl) => true,   // path (double UFCS)
-                // leading vert `|` or-pattern
-                token::BinOp(token::Or) =>  matches!(kind, NonterminalKind::Pat2021 {..}),
-                token::Interpolated(ref nt) => may_be_ident(nt),
+            NonterminalKind::Path | NonterminalKind::Meta => match &token.kind {
+                token::PathSep | token::Ident(..) | token::NtIdent(..) => true,
+                token::OpenInvisible(InvisibleOrigin::MetaVar(kind)) => may_be_ident(*kind),
                 _ => false,
             },
-            NonterminalKind::Lifetime => match token.kind {
-                token::Lifetime(_) => true,
-                token::Interpolated(ref nt) => {
-                    matches!(**nt, token::NtLifetime(_) | token::NtTT(_))
-                }
+            NonterminalKind::Pat(pat_kind) => token.can_begin_pattern(pat_kind),
+            NonterminalKind::Lifetime => match &token.kind {
+                token::Lifetime(..) | token::NtLifetime(..) => true,
                 _ => false,
             },
             NonterminalKind::TT | NonterminalKind::Item | NonterminalKind::Stmt => {
-                !matches!(token.kind, token::CloseDelim(_))
+                token.kind.close_delim().is_none()
             }
         }
     }
 
-    /// Parse a non-terminal (e.g. MBE `:pat` or `:ident`).
-    pub fn parse_nonterminal(&mut self, kind: NonterminalKind) -> PResult<'a, Nonterminal> {
-        // Any `Nonterminal` which stores its tokens (currently `NtItem` and `NtExpr`)
-        // needs to have them force-captured here.
+    /// Parse a non-terminal (e.g. MBE `:pat` or `:ident`). Inlined because there is only one call
+    /// site.
+    #[inline]
+    pub fn parse_nonterminal(&mut self, kind: NonterminalKind) -> PResult<'a, ParseNtResult> {
         // A `macro_rules!` invocation may pass a captured item/expr to a proc-macro,
         // which requires having captured tokens available. Since we cannot determine
         // in advance whether or not a proc-macro will be (transitively) invoked,
-        // we always capture tokens for any `Nonterminal` which needs them.
-        Ok(match kind {
+        // we always capture tokens for any nonterminal that needs them.
+        match kind {
+            // Note that TT is treated differently to all the others.
+            NonterminalKind::TT => Ok(ParseNtResult::Tt(self.parse_token_tree())),
             NonterminalKind::Item => match self.parse_item(ForceCollect::Yes)? {
-                Some(item) => token::NtItem(item),
-                None => {
-                    return Err(self.struct_span_err(self.token.span, "expected an item keyword"));
-                }
+                Some(item) => Ok(ParseNtResult::Item(item)),
+                None => Err(self.dcx().create_err(UnexpectedNonterminal::Item(self.token.span))),
             },
             NonterminalKind::Block => {
                 // While a block *expression* may have attributes (e.g. `#[my_attr] { ... }`),
                 // the ':block' matcher does not support them
-                token::NtBlock(self.collect_tokens_no_attrs(|this| this.parse_block())?)
+                Ok(ParseNtResult::Block(self.collect_tokens_no_attrs(|this| this.parse_block())?))
             }
             NonterminalKind::Stmt => match self.parse_stmt(ForceCollect::Yes)? {
-                Some(s) => token::NtStmt(s),
+                Some(stmt) => Ok(ParseNtResult::Stmt(Box::new(stmt))),
                 None => {
-                    return Err(self.struct_span_err(self.token.span, "expected a statement"));
+                    Err(self.dcx().create_err(UnexpectedNonterminal::Statement(self.token.span)))
                 }
             },
-            NonterminalKind::Pat2015 { .. } | NonterminalKind::Pat2021 { .. } => {
-                token::NtPat(self.collect_tokens_no_attrs(|this| match kind {
-                    NonterminalKind::Pat2015 { .. } => this.parse_pat_no_top_alt(None),
-                    NonterminalKind::Pat2021 { .. } => {
-                        this.parse_pat_allow_top_alt(None, RecoverComma::No)
-                    }
-                    _ => unreachable!(),
-                })?)
+            NonterminalKind::Pat(pat_kind) => Ok(ParseNtResult::Pat(
+                self.collect_tokens_no_attrs(|this| match pat_kind {
+                    PatParam { .. } => this.parse_pat_no_top_alt(None, None),
+                    PatWithOr => this.parse_pat_no_top_guard(
+                        None,
+                        RecoverComma::No,
+                        RecoverColon::No,
+                        CommaRecoveryMode::EitherTupleOrPipe,
+                    ),
+                })
+                .map(Box::new)?,
+                pat_kind,
+            )),
+            NonterminalKind::Expr(expr_kind) => {
+                Ok(ParseNtResult::Expr(self.parse_expr_force_collect()?, expr_kind))
             }
-
-            NonterminalKind::Expr => token::NtExpr(self.parse_expr_force_collect()?),
             NonterminalKind::Literal => {
-                // The `:literal` matcher does not support attributes
-                token::NtLiteral(
+                // The `:literal` matcher does not support attributes.
+                Ok(ParseNtResult::Literal(
                     self.collect_tokens_no_attrs(|this| this.parse_literal_maybe_minus())?,
-                )
+                ))
             }
-
-            NonterminalKind::Ty => {
-                token::NtTy(self.collect_tokens_no_attrs(|this| this.parse_ty())?)
-            }
-            // this could be handled like a token, since it is one
+            NonterminalKind::Ty => Ok(ParseNtResult::Ty(
+                self.collect_tokens_no_attrs(|this| this.parse_ty_no_question_mark_recover())?,
+            )),
+            // This could be handled like a token, since it is one.
             NonterminalKind::Ident => {
                 if let Some((ident, is_raw)) = get_macro_ident(&self.token) {
                     self.bump();
-                    token::NtIdent(ident, is_raw)
+                    Ok(ParseNtResult::Ident(ident, is_raw))
                 } else {
-                    let token_str = pprust::token_to_string(&self.token);
-                    let msg = &format!("expected ident, found {}", &token_str);
-                    return Err(self.struct_span_err(self.token.span, msg));
+                    Err(self.dcx().create_err(UnexpectedNonterminal::Ident {
+                        span: self.token.span,
+                        token: self.token,
+                    }))
                 }
             }
-            NonterminalKind::Path => token::NtPath(
+            NonterminalKind::Path => Ok(ParseNtResult::Path(Box::new(
                 self.collect_tokens_no_attrs(|this| this.parse_path(PathStyle::Type))?,
-            ),
+            ))),
             NonterminalKind::Meta => {
-                token::NtMeta(P(self.collect_tokens_no_attrs(|this| this.parse_attr_item(false))?))
+                Ok(ParseNtResult::Meta(Box::new(self.parse_attr_item(ForceCollect::Yes)?)))
             }
-            NonterminalKind::TT => token::NtTT(self.parse_token_tree()),
-            NonterminalKind::Vis => token::NtVis(
+            NonterminalKind::Vis => Ok(ParseNtResult::Vis(Box::new(
                 self.collect_tokens_no_attrs(|this| this.parse_visibility(FollowedByType::Yes))?,
-            ),
+            ))),
             NonterminalKind::Lifetime => {
-                if self.check_lifetime() {
-                    token::NtLifetime(self.expect_lifetime().ident)
+                // We want to keep `'keyword` parsing, just like `keyword` is still
+                // an ident for nonterminal purposes.
+                if let Some((ident, is_raw)) = self.token.lifetime() {
+                    self.bump();
+                    Ok(ParseNtResult::Lifetime(ident, is_raw))
                 } else {
-                    let token_str = pprust::token_to_string(&self.token);
-                    let msg = &format!("expected a lifetime, found `{}`", &token_str);
-                    return Err(self.struct_span_err(self.token.span, msg));
+                    Err(self.dcx().create_err(UnexpectedNonterminal::Lifetime {
+                        span: self.token.span,
+                        token: self.token,
+                    }))
                 }
             }
-        })
+        }
     }
 }
 
 /// The token is an identifier, but not `_`.
 /// We prohibit passing `_` to macros expecting `ident` for now.
-fn get_macro_ident(token: &Token) -> Option<(Ident, bool)> {
+fn get_macro_ident(token: &Token) -> Option<(Ident, token::IdentIsRaw)> {
     token.ident().filter(|(ident, _)| ident.name != kw::Underscore)
 }

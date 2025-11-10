@@ -2,52 +2,72 @@
 //! a literal `true` or `false` based on whether the given cfg matches the
 //! current compilation environment.
 
-use rustc_ast as ast;
-use rustc_ast::token;
 use rustc_ast::tokenstream::TokenStream;
-use rustc_attr as attr;
-use rustc_errors::DiagnosticBuilder;
-use rustc_expand::base::{self, *};
-use rustc_span::Span;
+use rustc_ast::{AttrStyle, token};
+use rustc_attr_parsing as attr;
+use rustc_attr_parsing::parser::MetaItemOrLitParser;
+use rustc_attr_parsing::{
+    AttributeParser, CFG_TEMPLATE, ParsedDescription, ShouldEmit, parse_cfg_entry,
+};
+use rustc_expand::base::{DummyResult, ExpandResult, ExtCtxt, MacEager, MacroExpanderResult};
+use rustc_hir::AttrPath;
+use rustc_hir::attrs::CfgEntry;
+use rustc_parse::exp;
+use rustc_span::{ErrorGuaranteed, Ident, Span};
 
-pub fn expand_cfg(
+use crate::errors;
+
+pub(crate) fn expand_cfg(
     cx: &mut ExtCtxt<'_>,
     sp: Span,
     tts: TokenStream,
-) -> Box<dyn base::MacResult + 'static> {
+) -> MacroExpanderResult<'static> {
     let sp = cx.with_def_site_ctxt(sp);
 
-    match parse_cfg(cx, sp, tts) {
+    ExpandResult::Ready(match parse_cfg(cx, sp, tts) {
         Ok(cfg) => {
-            let matches_cfg = attr::cfg_matches(&cfg, &cx.sess.parse_sess, cx.ecfg.features);
+            let matches_cfg = attr::eval_config_entry(
+                cx.sess,
+                &cfg,
+                cx.current_expansion.lint_node_id,
+                ShouldEmit::ErrorsAndLints,
+            )
+            .as_bool();
+
             MacEager::expr(cx.expr_bool(sp, matches_cfg))
         }
-        Err(mut err) => {
-            err.emit();
-            DummyResult::any(sp)
-        }
-    }
+        Err(guar) => DummyResult::any(sp, guar),
+    })
 }
 
-fn parse_cfg<'a>(
-    cx: &mut ExtCtxt<'a>,
-    sp: Span,
-    tts: TokenStream,
-) -> Result<ast::MetaItem, DiagnosticBuilder<'a>> {
-    let mut p = cx.new_parser_from_tts(tts);
-
-    if p.token == token::Eof {
-        let mut err = cx.struct_span_err(sp, "macro requires a cfg-pattern as an argument");
-        err.span_label(sp, "cfg-pattern required");
-        return Err(err);
+fn parse_cfg(cx: &ExtCtxt<'_>, span: Span, tts: TokenStream) -> Result<CfgEntry, ErrorGuaranteed> {
+    let mut parser = cx.new_parser_from_tts(tts);
+    if parser.token == token::Eof {
+        return Err(cx.dcx().emit_err(errors::RequiresCfgPattern { span }));
     }
 
-    let cfg = p.parse_meta_item()?;
+    let meta = MetaItemOrLitParser::parse_single(&mut parser, ShouldEmit::ErrorsAndLints)
+        .map_err(|diag| diag.emit())?;
+    let cfg = AttributeParser::parse_single_args(
+        cx.sess,
+        span,
+        span,
+        AttrStyle::Inner,
+        AttrPath { segments: vec![Ident::from_str("cfg")].into_boxed_slice(), span },
+        ParsedDescription::Macro,
+        span,
+        cx.current_expansion.lint_node_id,
+        Some(cx.ecfg.features),
+        ShouldEmit::ErrorsAndLints,
+        &meta,
+        parse_cfg_entry,
+        &CFG_TEMPLATE,
+    )?;
 
-    let _ = p.eat(&token::Comma);
+    let _ = parser.eat(exp!(Comma));
 
-    if !p.eat(&token::Eof) {
-        return Err(cx.struct_span_err(sp, "expected 1 cfg-pattern"));
+    if !parser.eat(exp!(Eof)) {
+        return Err(cx.dcx().emit_err(errors::OneCfgPattern { span }));
     }
 
     Ok(cfg)

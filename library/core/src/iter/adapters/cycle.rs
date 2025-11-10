@@ -1,4 +1,6 @@
-use crate::{iter::FusedIterator, ops::Try};
+use crate::iter::FusedIterator;
+use crate::num::NonZero;
+use crate::ops::Try;
 
 /// An iterator that repeats endlessly.
 ///
@@ -53,7 +55,7 @@ where
     fn try_fold<Acc, F, R>(&mut self, mut acc: Acc, mut f: F) -> R
     where
         F: FnMut(Acc, Self::Item) -> R,
-        R: Try<Ok = Acc>,
+        R: Try<Output = Acc>,
     {
         // fully iterate the current iterator. this is necessary because
         // `self.iter` may be empty even when `self.orig` isn't
@@ -77,6 +79,26 @@ where
             self.iter = self.orig.clone();
             acc = self.iter.try_fold(acc, &mut f)?;
         }
+    }
+
+    #[inline]
+    #[rustc_inherit_overflow_checks]
+    fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
+        let mut n = match self.iter.advance_by(n) {
+            Ok(()) => return Ok(()),
+            Err(rem) => rem.get(),
+        };
+
+        while n > 0 {
+            self.iter = self.orig.clone();
+            n = match self.iter.advance_by(n) {
+                Ok(()) => return Ok(()),
+                e @ Err(rem) if rem.get() == n => return e,
+                Err(rem) => rem.get(),
+            };
+        }
+
+        NonZero::new(n).map_or(Ok(()), Err)
     }
 
     // No `fold` override, because `fold` doesn't make much sense for `Cycle`,

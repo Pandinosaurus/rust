@@ -1,23 +1,22 @@
 // Namespace Handling.
 
-use super::utils::{debug_context, DIB};
+use rustc_codegen_ssa::debuginfo::type_names;
+use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{self, Instance};
 
+use super::utils::{DIB, debug_context};
 use crate::common::CodegenCx;
 use crate::llvm;
 use crate::llvm::debuginfo::DIScope;
-use rustc_hir::def_id::DefId;
-use rustc_hir::definitions::DefPathData;
 
-pub fn mangled_name_of_instance<'a, 'tcx>(
+pub(crate) fn mangled_name_of_instance<'a, 'tcx>(
     cx: &CodegenCx<'a, 'tcx>,
     instance: Instance<'tcx>,
 ) -> ty::SymbolName<'tcx> {
-    let tcx = cx.tcx;
-    tcx.symbol_name(instance)
+    cx.tcx.symbol_name(instance)
 }
 
-pub fn item_namespace(cx: &CodegenCx<'ll, '_>, def_id: DefId) -> &'ll DIScope {
+pub(crate) fn item_namespace<'ll>(cx: &CodegenCx<'ll, '_>, def_id: DefId) -> &'ll DIScope {
     if let Some(&scope) = debug_context(cx).namespace_map.borrow().get(&def_id) {
         return scope;
     }
@@ -27,26 +26,19 @@ pub fn item_namespace(cx: &CodegenCx<'ll, '_>, def_id: DefId) -> &'ll DIScope {
         .parent
         .map(|parent| item_namespace(cx, DefId { krate: def_id.krate, index: parent }));
 
-    let crate_name_as_str;
-    let name_to_string;
-    let namespace_name = match def_key.disambiguated_data.data {
-        DefPathData::CrateRoot => {
-            crate_name_as_str = cx.tcx.crate_name(def_id.krate).as_str();
-            &*crate_name_as_str
-        }
-        data => {
-            name_to_string = data.to_string();
-            &*name_to_string
-        }
+    let namespace_name_string = {
+        let mut output = String::with_capacity(64);
+        type_names::push_item_name(cx.tcx, def_id, false, &mut output);
+        output
     };
 
     let scope = unsafe {
-        llvm::LLVMRustDIBuilderCreateNameSpace(
+        llvm::LLVMDIBuilderCreateNameSpace(
             DIB(cx),
             parent_scope,
-            namespace_name.as_ptr().cast(),
-            namespace_name.len(),
-            false, // ExportSymbols (only relevant for C++ anonymous namespaces)
+            namespace_name_string.as_ptr(),
+            namespace_name_string.len(),
+            llvm::FALSE, // ExportSymbols (only relevant for C++ anonymous namespaces)
         )
     };
 

@@ -2,28 +2,23 @@
 mod tests;
 
 pub mod state;
-pub use state::{print_crate, AnnNode, Comments, PpAnn, PrintState, State};
+use std::borrow::Cow;
 
 use rustc_ast as ast;
-use rustc_ast::token::{Nonterminal, Token, TokenKind};
+use rustc_ast::token::{Token, TokenKind};
 use rustc_ast::tokenstream::{TokenStream, TokenTree};
-
-pub fn nonterminal_to_string(nt: &Nonterminal) -> String {
-    State::new().nonterminal_to_string(nt)
-}
+pub use state::{
+    AnnNode, Comments, PpAnn, PrintState, State, print_crate, print_crate_as_interface,
+};
 
 /// Print the token kind precisely, without converting `$crate` into its respective crate name.
-pub fn token_kind_to_string(tok: &TokenKind) -> String {
+pub fn token_kind_to_string(tok: &TokenKind) -> Cow<'static, str> {
     State::new().token_kind_to_string(tok)
 }
 
 /// Print the token precisely, without converting `$crate` into its respective crate name.
-pub fn token_to_string(token: &Token) -> String {
+pub fn token_to_string(token: &Token) -> Cow<'static, str> {
     State::new().token_to_string(token)
-}
-
-pub fn token_to_string_ext(token: &Token, convert_dollar_crate: bool) -> String {
-    State::new().token_to_string_ext(token, convert_dollar_crate)
 }
 
 pub fn ty_to_string(ty: &ast::Ty) -> String {
@@ -32,6 +27,10 @@ pub fn ty_to_string(ty: &ast::Ty) -> String {
 
 pub fn bounds_to_string(bounds: &[ast::GenericBound]) -> String {
     State::new().bounds_to_string(bounds)
+}
+
+pub fn where_bound_predicate_to_string(where_bound_predicate: &ast::WhereBoundPredicate) -> String {
+    State::new().where_bound_predicate_to_string(where_bound_predicate)
 }
 
 pub fn pat_to_string(pat: &ast::Pat) -> String {
@@ -50,16 +49,20 @@ pub fn tts_to_string(tokens: &TokenStream) -> String {
     State::new().tts_to_string(tokens)
 }
 
-pub fn stmt_to_string(stmt: &ast::Stmt) -> String {
-    State::new().stmt_to_string(stmt)
-}
-
 pub fn item_to_string(i: &ast::Item) -> String {
     State::new().item_to_string(i)
 }
 
-pub fn generic_params_to_string(generic_params: &[ast::GenericParam]) -> String {
-    State::new().generic_params_to_string(generic_params)
+pub fn assoc_item_to_string(i: &ast::AssocItem) -> String {
+    State::new().assoc_item_to_string(i)
+}
+
+pub fn foreign_item_to_string(i: &ast::ForeignItem) -> String {
+    State::new().foreign_item_to_string(i)
+}
+
+pub fn stmt_to_string(s: &ast::Stmt) -> String {
+    State::new().stmt_to_string(s)
 }
 
 pub fn path_to_string(p: &ast::Path) -> String {
@@ -74,26 +77,23 @@ pub fn vis_to_string(v: &ast::Visibility) -> String {
     State::new().vis_to_string(v)
 }
 
-pub fn block_to_string(blk: &ast::Block) -> String {
-    State::new().block_to_string(blk)
-}
-
-pub fn meta_list_item_to_string(li: &ast::NestedMetaItem) -> String {
+pub fn meta_list_item_to_string(li: &ast::MetaItemInner) -> String {
     State::new().meta_list_item_to_string(li)
-}
-
-pub fn attr_item_to_string(ai: &ast::AttrItem) -> String {
-    State::new().attr_item_to_string(ai)
 }
 
 pub fn attribute_to_string(attr: &ast::Attribute) -> String {
     State::new().attribute_to_string(attr)
 }
 
-pub fn param_to_string(arg: &ast::Param) -> String {
-    State::new().param_to_string(arg)
+pub fn to_string(f: impl FnOnce(&mut State<'_>)) -> String {
+    State::to_string(f)
 }
 
-pub fn to_string(f: impl FnOnce(&mut State<'_>)) -> String {
-    State::new().to_string(f)
+pub fn crate_to_string_for_macros(krate: &ast::Crate) -> String {
+    State::to_string(|s| {
+        s.print_inner_attributes(&krate.attrs);
+        for item in &krate.items {
+            s.print_item(item);
+        }
+    })
 }

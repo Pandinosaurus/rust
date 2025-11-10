@@ -21,28 +21,43 @@ fn main() {
     let item = 2;
     for _ in 5..=20 {
         vec.push(item);
+        //~^ same_item_push
     }
 
     let mut vec: Vec<u8> = Vec::new();
     for _ in 0..15 {
         let item = 2;
         vec.push(item);
+        //~^ same_item_push
     }
 
     let mut vec: Vec<u8> = Vec::new();
     for _ in 0..15 {
         vec.push(13);
+        //~^ same_item_push
     }
 
     let mut vec = Vec::new();
     for _ in 0..20 {
         vec.push(VALUE);
+        //~^ same_item_push
     }
 
     let mut vec = Vec::new();
     let item = VALUE;
     for _ in 0..20 {
         vec.push(item);
+        //~^ same_item_push
+    }
+
+    #[clippy::msrv = "1.81"]
+    fn older_msrv() {
+        let mut vec = Vec::new();
+        let item = VALUE;
+        for _ in 0..20 {
+            vec.push(item);
+            //~^ same_item_push
+        }
     }
 
     // ** non-linted cases **
@@ -120,7 +135,7 @@ fn main() {
     }
     // Fix #5979
     #[derive(Clone)]
-    struct S {}
+    struct S;
 
     trait T {}
     impl T for S {}
@@ -147,5 +162,13 @@ fn main() {
             _ => 0,
         };
         vec.push(item);
+    }
+
+    // Fix #6987
+    let mut vec = Vec::new();
+    #[allow(clippy::needless_borrow)]
+    for _ in 0..10 {
+        vec.push(1);
+        vec.extend(&[2]);
     }
 }

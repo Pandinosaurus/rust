@@ -1,5 +1,6 @@
-use super::*;
 use std::cell::Cell;
+
+use super::*;
 
 #[test]
 fn allocator_param() {
@@ -41,9 +42,9 @@ fn allocator_param() {
 
     let a = BoundedAlloc { fuel: Cell::new(500) };
     let mut v: RawVec<u8, _> = RawVec::with_capacity_in(50, a);
-    assert_eq!(v.alloc.fuel.get(), 450);
+    assert_eq!(v.inner.alloc.fuel.get(), 450);
     v.reserve(50, 150); // (causes a realloc, thus using 50 + 150 = 200 units of fuel)
-    assert_eq!(v.alloc.fuel.get(), 250);
+    assert_eq!(v.inner.alloc.fuel.get(), 250);
 }
 
 #[test]
@@ -76,4 +77,86 @@ fn reserve_does_not_overallocate() {
         // of 1.5 is OK too. Hence `>= 18` in assert.
         assert!(v.capacity() >= 12 + 12 / 2);
     }
+}
+
+struct ZST;
+
+// A `RawVec` holding zero-sized elements should always look like this.
+fn zst_sanity<T>(v: &RawVec<T>) {
+    assert_eq!(v.capacity(), usize::MAX);
+    assert_eq!(v.ptr(), core::ptr::Unique::<T>::dangling().as_ptr());
+    assert_eq!(unsafe { v.inner.current_memory(T::LAYOUT) }, None);
+}
+
+#[test]
+fn zst() {
+    let cap_err = Err(crate::collections::TryReserveErrorKind::CapacityOverflow.into());
+
+    assert_eq!(size_of::<ZST>(), 0);
+
+    // All these different ways of creating the RawVec produce the same thing.
+
+    let v: RawVec<ZST> = RawVec::new();
+    zst_sanity(&v);
+
+    let v: RawVec<ZST> = RawVec::with_capacity_in(100, Global);
+    zst_sanity(&v);
+
+    let v: RawVec<ZST> = RawVec::with_capacity_in(100, Global);
+    zst_sanity(&v);
+
+    let mut v: RawVec<ZST> = RawVec::with_capacity_in(usize::MAX, Global);
+    zst_sanity(&v);
+
+    // Check all these operations work as expected with zero-sized elements.
+
+    v.reserve(100, usize::MAX - 100);
+    //v.reserve(101, usize::MAX - 100); // panics, in `zst_reserve_panic` below
+    zst_sanity(&v);
+
+    v.reserve_exact(100, usize::MAX - 100);
+    //v.reserve_exact(101, usize::MAX - 100); // panics, in `zst_reserve_exact_panic` below
+    zst_sanity(&v);
+
+    assert_eq!(v.try_reserve(100, usize::MAX - 100), Ok(()));
+    assert_eq!(v.try_reserve(101, usize::MAX - 100), cap_err);
+    zst_sanity(&v);
+
+    assert_eq!(v.try_reserve_exact(100, usize::MAX - 100), Ok(()));
+    assert_eq!(v.try_reserve_exact(101, usize::MAX - 100), cap_err);
+    zst_sanity(&v);
+
+    assert_eq!(unsafe { v.inner.grow_amortized(100, usize::MAX - 100, ZST::LAYOUT) }, cap_err);
+    assert_eq!(unsafe { v.inner.grow_amortized(101, usize::MAX - 100, ZST::LAYOUT) }, cap_err);
+    zst_sanity(&v);
+
+    assert_eq!(unsafe { v.inner.grow_exact(100, usize::MAX - 100, ZST::LAYOUT) }, cap_err);
+    assert_eq!(unsafe { v.inner.grow_exact(101, usize::MAX - 100, ZST::LAYOUT) }, cap_err);
+    zst_sanity(&v);
+}
+
+#[test]
+#[should_panic(expected = "capacity overflow")]
+fn zst_reserve_panic() {
+    let mut v: RawVec<ZST> = RawVec::new();
+    zst_sanity(&v);
+
+    v.reserve(101, usize::MAX - 100);
+}
+
+#[test]
+#[should_panic(expected = "capacity overflow")]
+fn zst_reserve_exact_panic() {
+    let mut v: RawVec<ZST> = RawVec::new();
+    zst_sanity(&v);
+
+    v.reserve_exact(101, usize::MAX - 100);
+}
+
+#[test]
+fn niches() {
+    let baseline = size_of::<RawVec<u8>>();
+    assert_eq!(size_of::<Option<RawVec<u8>>>(), baseline);
+    assert_eq!(size_of::<Option<Option<RawVec<u8>>>>(), baseline);
+    assert_eq!(size_of::<Option<Option<Option<RawVec<u8>>>>>(), baseline);
 }

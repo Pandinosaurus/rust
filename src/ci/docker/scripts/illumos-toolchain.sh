@@ -4,6 +4,8 @@ set -o errexit
 set -o pipefail
 set -o xtrace
 
+source /tmp/shared.sh
+
 ARCH="$1"
 PHASE="$2"
 
@@ -52,59 +54,20 @@ SYSROOT_URL='https://github.com/illumos/sysroot/releases/download/'
 SYSROOT_URL+="$SYSROOT_VER/$SYSROOT_TAR"
 SYSROOT_DIR="$PREFIX/sysroot"
 
-BINUTILS_VERSION='2.25.1'
-BINUTILS_SUM='b5b14added7d78a8d1ca70b5cb75fef57ce2197264f4f5835326b0df22ac9f22'
+BINUTILS_VERSION='2.40'
+BINUTILS_SUM='f8298eb153a4b37d112e945aa5cb2850040bcf26a3ea65b5a715c83afe05e48a'
 BINUTILS_BASE="binutils-$BINUTILS_VERSION"
 BINUTILS_TAR="$BINUTILS_BASE.tar.bz2"
 BINUTILS_URL="https://ftp.gnu.org/gnu/binutils/$BINUTILS_TAR"
 
 
-download_file() {
-        local file="$1"
-        local url="$2"
-        local sum="$3"
-
-        while :; do
-                if [[ -f "$file" ]]; then
-                        if ! h="$(sha256sum "$file" | awk '{ print $1 }')"; then
-                                printf 'ERROR: reading hash\n' >&2
-                                exit 1
-                        fi
-
-                        if [[ "$h" == "$sum" ]]; then
-                                return 0
-                        fi
-
-                        printf 'WARNING: hash mismatch: %s != expected %s\n' \
-                            "$h" "$sum" >&2
-                        rm -f "$file"
-                fi
-
-                printf 'Downloading: %s\n' "$url"
-                if ! curl -f -L -o "$file" "$url"; then
-                        rm -f "$file"
-                        sleep 1
-                fi
-        done
-}
-
-
 case "$PHASE" in
 sysroot)
-        download_file "/tmp/$SYSROOT_TAR" "$SYSROOT_URL" "$SYSROOT_SUM"
-        mkdir -p "$SYSROOT_DIR"
-        cd "$SYSROOT_DIR"
-        tar -xzf "/tmp/$SYSROOT_TAR"
-        rm -f "/tmp/$SYSROOT_TAR"
+        download_tar_and_extract_into_dir "$SYSROOT_URL" "$SYSROOT_SUM" "$SYSROOT_DIR"
         ;;
 
 binutils)
-        download_file "/tmp/$BINUTILS_TAR" "$BINUTILS_URL" "$BINUTILS_SUM"
-        mkdir -p /ws/src/binutils
-        cd /ws/src/binutils
-        tar -xjf "/tmp/$BINUTILS_TAR"
-        rm -f "/tmp/$BINUTILS_TAR"
-
+        download_tar_and_extract_into_dir "$BINUTILS_URL" "$BINUTILS_SUM" /ws/src/binutils
         mkdir -p /ws/build/binutils
         cd /ws/build/binutils
         "/ws/src/binutils/$BINUTILS_BASE/configure" \
@@ -123,12 +86,7 @@ binutils)
         ;;
 
 gcc)
-        download_file "/tmp/$GCC_TAR" "$GCC_URL" "$GCC_SUM"
-        mkdir -p /ws/src/gcc
-        cd /ws/src/gcc
-        tar -xJf "/tmp/$GCC_TAR"
-        rm -f "/tmp/$GCC_TAR"
-
+        download_tar_and_extract_into_dir "$GCC_URL" "$GCC_SUM" /ws/src/gcc
         mkdir -p /ws/build/gcc
         cd /ws/build/gcc
         export CFLAGS='-fPIC'

@@ -1,145 +1,124 @@
-// Detecting lib features (i.e., features that are not lang features).
-//
-// These are declared using stability attributes (e.g., `#[stable (..)]`
-// and `#[unstable (..)]`), but are not declared in one single location
-// (unlike lang features), which means we need to collect them instead.
+//! Detecting lib features (i.e., features that are not lang features).
+//!
+//! These are declared using stability attributes (e.g., `#[stable (..)]` and `#[unstable (..)]`),
+//! but are not declared in one single location (unlike lang features), which means we need to
+//! collect them instead.
 
-use rustc_ast::{Attribute, MetaItem, MetaItemKind};
-use rustc_errors::struct_span_err;
-use rustc_hir::def_id::LOCAL_CRATE;
-use rustc_hir::intravisit::{self, NestedVisitorMap, Visitor};
-use rustc_middle::hir::map::Map;
-use rustc_middle::middle::lib_features::LibFeatures;
-use rustc_middle::ty::query::Providers;
+use rustc_hir::attrs::AttributeKind;
+use rustc_hir::intravisit::Visitor;
+use rustc_hir::{Attribute, StabilityLevel, StableSince};
+use rustc_middle::hir::nested_filter;
+use rustc_middle::middle::lib_features::{FeatureStability, LibFeatures};
+use rustc_middle::query::{LocalCrate, Providers};
 use rustc_middle::ty::TyCtxt;
-use rustc_span::symbol::Symbol;
-use rustc_span::{sym, Span};
+use rustc_span::{Span, Symbol, sym};
 
-fn new_lib_features() -> LibFeatures {
-    LibFeatures { stable: Default::default(), unstable: Default::default() }
-}
+use crate::errors::{FeaturePreviouslyDeclared, FeatureStableTwice};
 
-pub struct LibFeatureCollector<'tcx> {
+struct LibFeatureCollector<'tcx> {
     tcx: TyCtxt<'tcx>,
     lib_features: LibFeatures,
 }
 
-impl LibFeatureCollector<'tcx> {
+impl<'tcx> LibFeatureCollector<'tcx> {
     fn new(tcx: TyCtxt<'tcx>) -> LibFeatureCollector<'tcx> {
-        LibFeatureCollector { tcx, lib_features: new_lib_features() }
+        LibFeatureCollector { tcx, lib_features: LibFeatures::default() }
     }
 
-    fn extract(&self, attr: &Attribute) -> Option<(Symbol, Option<Symbol>, Span)> {
-        let stab_attrs = [sym::stable, sym::unstable, sym::rustc_const_unstable];
-
-        // Find a stability attribute (i.e., `#[stable (..)]`, `#[unstable (..)]`,
-        // `#[rustc_const_unstable (..)]`).
-        if let Some(stab_attr) =
-            stab_attrs.iter().find(|stab_attr| self.tcx.sess.check_name(attr, **stab_attr))
-        {
-            let meta_item = attr.meta();
-            if let Some(MetaItem { kind: MetaItemKind::List(ref metas), .. }) = meta_item {
-                let mut feature = None;
-                let mut since = None;
-                for meta in metas {
-                    if let Some(mi) = meta.meta_item() {
-                        // Find the `feature = ".."` meta-item.
-                        match (mi.name_or_empty(), mi.value_str()) {
-                            (sym::feature, val) => feature = val,
-                            (sym::since, val) => since = val,
-                            _ => {}
-                        }
-                    }
-                }
-                if let Some(feature) = feature {
-                    // This additional check for stability is to make sure we
-                    // don't emit additional, irrelevant errors for malformed
-                    // attributes.
-                    if *stab_attr != sym::stable || since.is_some() {
-                        return Some((feature, since, attr.span));
-                    }
-                }
-                // We need to iterate over the other attributes, because
-                // `rustc_const_unstable` is not mutually exclusive with
-                // the other stability attributes, so we can't just `break`
-                // here.
+    fn extract(&self, attr: &Attribute) -> Option<(Symbol, FeatureStability, Span)> {
+        let (feature, level, span) = match attr {
+            Attribute::Parsed(AttributeKind::Stability { stability, span }) => {
+                (stability.feature, stability.level, *span)
             }
-        }
+            Attribute::Parsed(AttributeKind::ConstStability { stability, span }) => {
+                (stability.feature, stability.level, *span)
+            }
+            Attribute::Parsed(AttributeKind::BodyStability { stability, span }) => {
+                (stability.feature, stability.level, *span)
+            }
+            _ => return None,
+        };
 
-        None
+        let feature_stability = match level {
+            StabilityLevel::Unstable { old_name, .. } => FeatureStability::Unstable { old_name },
+            StabilityLevel::Stable { since, .. } => FeatureStability::AcceptedSince(match since {
+                StableSince::Version(v) => Symbol::intern(&v.to_string()),
+                StableSince::Current => sym::env_CFG_RELEASE,
+                StableSince::Err(_) => return None,
+            }),
+        };
+
+        Some((feature, feature_stability, span))
     }
 
-    fn collect_feature(&mut self, feature: Symbol, since: Option<Symbol>, span: Span) {
-        let already_in_stable = self.lib_features.stable.contains_key(&feature);
-        let already_in_unstable = self.lib_features.unstable.contains(&feature);
+    fn collect_feature(&mut self, feature: Symbol, stability: FeatureStability, span: Span) {
+        let existing_stability = self.lib_features.stability.get(&feature).cloned();
 
-        match (since, already_in_stable, already_in_unstable) {
-            (Some(since), _, false) => {
-                if let Some(prev_since) = self.lib_features.stable.get(&feature) {
-                    if *prev_since != since {
-                        self.span_feature_error(
-                            span,
-                            &format!(
-                                "feature `{}` is declared stable since {}, \
-                                 but was previously declared stable since {}",
-                                feature, since, prev_since,
-                            ),
-                        );
-                        return;
-                    }
-                }
-
-                self.lib_features.stable.insert(feature, since);
+        match (stability, existing_stability) {
+            (_, None) => {
+                self.lib_features.stability.insert(feature, (stability, span));
             }
-            (None, false, _) => {
-                self.lib_features.unstable.insert(feature);
-            }
-            (Some(_), _, true) | (None, true, _) => {
-                self.span_feature_error(
-                    span,
-                    &format!(
-                        "feature `{}` is declared {}, but was previously declared {}",
+            (
+                FeatureStability::AcceptedSince(since),
+                Some((FeatureStability::AcceptedSince(prev_since), _)),
+            ) => {
+                if prev_since != since {
+                    self.tcx.dcx().emit_err(FeatureStableTwice {
+                        span,
                         feature,
-                        if since.is_some() { "stable" } else { "unstable" },
-                        if since.is_none() { "stable" } else { "unstable" },
-                    ),
-                );
+                        since,
+                        prev_since,
+                    });
+                }
             }
+            (FeatureStability::AcceptedSince(_), Some((FeatureStability::Unstable { .. }, _))) => {
+                self.tcx.dcx().emit_err(FeaturePreviouslyDeclared {
+                    span,
+                    feature,
+                    declared: "stable",
+                    prev_declared: "unstable",
+                });
+            }
+            (FeatureStability::Unstable { .. }, Some((FeatureStability::AcceptedSince(_), _))) => {
+                self.tcx.dcx().emit_err(FeaturePreviouslyDeclared {
+                    span,
+                    feature,
+                    declared: "unstable",
+                    prev_declared: "stable",
+                });
+            }
+            // duplicate `unstable` feature is ok.
+            (FeatureStability::Unstable { .. }, Some((FeatureStability::Unstable { .. }, _))) => {}
         }
-    }
-
-    fn span_feature_error(&self, span: Span, msg: &str) {
-        struct_span_err!(self.tcx.sess, span, E0711, "{}", &msg).emit();
     }
 }
 
-impl Visitor<'tcx> for LibFeatureCollector<'tcx> {
-    type Map = Map<'tcx>;
+impl<'tcx> Visitor<'tcx> for LibFeatureCollector<'tcx> {
+    type NestedFilter = nested_filter::All;
 
-    fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
-        NestedVisitorMap::All(self.tcx.hir())
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
     }
 
-    fn visit_attribute(&mut self, _: rustc_hir::HirId, attr: &'tcx Attribute) {
+    fn visit_attribute(&mut self, attr: &'tcx Attribute) {
         if let Some((feature, stable, span)) = self.extract(attr) {
             self.collect_feature(feature, stable, span);
         }
     }
 }
 
-fn collect(tcx: TyCtxt<'_>) -> LibFeatures {
-    let mut collector = LibFeatureCollector::new(tcx);
-    let krate = tcx.hir().krate();
-    for attr in krate.non_exported_macro_attrs {
-        collector.visit_attribute(rustc_hir::CRATE_HIR_ID, attr);
+fn lib_features(tcx: TyCtxt<'_>, LocalCrate: LocalCrate) -> LibFeatures {
+    // If `staged_api` is not enabled then we aren't allowed to define lib
+    // features; there is no point collecting them.
+    if !tcx.features().staged_api() {
+        return LibFeatures::default();
     }
-    intravisit::walk_crate(&mut collector, krate);
+
+    let mut collector = LibFeatureCollector::new(tcx);
+    tcx.hir_walk_attributes(&mut collector);
     collector.lib_features
 }
 
-pub fn provide(providers: &mut Providers) {
-    providers.get_lib_features = |tcx, id| {
-        assert_eq!(id, LOCAL_CRATE);
-        collect(tcx)
-    };
+pub(crate) fn provide(providers: &mut Providers) {
+    providers.lib_features = lib_features;
 }

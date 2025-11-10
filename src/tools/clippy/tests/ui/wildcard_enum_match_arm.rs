@@ -1,17 +1,17 @@
-// run-rustfix
-
+//@aux-build:non-exhaustive-enum.rs
 #![deny(clippy::wildcard_enum_match_arm)]
+#![allow(dead_code, unreachable_code, unused_variables)]
 #![allow(
-    unreachable_code,
-    unused_variables,
-    dead_code,
+    clippy::diverging_sub_expression,
     clippy::single_match,
-    clippy::wildcard_in_or_patterns,
+    clippy::uninlined_format_args,
     clippy::unnested_or_patterns,
-    clippy::diverging_sub_expression
+    clippy::wildcard_in_or_patterns
 )]
 
-use std::io::ErrorKind;
+extern crate non_exhaustive_enum;
+
+use non_exhaustive_enum::ErrorKind;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Color {
@@ -37,14 +37,17 @@ fn main() {
     match color {
         Color::Red => println!("Red"),
         _ => eprintln!("Not red"),
+        //~^ wildcard_enum_match_arm
     };
     match color {
         Color::Red => println!("Red"),
         _not_red => eprintln!("Not red"),
+        //~^ wildcard_enum_match_arm
     };
     let _str = match color {
         Color::Red => "Red".to_owned(),
         not_red => format!("{:?}", not_red),
+        //~^ wildcard_enum_match_arm
     };
     match color {
         Color::Red => {},
@@ -61,6 +64,7 @@ fn main() {
     match color {
         Color::Rgb(r, _, _) if r > 0 => "Some red",
         _ => "No red",
+        //~^ wildcard_enum_match_arm
     };
     match color {
         Color::Red | Color::Green | Color::Blue | Color::Cyan => {},
@@ -78,26 +82,55 @@ fn main() {
     match error_kind {
         ErrorKind::NotFound => {},
         _ => {},
+        //~^ wildcard_enum_match_arm
     }
     match error_kind {
         ErrorKind::NotFound => {},
         ErrorKind::PermissionDenied => {},
-        ErrorKind::ConnectionRefused => {},
-        ErrorKind::ConnectionReset => {},
-        ErrorKind::ConnectionAborted => {},
-        ErrorKind::NotConnected => {},
-        ErrorKind::AddrInUse => {},
-        ErrorKind::AddrNotAvailable => {},
-        ErrorKind::BrokenPipe => {},
-        ErrorKind::AlreadyExists => {},
-        ErrorKind::WouldBlock => {},
-        ErrorKind::InvalidInput => {},
-        ErrorKind::InvalidData => {},
-        ErrorKind::TimedOut => {},
-        ErrorKind::WriteZero => {},
-        ErrorKind::Interrupted => {},
-        ErrorKind::Other => {},
-        ErrorKind::UnexpectedEof => {},
         _ => {},
+    }
+
+    {
+        pub enum Enum {
+            A,
+            B,
+            C(u8),
+            D(u8, u8),
+            E { e: u8 },
+        };
+        match Enum::A {
+            Enum::A => (),
+            _ => (),
+            //~^ wildcard_enum_match_arm
+        }
+    }
+
+    {
+        #![allow(clippy::manual_non_exhaustive)]
+        pub enum Enum {
+            A,
+            B,
+            #[doc(hidden)]
+            __Private,
+        }
+        match Enum::A {
+            Enum::A => (),
+            _ => (),
+            //~^ wildcard_enum_match_arm
+        }
+    }
+}
+
+fn issue15091() {
+    enum Foo {
+        A,
+        B,
+        C,
+    }
+
+    match Foo::A {
+        Foo::A => {},
+        r#type => {},
+        //~^ wildcard_enum_match_arm
     }
 }

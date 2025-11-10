@@ -1,172 +1,358 @@
-use super::utils::{LoopNestVisitor, Nesting};
+use std::ops::ControlFlow;
+
 use super::WHILE_LET_ON_ITERATOR;
 use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::res::{MaybeDef, MaybeTypeckRes};
 use clippy_utils::source::snippet_with_applicability;
-use clippy_utils::ty::implements_trait;
-use clippy_utils::usage::mutated_variables;
-use clippy_utils::{
-    get_enclosing_block, is_refutable, is_trait_method, last_path_segment, path_to_local, path_to_local_id,
-};
-use if_chain::if_chain;
+use clippy_utils::visitors::is_res_used;
+use clippy_utils::{get_enclosing_loop_or_multi_call_closure, higher, is_refutable};
 use rustc_errors::Applicability;
-use rustc_hir::intravisit::{walk_block, walk_expr, NestedVisitorMap, Visitor};
-use rustc_hir::{Expr, ExprKind, HirId, MatchSource, Node, PatKind};
+use rustc_hir::def::Res;
+use rustc_hir::intravisit::{Visitor, walk_expr};
+use rustc_hir::{Closure, Expr, ExprKind, HirId, LangItem, LetStmt, Mutability, PatKind, UnOp};
 use rustc_lint::LateContext;
-use rustc_middle::hir::map::Map;
+use rustc_middle::hir::nested_filter::OnlyBodies;
+use rustc_middle::ty::adjustment::Adjust;
+use rustc_span::Symbol;
 use rustc_span::symbol::sym;
 
-pub(super) fn check(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
-    if let ExprKind::Match(ref match_expr, ref arms, MatchSource::WhileLetDesugar) = expr.kind {
-        let pat = &arms[0].pat.kind;
-        if let (
-            &PatKind::TupleStruct(ref qpath, ref pat_args, _),
-            &ExprKind::MethodCall(ref method_path, _, ref method_args, _),
-        ) = (pat, &match_expr.kind)
+pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
+    if let Some(higher::WhileLet { if_then, let_pat, let_expr, label, .. }) = higher::WhileLet::hir(expr)
+        // check for `Some(..)` pattern
+        && let PatKind::TupleStruct(ref pat_path, some_pat, _) = let_pat.kind
+        && cx.qpath_res(pat_path, let_pat.hir_id).ctor_parent(cx).is_lang_item(cx, LangItem::OptionSome)
+        // check for call to `Iterator::next`
+        && let ExprKind::MethodCall(method_name, iter_expr, [], _) = let_expr.kind
+        && method_name.ident.name == sym::next
+        && cx.ty_based_def(let_expr).opt_parent(cx).is_diag_item(cx, sym::Iterator)
+        && let Some(iter_expr_struct) = try_parse_iter_expr(cx, iter_expr)
+        // get the loop containing the match expression
+        && !uses_iter(cx, &iter_expr_struct, if_then)
+    {
+        let mut applicability = Applicability::MachineApplicable;
+
+        let loop_label = label.map_or(String::new(), |l| format!("{}: ", l.ident.name));
+
+        let loop_var = if let Some(some_pat) = some_pat.first() {
+            if is_refutable(cx, some_pat) {
+                // Refutable patterns don't work with for loops.
+                return;
+            }
+            snippet_with_applicability(cx, some_pat.span, "..", &mut applicability)
+        } else {
+            "_".into()
+        };
+
+        // If the iterator is a field or the iterator is accessed after the loop is complete it needs to be
+        // borrowed mutably. TODO: If the struct can be partially moved from and the struct isn't used
+        // afterwards a mutable borrow of a field isn't necessary.
+        let by_ref = if cx.typeck_results().expr_ty(iter_expr).ref_mutability() == Some(Mutability::Mut)
+            || !iter_expr_struct.can_move
+            || !iter_expr_struct.fields.is_empty()
+            || needs_mutable_borrow(cx, &iter_expr_struct, expr)
         {
-            let iter_expr = &method_args[0];
+            ".by_ref()"
+        } else {
+            ""
+        };
 
-            // Don't lint when the iterator is recreated on every iteration
-            if_chain! {
-                if let ExprKind::MethodCall(..) | ExprKind::Call(..) = iter_expr.kind;
-                if let Some(iter_def_id) = cx.tcx.get_diagnostic_item(sym::Iterator);
-                if implements_trait(cx, cx.typeck_results().expr_ty(iter_expr), iter_def_id, &[]);
-                then {
-                    return;
-                }
-            }
-
-            let lhs_constructor = last_path_segment(qpath);
-            if method_path.ident.name == sym::next
-                && is_trait_method(cx, match_expr, sym::Iterator)
-                && lhs_constructor.ident.name == sym::Some
-                && (pat_args.is_empty()
-                    || !is_refutable(cx, &pat_args[0])
-                        && !is_used_inside(cx, iter_expr, &arms[0].body)
-                        && !is_iterator_used_after_while_let(cx, iter_expr)
-                        && !is_nested(cx, expr, &method_args[0]))
-            {
-                let mut applicability = Applicability::MachineApplicable;
-                let iterator = snippet_with_applicability(cx, method_args[0].span, "_", &mut applicability);
-                let loop_var = if pat_args.is_empty() {
-                    "_".to_string()
-                } else {
-                    snippet_with_applicability(cx, pat_args[0].span, "_", &mut applicability).into_owned()
-                };
-                span_lint_and_sugg(
-                    cx,
-                    WHILE_LET_ON_ITERATOR,
-                    expr.span.with_hi(match_expr.span.hi()),
-                    "this loop could be written as a `for` loop",
-                    "try",
-                    format!("for {} in {}", loop_var, iterator),
-                    applicability,
-                );
-            }
-        }
+        let iterator = snippet_with_applicability(cx, iter_expr.span, "_", &mut applicability);
+        span_lint_and_sugg(
+            cx,
+            WHILE_LET_ON_ITERATOR,
+            expr.span.with_hi(let_expr.span.hi()),
+            "this loop could be written as a `for` loop",
+            "try",
+            format!("{loop_label}for {loop_var} in {iterator}{by_ref}"),
+            applicability,
+        );
     }
 }
 
-fn is_used_inside<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, container: &'tcx Expr<'_>) -> bool {
-    let def_id = match path_to_local(expr) {
-        Some(id) => id,
-        None => return false,
-    };
-    if let Some(used_mutably) = mutated_variables(container, cx) {
-        if used_mutably.contains(&def_id) {
-            return true;
-        }
-    }
-    false
+#[derive(Debug)]
+struct IterExpr {
+    /// The fields used, in order of child to parent.
+    fields: Vec<Symbol>,
+    /// The path being used.
+    path: Res,
+    /// Whether or not the iterator can be moved.
+    can_move: bool,
 }
 
-fn is_iterator_used_after_while_let<'tcx>(cx: &LateContext<'tcx>, iter_expr: &'tcx Expr<'_>) -> bool {
-    let def_id = match path_to_local(iter_expr) {
-        Some(id) => id,
-        None => return false,
-    };
-    let mut visitor = VarUsedAfterLoopVisitor {
-        def_id,
-        iter_expr_id: iter_expr.hir_id,
-        past_while_let: false,
-        var_used_after_while_let: false,
-    };
-    if let Some(enclosing_block) = get_enclosing_block(cx, def_id) {
-        walk_block(&mut visitor, enclosing_block);
-    }
-    visitor.var_used_after_while_let
-}
-
-fn is_nested(cx: &LateContext<'_>, match_expr: &Expr<'_>, iter_expr: &Expr<'_>) -> bool {
-    if_chain! {
-        if let Some(loop_block) = get_enclosing_block(cx, match_expr.hir_id);
-        let parent_node = cx.tcx.hir().get_parent_node(loop_block.hir_id);
-        if let Some(Node::Expr(loop_expr)) = cx.tcx.hir().find(parent_node);
-        then {
-            return is_loop_nested(cx, loop_expr, iter_expr)
-        }
-    }
-    false
-}
-
-fn is_loop_nested(cx: &LateContext<'_>, loop_expr: &Expr<'_>, iter_expr: &Expr<'_>) -> bool {
-    let mut id = loop_expr.hir_id;
-    let iter_id = if let Some(id) = path_to_local(iter_expr) {
-        id
-    } else {
-        return true;
-    };
+/// Parses any expression to find out which field of which variable is used. Will return `None` if
+/// the expression might have side effects.
+fn try_parse_iter_expr(cx: &LateContext<'_>, mut e: &Expr<'_>) -> Option<IterExpr> {
+    let mut fields = Vec::new();
+    let mut can_move = true;
     loop {
-        let parent = cx.tcx.hir().get_parent_node(id);
-        if parent == id {
-            return false;
+        if cx
+            .typeck_results()
+            .expr_adjustments(e)
+            .iter()
+            .any(|a| matches!(a.kind, Adjust::Deref(Some(..))))
+        {
+            // Custom deref impls need to borrow the whole value as it's captured by reference
+            can_move = false;
+            fields.clear();
         }
-        match cx.tcx.hir().find(parent) {
-            Some(Node::Expr(expr)) => {
-                if let ExprKind::Loop(..) = expr.kind {
+        match e.kind {
+            ExprKind::Path(ref path) => {
+                break Some(IterExpr {
+                    fields,
+                    path: cx.qpath_res(path, e.hir_id),
+                    can_move,
+                });
+            },
+            ExprKind::Field(base, name) => {
+                fields.push(name.name);
+                e = base;
+            },
+            // Dereferencing a pointer has no side effects and doesn't affect which field is being used.
+            ExprKind::Unary(UnOp::Deref, base) if cx.typeck_results().expr_ty(base).is_ref() => e = base,
+
+            // Shouldn't have side effects, but there's no way to trace which field is used. So forget which fields have
+            // already been seen.
+            ExprKind::Index(base, idx, _) if !idx.can_have_side_effects() => {
+                can_move = false;
+                fields.clear();
+                e = base;
+            },
+            ExprKind::Unary(UnOp::Deref, base) => {
+                can_move = false;
+                fields.clear();
+                e = base;
+            },
+
+            // No effect and doesn't affect which field is being used.
+            ExprKind::DropTemps(base) | ExprKind::AddrOf(_, _, base) | ExprKind::Type(base, _) => e = base,
+            _ => break None,
+        }
+    }
+}
+
+fn is_expr_same_field(cx: &LateContext<'_>, mut e: &Expr<'_>, mut fields: &[Symbol], path_res: Res) -> bool {
+    loop {
+        match (&e.kind, fields) {
+            (&ExprKind::Field(base, name), [head_field, tail_fields @ ..]) if name.name == *head_field => {
+                e = base;
+                fields = tail_fields;
+            },
+            (ExprKind::Path(path), []) => {
+                break cx.qpath_res(path, e.hir_id) == path_res;
+            },
+            (&(ExprKind::DropTemps(base) | ExprKind::AddrOf(_, _, base) | ExprKind::Type(base, _)), _) => e = base,
+            _ => break false,
+        }
+    }
+}
+
+/// Checks if the given expression is the same field as, is a child of, or is the parent of the
+/// given field. Used to check if the expression can be used while the given field is borrowed
+/// mutably. e.g. if checking for `x.y`, then `x.y`, `x.y.z`, and `x` will all return true, but
+/// `x.z`, and `y` will return false.
+fn is_expr_same_child_or_parent_field(cx: &LateContext<'_>, expr: &Expr<'_>, fields: &[Symbol], path_res: Res) -> bool {
+    match expr.kind {
+        ExprKind::Field(base, name) => {
+            if let Some((head_field, tail_fields)) = fields.split_first() {
+                if name.name == *head_field && is_expr_same_field(cx, base, tail_fields, path_res) {
                     return true;
-                };
-            },
-            Some(Node::Block(block)) => {
-                let mut block_visitor = LoopNestVisitor {
-                    hir_id: id,
-                    iterator: iter_id,
-                    nesting: Nesting::Unknown,
-                };
-                walk_block(&mut block_visitor, block);
-                if block_visitor.nesting == Nesting::RuledOut {
-                    return false;
                 }
-            },
-            Some(Node::Stmt(_)) => (),
-            _ => {
-                return false;
-            },
-        }
-        id = parent;
-    }
-}
-
-struct VarUsedAfterLoopVisitor {
-    def_id: HirId,
-    iter_expr_id: HirId,
-    past_while_let: bool,
-    var_used_after_while_let: bool,
-}
-
-impl<'tcx> Visitor<'tcx> for VarUsedAfterLoopVisitor {
-    type Map = Map<'tcx>;
-
-    fn visit_expr(&mut self, expr: &'tcx Expr<'_>) {
-        if self.past_while_let {
-            if path_to_local_id(expr, self.def_id) {
-                self.var_used_after_while_let = true;
+                // Check if the expression is a parent field
+                let mut fields_iter = tail_fields.iter();
+                while let Some(field) = fields_iter.next() {
+                    if *field == name.name && is_expr_same_field(cx, base, fields_iter.as_slice(), path_res) {
+                        return true;
+                    }
+                }
             }
-        } else if self.iter_expr_id == expr.hir_id {
-            self.past_while_let = true;
-        }
-        walk_expr(self, expr);
+
+            // Check if the expression is a child field.
+            let mut e = base;
+            loop {
+                match e.kind {
+                    ExprKind::Field(..) if is_expr_same_field(cx, e, fields, path_res) => break true,
+                    ExprKind::Field(base, _) | ExprKind::DropTemps(base) | ExprKind::Type(base, _) => e = base,
+                    ExprKind::Path(ref path) if fields.is_empty() => {
+                        break cx.qpath_res(path, e.hir_id) == path_res;
+                    },
+                    _ => break false,
+                }
+            }
+        },
+        // If the path matches, this is either an exact match, or the expression is a parent of the field.
+        ExprKind::Path(ref path) => cx.qpath_res(path, expr.hir_id) == path_res,
+        ExprKind::DropTemps(base) | ExprKind::Type(base, _) | ExprKind::AddrOf(_, _, base) => {
+            is_expr_same_child_or_parent_field(cx, base, fields, path_res)
+        },
+        _ => false,
     }
-    fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
-        NestedVisitorMap::None
+}
+
+/// Strips off all field and path expressions. This will return true if a field or path has been
+/// skipped. Used to skip them after failing to check for equality.
+fn skip_fields_and_path<'tcx>(expr: &'tcx Expr<'_>) -> (Option<&'tcx Expr<'tcx>>, bool) {
+    let mut e = expr;
+    let e = loop {
+        match e.kind {
+            ExprKind::Field(base, _) | ExprKind::DropTemps(base) | ExprKind::Type(base, _) => e = base,
+            ExprKind::Path(_) => return (None, true),
+            _ => break e,
+        }
+    };
+    (Some(e), e.hir_id != expr.hir_id)
+}
+
+/// Checks if the given expression uses the iterator.
+fn uses_iter<'tcx>(cx: &LateContext<'tcx>, iter_expr: &IterExpr, container: &'tcx Expr<'_>) -> bool {
+    struct V<'a, 'b, 'tcx> {
+        cx: &'a LateContext<'tcx>,
+        iter_expr: &'b IterExpr,
+    }
+    impl<'tcx> Visitor<'tcx> for V<'_, '_, 'tcx> {
+        type Result = ControlFlow<()>;
+        fn visit_expr(&mut self, e: &'tcx Expr<'_>) -> Self::Result {
+            if is_expr_same_child_or_parent_field(self.cx, e, &self.iter_expr.fields, self.iter_expr.path) {
+                ControlFlow::Break(())
+            } else if let (e, true) = skip_fields_and_path(e) {
+                if let Some(e) = e {
+                    self.visit_expr(e)
+                } else {
+                    ControlFlow::Continue(())
+                }
+            } else if let ExprKind::Closure(&Closure { body: id, .. }) = e.kind {
+                if is_res_used(self.cx, self.iter_expr.path, id) {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            } else {
+                walk_expr(self, e)
+            }
+        }
+    }
+
+    let mut v = V { cx, iter_expr };
+    v.visit_expr(container).is_break()
+}
+
+#[expect(clippy::too_many_lines)]
+fn needs_mutable_borrow(cx: &LateContext<'_>, iter_expr: &IterExpr, loop_expr: &Expr<'_>) -> bool {
+    struct AfterLoopVisitor<'a, 'b, 'tcx> {
+        cx: &'a LateContext<'tcx>,
+        iter_expr: &'b IterExpr,
+        loop_id: HirId,
+        after_loop: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for AfterLoopVisitor<'_, '_, 'tcx> {
+        type NestedFilter = OnlyBodies;
+        type Result = ControlFlow<()>;
+        fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+            self.cx.tcx
+        }
+
+        fn visit_expr(&mut self, e: &'tcx Expr<'_>) -> Self::Result {
+            if self.after_loop {
+                if is_expr_same_child_or_parent_field(self.cx, e, &self.iter_expr.fields, self.iter_expr.path) {
+                    ControlFlow::Break(())
+                } else if let (e, true) = skip_fields_and_path(e) {
+                    if let Some(e) = e {
+                        self.visit_expr(e)
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                } else if let ExprKind::Closure(&Closure { body: id, .. }) = e.kind {
+                    if is_res_used(self.cx, self.iter_expr.path, id) {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                } else {
+                    walk_expr(self, e)
+                }
+            } else if self.loop_id == e.hir_id {
+                self.after_loop = true;
+                ControlFlow::Continue(())
+            } else {
+                walk_expr(self, e)
+            }
+        }
+    }
+
+    struct NestedLoopVisitor<'a, 'b, 'tcx> {
+        cx: &'a LateContext<'tcx>,
+        iter_expr: &'b IterExpr,
+        local_id: HirId,
+        loop_id: HirId,
+        after_loop: bool,
+        found_local: bool,
+        used_after: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for NestedLoopVisitor<'_, '_, 'tcx> {
+        type NestedFilter = OnlyBodies;
+        fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+            self.cx.tcx
+        }
+
+        fn visit_local(&mut self, l: &'tcx LetStmt<'_>) {
+            if !self.after_loop {
+                l.pat.each_binding_or_first(&mut |_, id, _, _| {
+                    if id == self.local_id {
+                        self.found_local = true;
+                    }
+                });
+            }
+            if let Some(e) = l.init {
+                self.visit_expr(e);
+            }
+        }
+
+        fn visit_expr(&mut self, e: &'tcx Expr<'_>) {
+            if self.used_after {
+                return;
+            }
+            if self.after_loop {
+                if is_expr_same_child_or_parent_field(self.cx, e, &self.iter_expr.fields, self.iter_expr.path) {
+                    self.used_after = true;
+                } else if let (e, true) = skip_fields_and_path(e) {
+                    if let Some(e) = e {
+                        self.visit_expr(e);
+                    }
+                } else if let ExprKind::Closure(&Closure { body: id, .. }) = e.kind {
+                    self.used_after = is_res_used(self.cx, self.iter_expr.path, id);
+                } else {
+                    walk_expr(self, e);
+                }
+            } else if e.hir_id == self.loop_id {
+                self.after_loop = true;
+            } else {
+                walk_expr(self, e);
+            }
+        }
+    }
+
+    if let Some(e) = get_enclosing_loop_or_multi_call_closure(cx, loop_expr) {
+        let Res::Local(local_id) = iter_expr.path else {
+            return true;
+        };
+        let mut v = NestedLoopVisitor {
+            cx,
+            iter_expr,
+            local_id,
+            loop_id: loop_expr.hir_id,
+            after_loop: false,
+            found_local: false,
+            used_after: false,
+        };
+        v.visit_expr(e);
+        v.used_after || !v.found_local
+    } else {
+        let mut v = AfterLoopVisitor {
+            cx,
+            iter_expr,
+            loop_id: loop_expr.hir_id,
+            after_loop: false,
+        };
+        v.visit_expr(cx.tcx.hir_body(cx.enclosing_body.unwrap()).value)
+            .is_break()
     }
 }

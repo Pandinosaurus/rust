@@ -1,9 +1,9 @@
 [package]
-authors = ["The Rust Project Developers"]
 name = "rustc_arena"
 version = "0.0.0"
-edition = "2018"
+edition = "2024"
 
 [dependencies]
-rustc_data_structures = { path = "../rustc_data_structures" }
-smallvec = { version = "1.6.1", features = ["union", "may_dangle"] }
+# tidy-alphabetical-start
+smallvec = { version = "1.8.1", features = ["union", "may_dangle"] }
+# tidy-alphabetical-end

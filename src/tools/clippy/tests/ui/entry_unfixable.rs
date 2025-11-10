@@ -1,72 +1,92 @@
-#![allow(unused, clippy::needless_pass_by_value)]
+#![allow(clippy::needless_pass_by_value, clippy::collapsible_if)]
 #![warn(clippy::map_entry)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::hash::Hash;
 
-fn foo() {}
+macro_rules! m {
+    ($e:expr) => {{ $e }};
+}
 
-fn insert_if_absent2<K: Eq + Hash, V>(m: &mut HashMap<K, V>, k: K, v: V) {
-    if !m.contains_key(&k) {
-        m.insert(k, v)
-    } else {
-        None
+macro_rules! insert {
+    ($map:expr, $key:expr, $val:expr) => {
+        $map.insert($key, $val)
     };
 }
 
-fn insert_if_present2<K: Eq + Hash, V>(m: &mut HashMap<K, V>, k: K, v: V) {
-    if m.contains_key(&k) {
-        None
-    } else {
-        m.insert(k, v)
-    };
-}
+mod issue13306 {
+    use std::collections::HashMap;
 
-fn insert_if_absent3<K: Eq + Hash, V>(m: &mut HashMap<K, V>, k: K, v: V) {
-    if !m.contains_key(&k) {
-        foo();
-        m.insert(k, v)
-    } else {
-        None
-    };
-}
+    struct Env {
+        enclosing: Option<Box<Env>>,
+        values: HashMap<String, usize>,
+    }
 
-fn insert_if_present3<K: Eq + Hash, V>(m: &mut HashMap<K, V>, k: K, v: V) {
-    if m.contains_key(&k) {
-        None
-    } else {
-        foo();
-        m.insert(k, v)
-    };
-}
-
-fn insert_in_btreemap<K: Ord, V>(m: &mut BTreeMap<K, V>, k: K, v: V) {
-    if !m.contains_key(&k) {
-        foo();
-        m.insert(k, v)
-    } else {
-        None
-    };
-}
-
-// should not trigger
-fn insert_other_if_absent<K: Eq + Hash, V>(m: &mut HashMap<K, V>, k: K, o: K, v: V) {
-    if !m.contains_key(&k) {
-        m.insert(o, v);
+    impl Env {
+        fn assign(&mut self, name: String, value: usize) -> bool {
+            if !self.values.contains_key(&name) {
+                //~^ map_entry
+                self.values.insert(name, value);
+                true
+            } else if let Some(enclosing) = &mut self.enclosing {
+                enclosing.assign(name, value)
+            } else {
+                false
+            }
+        }
     }
 }
 
-// should not trigger, because the one uses different HashMap from another one
-fn insert_from_different_map<K: Eq + Hash, V>(m: HashMap<K, V>, n: &mut HashMap<K, V>, k: K, v: V) {
-    if !m.contains_key(&k) {
-        n.insert(k, v);
+fn issue9925(mut hm: HashMap<String, bool>) {
+    let key = "hello".to_string();
+    if hm.contains_key(&key) {
+        //~^ map_entry
+        let bval = hm.get_mut(&key).unwrap();
+        *bval = false;
+    } else {
+        hm.insert(key, true);
     }
 }
 
-// should not trigger, because the one uses different HashMap from another one
-fn insert_from_different_map2<K: Eq + Hash, V>(m: &mut HashMap<K, V>, n: &mut HashMap<K, V>, k: K, v: V) {
-    if !m.contains_key(&k) {
-        n.insert(k, v);
+mod issue9470 {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    struct Interner(i32);
+
+    impl Interner {
+        const fn new() -> Self {
+            Interner(0)
+        }
+
+        fn resolve(&self, name: String) -> Option<String> {
+            todo!()
+        }
+    }
+
+    static INTERNER: Mutex<Interner> = Mutex::new(Interner::new());
+
+    struct VM {
+        stack: Vec<i32>,
+        globals: HashMap<String, i32>,
+    }
+
+    impl VM {
+        fn stack_top(&self) -> &i32 {
+            self.stack.last().unwrap()
+        }
+
+        fn resolve(&mut self, name: String, value: i32) -> Result<(), String> {
+            if self.globals.contains_key(&name) {
+                //~^ map_entry
+                self.globals.insert(name, value);
+            } else {
+                let interner = INTERNER.lock().unwrap();
+                return Err(interner.resolve(name).unwrap().to_owned());
+            }
+
+            Ok(())
+        }
     }
 }
 

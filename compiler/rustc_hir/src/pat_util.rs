@@ -1,10 +1,10 @@
-use crate::def::{CtorOf, DefKind, Res};
-use crate::def_id::DefId;
-use crate::hir::{self, HirId, PatKind};
-use rustc_span::symbol::Ident;
-use rustc_span::Span;
+use std::iter::Enumerate;
 
-use std::iter::{Enumerate, ExactSizeIterator};
+use rustc_span::{Ident, Span};
+
+use crate::def::{CtorOf, DefKind, Res};
+use crate::def_id::{DefId, DefIdSet};
+use crate::hir::{self, BindingMode, ByRef, HirId, PatKind};
 
 pub struct EnumerateAndAdjust<I> {
     enumerate: Enumerate<I>,
@@ -33,7 +33,7 @@ pub trait EnumerateAndAdjustIterator {
     fn enumerate_and_adjust(
         self,
         expected_len: usize,
-        gap_pos: Option<usize>,
+        gap_pos: hir::DotDotPos,
     ) -> EnumerateAndAdjust<Self>
     where
         Self: Sized;
@@ -43,7 +43,7 @@ impl<T: ExactSizeIterator> EnumerateAndAdjustIterator for T {
     fn enumerate_and_adjust(
         self,
         expected_len: usize,
-        gap_pos: Option<usize>,
+        gap_pos: hir::DotDotPos,
     ) -> EnumerateAndAdjust<Self>
     where
         Self: Sized,
@@ -51,7 +51,7 @@ impl<T: ExactSizeIterator> EnumerateAndAdjustIterator for T {
         let actual_len = self.len();
         EnumerateAndAdjust {
             enumerate: self.enumerate(),
-            gap_pos: gap_pos.unwrap_or(expected_len),
+            gap_pos: gap_pos.as_opt_usize().unwrap_or(expected_len),
             gap_len: expected_len - actual_len,
         }
     }
@@ -60,7 +60,7 @@ impl<T: ExactSizeIterator> EnumerateAndAdjustIterator for T {
 impl hir::Pat<'_> {
     /// Call `f` on every "binding" in a pattern, e.g., on `a` in
     /// `match foo() { Some(a) => (), None => () }`
-    pub fn each_binding(&self, mut f: impl FnMut(hir::BindingAnnotation, HirId, Span, Ident)) {
+    pub fn each_binding(&self, mut f: impl FnMut(hir::BindingMode, HirId, Span, Ident)) {
         self.walk_always(|p| {
             if let PatKind::Binding(binding_mode, _, ident, _) = p.kind {
                 f(binding_mode, p.hir_id, p.span, ident);
@@ -71,14 +71,18 @@ impl hir::Pat<'_> {
     /// Call `f` on every "binding" in a pattern, e.g., on `a` in
     /// `match foo() { Some(a) => (), None => () }`.
     ///
-    /// When encountering an or-pattern `p_0 | ... | p_n` only `p_0` will be visited.
-    pub fn each_binding_or_first(
-        &self,
-        f: &mut impl FnMut(hir::BindingAnnotation, HirId, Span, Ident),
-    ) {
+    /// When encountering an or-pattern `p_0 | ... | p_n` only the first non-never pattern will be
+    /// visited. If they're all never patterns we visit nothing, which is ok since a never pattern
+    /// cannot have bindings.
+    pub fn each_binding_or_first(&self, f: &mut impl FnMut(hir::BindingMode, HirId, Span, Ident)) {
         self.walk(|p| match &p.kind {
             PatKind::Or(ps) => {
-                ps[0].each_binding_or_first(f);
+                for p in *ps {
+                    if !p.is_never_pattern() {
+                        p.each_binding_or_first(f);
+                        break;
+                    }
+                }
                 false
             }
             PatKind::Binding(bm, _, ident, _) => {
@@ -89,34 +93,9 @@ impl hir::Pat<'_> {
         })
     }
 
-    /// Checks if the pattern contains any patterns that bind something to
-    /// an ident, e.g., `foo`, or `Foo(foo)` or `foo @ Bar(..)`.
-    pub fn contains_bindings(&self) -> bool {
-        self.satisfies(|p| matches!(p.kind, PatKind::Binding(..)))
-    }
-
-    /// Checks if the pattern satisfies the given predicate on some sub-pattern.
-    fn satisfies(&self, pred: impl Fn(&hir::Pat<'_>) -> bool) -> bool {
-        let mut satisfies = false;
-        self.walk_short(|p| {
-            if pred(p) {
-                satisfies = true;
-                false // Found one, can short circuit now.
-            } else {
-                true
-            }
-        });
-        satisfies
-    }
-
     pub fn simple_ident(&self) -> Option<Ident> {
         match self.kind {
-            PatKind::Binding(
-                hir::BindingAnnotation::Unannotated | hir::BindingAnnotation::Mutable,
-                _,
-                ident,
-                None,
-            ) => Some(ident),
+            PatKind::Binding(BindingMode(ByRef::No, _), _, ident, None) => Some(ident),
             _ => None,
         }
     }
@@ -126,7 +105,10 @@ impl hir::Pat<'_> {
         let mut variants = vec![];
         self.walk(|p| match &p.kind {
             PatKind::Or(_) => false,
-            PatKind::Path(hir::QPath::Resolved(_, path))
+            PatKind::Expr(hir::PatExpr {
+                kind: hir::PatExprKind::Path(hir::QPath::Resolved(_, path)),
+                ..
+            })
             | PatKind::TupleStruct(hir::QPath::Resolved(_, path), ..)
             | PatKind::Struct(hir::QPath::Resolved(_, path), ..) => {
                 if let Res::Def(DefKind::Variant | DefKind::Ctor(CtorOf::Variant, ..), id) =
@@ -138,8 +120,10 @@ impl hir::Pat<'_> {
             }
             _ => true,
         });
-        variants.sort();
-        variants.dedup();
+        // We remove duplicates by inserting into a hash set to avoid re-ordering
+        // the bounds
+        let mut duplicates = DefIdSet::default();
+        variants.retain(|def_id| duplicates.insert(*def_id));
         variants
     }
 
@@ -151,11 +135,8 @@ impl hir::Pat<'_> {
     pub fn contains_explicit_ref_binding(&self) -> Option<hir::Mutability> {
         let mut result = None;
         self.each_binding(|annotation, _, _, _| match annotation {
-            hir::BindingAnnotation::Ref => match result {
-                None | Some(hir::Mutability::Not) => result = Some(hir::Mutability::Not),
-                _ => {}
-            },
-            hir::BindingAnnotation::RefMut => result = Some(hir::Mutability::Mut),
+            hir::BindingMode::REF if result.is_none() => result = Some(hir::Mutability::Not),
+            hir::BindingMode::REF_MUT => result = Some(hir::Mutability::Mut),
             _ => {}
         });
         result

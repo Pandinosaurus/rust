@@ -1,12 +1,12 @@
-// edition:2018
-// run-rustfix
-
 #![warn(clippy::manual_map)]
 #![allow(
     clippy::no_effect,
     clippy::map_identity,
     clippy::unit_arg,
     clippy::match_ref_pats,
+    clippy::redundant_pattern_matching,
+    clippy::unnecessary_map_on_constructor,
+    for_loops_over_fallibles,
     dead_code
 )]
 
@@ -113,7 +113,16 @@ fn main() {
     }
 
     // #6811
-    Some(0).map(|x| vec![x]);
+    match Some(0) {
+        Some(x) => Some(vec![x]),
+        None => None,
+    };
+
+    // Don't lint, coercion
+    let x: Option<Vec<&[u8]>> = match Some(()) {
+        Some(_) => Some(vec![b"1234"]),
+        None => None,
+    };
 
     option_env!("").map(String::from);
 
@@ -130,7 +139,27 @@ fn main() {
     }
 
     // #6847
-    if Some(0).is_some() {
+    if let Some(_) = Some(0) {
         Some(0)
     } else { Some(0).map(|x| x + 1) };
+
+    if true {
+        Some(0)
+    } else { Some(0).map(|x| x + 1) };
+
+    // #6967
+    const fn f4() {
+        match Some(0) {
+            Some(x) => Some(x + 1),
+            None => None,
+        };
+    }
+
+    // #7077
+    let s = &String::new();
+    #[allow(clippy::needless_match)]
+    let _: Option<&str> = match Some(s) {
+        Some(s) => Some(s),
+        None => None,
+    };
 }

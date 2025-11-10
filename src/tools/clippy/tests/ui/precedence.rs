@@ -1,8 +1,12 @@
-// run-rustfix
 #![warn(clippy::precedence)]
-#![allow(unused_must_use, clippy::no_effect, clippy::unnecessary_operation)]
-#![allow(clippy::identity_op)]
-#![allow(clippy::eq_op)]
+#![allow(
+    unused_must_use,
+    clippy::no_effect,
+    clippy::unnecessary_operation,
+    clippy::clone_on_copy,
+    clippy::identity_op,
+    clippy::eq_op
+)]
 
 macro_rules! trip {
     ($a:expr) => {
@@ -15,47 +19,45 @@ macro_rules! trip {
 
 fn main() {
     1 << 2 + 3;
+    //~^ precedence
     1 + 2 << 3;
+    //~^ precedence
     4 >> 1 + 1;
+    //~^ precedence
     1 + 3 >> 2;
+    //~^ precedence
     1 ^ 1 - 1;
+    //~^ precedence
     3 | 2 - 1;
+    //~^ precedence
     3 & 5 - 2;
-    -1i32.abs();
-    -1f32.abs();
-
-    // These should not trigger an error
-    let _ = (-1i32).abs();
-    let _ = (-1f32).abs();
-    let _ = -(1i32).abs();
-    let _ = -(1f32).abs();
-    let _ = -(1i32.abs());
-    let _ = -(1f32.abs());
-
-    // Odd functions should not trigger an error
-    let _ = -1f64.asin();
-    let _ = -1f64.asinh();
-    let _ = -1f64.atan();
-    let _ = -1f64.atanh();
-    let _ = -1f64.cbrt();
-    let _ = -1f64.fract();
-    let _ = -1f64.round();
-    let _ = -1f64.signum();
-    let _ = -1f64.sin();
-    let _ = -1f64.sinh();
-    let _ = -1f64.tan();
-    let _ = -1f64.tanh();
-    let _ = -1f64.to_degrees();
-    let _ = -1f64.to_radians();
-
-    // Chains containing any non-odd function should trigger (issue #5924)
-    let _ = -1.0_f64.cos().cos();
-    let _ = -1.0_f64.cos().sin();
-    let _ = -1.0_f64.sin().cos();
-
-    // Chains of odd functions shouldn't trigger
-    let _ = -1f64.sin().sin();
+    //~^ precedence
+    0x0F00 & 0x00F0 << 4;
+    0x0F00 & 0xF000 >> 4;
+    0x0F00 << 1 ^ 3;
+    0x0F00 << 1 | 2;
 
     let b = 3;
     trip!(b * 8);
+}
+
+struct W(u8);
+impl Clone for W {
+    fn clone(&self) -> Self {
+        W(1)
+    }
+}
+
+fn closure_method_call() {
+    // Do not lint when the method call is applied to the block, both inside the closure
+    let f = |x: W| { x }.clone();
+    assert!(matches!(f(W(0)), W(1)));
+
+    let f = |x: W| -> _ { x }.clone();
+    assert!(matches!(f(W(0)), W(0)));
+    //~^^ precedence
+
+    let f = move |x: W| -> _ { x }.clone();
+    assert!(matches!(f(W(0)), W(0)));
+    //~^^ precedence
 }
